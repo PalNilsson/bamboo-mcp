@@ -51,6 +51,8 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 
 from bamboo.auth import TokenAuthError
 
+from bamboo import session_scope
+
 from bamboo.core import create_server
 
 # ASGI typing helpers
@@ -212,11 +214,20 @@ async def _run_session(session_id: str, transport: StreamableHTTPServerTransport
     `server.run(...)`. The `ready_evt` is set immediately after connect() is entered,
     guaranteeing that request handlers can call `handle_request` safely.
 
+    Conversational state (tool evidence, prompt-log coordinates) is bound to
+    this session before connect() is entered.  A task owns its own context and
+    every tool call for this session is executed inside this task, so the one
+    assignment below covers the session's whole lifetime — see
+    :mod:`bamboo.session_scope` for why that state must not be process-global.
+
     Args:
         session_id: MCP session identifier.
         transport: Streamable HTTP transport for this session.
         ready_evt: Event set once connect() is active.
     """
+    scope_id = f"mcp:{session_id}"
+    session_scope.set_session_id(scope_id)
+
     try:
         async with transport.connect() as streams:
             # We are now "connected" from the transport's perspective.
@@ -241,7 +252,11 @@ async def _run_session(session_id: str, transport: StreamableHTTPServerTransport
             await server.run(read_stream, write_stream, server.create_initialization_options())
 
     finally:
-        # Cleanup session state
+        # Cleanup session state.  The scope id is not reset here: the context
+        # belongs to this task and dies with it, whereas the buckets are held
+        # in a module-level registry and must be released explicitly.
+        session_scope.clear_session(scope_id)
+
         async with _lock:
             _transports.pop(session_id, None)
             _ready.pop(session_id, None)

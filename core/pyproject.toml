@@ -1,6 +1,6 @@
 [project]
 name = "bamboo-core"
-version = "1.0.8"
+version = "1.1.0"
 description = "Bamboo core (MCP server, loader, orchestration)"
 requires-python = ">=3.10"
 dependencies = [

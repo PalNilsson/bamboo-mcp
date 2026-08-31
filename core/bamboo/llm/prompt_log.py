@@ -87,6 +87,8 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from bamboo import session_scope
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -149,9 +151,27 @@ def _notify(severity: str, message: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Process-wide session ID — set once at import time.
+#
+# This is the right identifier under stdio, where one process serves one user.
+# On the shared HTTP server it is not: every connected client would be indexed
+# under the same session_id, which makes a conversation impossible to
+# reconstruct from the index and distorts any per-session aggregation.
+# _effective_session_id() therefore prefers the transport-bound session id
+# when one is active, and falls back to this constant otherwise.
 # ---------------------------------------------------------------------------
 
 _SESSION_ID: str = str(uuid.uuid4())
+
+
+def _effective_session_id() -> str:
+    """Return the session id to record on prompt-log documents.
+
+    Returns:
+        The active Bamboo session id when a scope is bound, otherwise the
+        process-wide :data:`_SESSION_ID`.
+    """
+    return session_scope.current_session_id() or _SESSION_ID
+
 
 #: 1-based turn counter, incremented once per :func:`log_prompt` call.
 #: Combined with ``session_id`` this gives a stable, human-readable reference
@@ -184,7 +204,16 @@ _event_log: deque[dict[str, Any]] = deque(maxlen=20)
 
 #: Stores the (index, doc_id) of the most recently indexed document so
 #: rating tools can locate the document without a search query.
+#:
+#: Process-wide, and therefore only consulted when no session scope is active
+#: (the stdio case).  Scoped callers read the per-session bucket instead — see
+#: :func:`get_last_doc_id` — because a single-slot process-wide deque under
+#: concurrency hands one user's rating to another user's document.
 _last_doc_store: deque[tuple[str, str]] = deque(maxlen=1)
+
+#: Key under which the last ``(index, doc_id)`` pair is stored inside a
+#: session's prompt-log bucket.
+_LAST_DOC_KEY: str = "last_doc"
 
 
 def drain_events() -> list[dict[str, Any]]:
@@ -205,15 +234,45 @@ def drain_events() -> list[dict[str, Any]]:
     return events
 
 
+def record_last_doc(index: str, doc_id: str, session_id: str | None = None) -> None:
+    """Record the coordinates of a freshly indexed document.
+
+    Args:
+        index: Index the document was written to.
+        doc_id: OpenSearch document ``_id``.
+        session_id: Session the document belongs to.  When ``None`` the pair
+            goes to the process-wide store, matching stdio behaviour.  Callers
+            running in a thread must pass this explicitly, since context
+            variables do not cross a thread boundary.
+    """
+    if session_id is None:
+        _last_doc_store.append((index, doc_id))
+        return
+    bucket = session_scope.bucket(
+        session_scope.PROMPTLOG_BUCKET, session_id=session_id
+    )
+    bucket[_LAST_DOC_KEY] = (index, doc_id)
+
+
 def get_last_doc_id() -> tuple[str, str] | None:
     """Return ``(index, doc_id)`` of the most recently indexed document.
 
     Used by rating tools to locate the correct document without a search.
-    Returns ``None`` when no document has been indexed in this process.
+    When a session scope is active the lookup is confined to that session, so
+    a rating can never be applied to a document belonging to another client.
 
     Returns:
-        Tuple of ``(index_name, doc_id)`` or ``None``.
+        Tuple of ``(index_name, doc_id)``, or ``None`` when nothing has been
+        indexed for the caller's session.
     """
+    session_id = session_scope.current_session_id()
+    if session_id is not None:
+        stored = session_scope.bucket(
+            session_scope.PROMPTLOG_BUCKET, session_id=session_id
+        ).get(_LAST_DOC_KEY)
+        if isinstance(stored, tuple) and len(stored) == 2:
+            return (str(stored[0]), str(stored[1]))
+        return None
     return _last_doc_store[-1] if _last_doc_store else None
 
 
@@ -563,11 +622,16 @@ def _ensure_index_template(client: Any) -> None:
             )
 
 
-def _write_document(doc: dict[str, Any]) -> None:
+def _write_document(doc: dict[str, Any]) -> tuple[str, str] | None:
     """Write *doc* to OpenSearch synchronously.
 
     Intended to be called from a background thread via
     :func:`asyncio.to_thread` so it never blocks the event loop.
+
+    The ``(index, doc_id)`` return value exists so the scheduling coroutine can
+    attribute the document to the session that produced it.  This function
+    cannot do that attribution itself: it runs in a worker thread, where the
+    session context variable is not visible.
 
     Implements a simple circuit breaker: after
     :data:`_CIRCUIT_BREAKER_THRESHOLD` consecutive failures the circuit is
@@ -576,11 +640,15 @@ def _write_document(doc: dict[str, Any]) -> None:
 
     Args:
         doc: Fully-built document dict to index.
+
+    Returns:
+        ``(index, doc_id)`` on a successful write, or ``None`` when the write
+        was skipped or failed.
     """
     global _consecutive_failures, _circuit_open  # pylint: disable=global-statement
 
     if _circuit_open:
-        return
+        return None
 
     index = _build_index_name()
     turn = doc.get("turn_number", "?")
@@ -605,6 +673,7 @@ def _write_document(doc: dict[str, Any]) -> None:
         _last_doc_store.append((index, doc_id))
         # Success — reset failure counter.
         _consecutive_failures = 0
+        return (str(index), str(doc_id))
     except ImportError:
         imp_msg = (
             f"prompt_log: turn {turn} — opensearch-py not installed; "
@@ -634,6 +703,28 @@ def _write_document(doc: dict[str, Any]) -> None:
             logger.warning(warn_msg)
             _notify("warning", warn_msg)
             _event_log.append({"turn": turn, "severity": "warning", "message": warn_msg})
+
+    return None
+
+
+async def _index_and_record(doc: dict[str, Any], session_id: str | None) -> None:
+    """Index *doc* in a worker thread, then attribute it to *session_id*.
+
+    The attribution has to happen here rather than inside
+    :func:`_write_document`, because that function runs in a thread where the
+    session context variable is invisible.  *session_id* is captured by the
+    caller while still on the event loop and passed through explicitly.
+
+    Args:
+        doc: Fully-built document dict to index.
+        session_id: Session that produced the document, or ``None`` when no
+            scope was active.
+    """
+    coords = await asyncio.to_thread(_write_document, doc)
+    if session_id is None:
+        return
+    if isinstance(coords, tuple) and len(coords) == 2:
+        record_last_doc(str(coords[0]), str(coords[1]), session_id=session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -693,9 +784,12 @@ async def log_prompt(
     turn_number = _turn_counter
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
+    session_id = session_scope.current_session_id()
+    effective_session_id = _effective_session_id()
+
     doc: dict[str, Any] = {
         "@timestamp": timestamp,
-        "session_id": _SESSION_ID,
+        "session_id": effective_session_id,
         "turn_number": turn_number,
         "provider": provider,
         "model": model,
@@ -709,11 +803,12 @@ async def log_prompt(
         "output_tokens": output_tokens,
     }
 
-    # asyncio.to_thread: synchronous OS client never blocks the event loop.
+    # asyncio.to_thread (inside _index_and_record): the synchronous OpenSearch
+    # client never blocks the event loop.
     # create_task: caller gets control back immediately (fire-and-forget).
     asyncio.create_task(  # noqa: RUF006 — intentional fire-and-forget
-        asyncio.to_thread(_write_document, doc),
-        name=f"prompt_log_{_SESSION_ID[:8]}_{turn_number}",
+        _index_and_record(doc, session_id),
+        name=f"prompt_log_{effective_session_id[:8]}_{turn_number}",
     )
 
 
@@ -721,6 +816,9 @@ __all__ = [
     "log_prompt",
     "redact_names",
     "drain_events",
+    "get_last_doc_id",
+    "record_last_doc",
+    "update_rating",
     "register_notify_callback",
     "clear_notify_callback",
     "NotifyFn",

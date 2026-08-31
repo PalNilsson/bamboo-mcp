@@ -28,6 +28,41 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **Session-scoped conversational state** (`core/bamboo/session_scope.py`). A
+  context variable naming the active session plus a bounded LRU registry of
+  named per-session buckets. The session id is bound once per session at the
+  transport boundary — `bamboo.entrypoints.http._run_session` sets it as its
+  first statement, and because a task owns its own context and every tool call
+  for that session runs inside that task, the one assignment covers the
+  session's whole lifetime.
+
+  `ScopedMapping` is a `MutableMapping` view onto one bucket of the active
+  session, so a module-level name can keep its dict syntax while the storage
+  follows the session. That indirection is deliberate: rewriting each of the
+  two dozen `_last_evidence_store` call sites to a helper leaves room for a
+  missed site to silently reintroduce leakage, and a missed site still
+  type-checks and still passes any test that runs unscoped.
+
+  Bounded by `BAMBOO_SESSION_BUCKETS` (default 128 non-default buckets) and
+  `BAMBOO_SESSION_TTL_S` (default 7200 s idle). The default bucket is exempt
+  from both, since evicting it would break cross-turn follow-ups in a long
+  stdio session. An unparsable value falls back to the default rather than
+  raising, so a typo in a deployment environment cannot stop the server
+  starting.
+
+  With no scope bound every access lands in the default bucket, which
+  reproduces the previous process-global behaviour exactly. stdio, the TUI and
+  the existing suite are unaffected.
+
+- **Prompt-log documents carry the transport session id**
+  (`core/bamboo/llm/prompt_log.py`). `session_id` was the process-wide
+  `_SESSION_ID`, correct under stdio but not on the shared HTTP server, where
+  every connected client was indexed under one id. That makes a conversation
+  impossible to reconstruct from the index and distorts any per-session
+  aggregation, which matters for the retrieval- and faithfulness-evaluation
+  work. `_effective_session_id()` now prefers the bound session id and falls
+  back to `_SESSION_ID` when no scope is active.
+
 - **Explicit search for the CPython gdb helper, enabling `py-bt`**
   (`packages/askpanda_atlas/askpanda_atlas/_core_dump_analyzer.py`). `py-bt`
   needs CPython's `python-gdb.py`, which gdb auto-loads as `<objfile>-gdb.py`
@@ -52,6 +87,38 @@ All notable changes to Bamboo are documented here.
   `--cleanenv`, so no host environment variable reaches the container.
 
 ### Fixed
+- **Conversational state leaked between concurrent clients**
+  (`core/bamboo/tools/bamboo_executor.py`, `core/bamboo/llm/prompt_log.py`).
+  `_last_evidence_store` was a module-level dict keyed by tool name alone,
+  with no session dimension. Two readers consult it *across* turns rather than
+  within one, and both are routing gates:
+
+  - `get_last_core_dump_offer()` decides whether a bare "yes" means "analyse
+    the core dump", and recovers the job id from the stored evidence rather
+    than from the user's message. On the shared HTTP server one process serves
+    every client, so user B's "yes" could start a gdb run against user A's job.
+  - `get_last_traceback_evidence()` gates the rule 1b pilot-source route, so a
+    question could be answered against another user's traceback.
+
+  `bamboo_last_evidence` had the same defect in visible form: it returned
+  whatever tool ran last anywhere in the process.
+
+  `prompt_log._last_doc_store` was a single-slot process-wide deque, so under
+  concurrency `get_last_doc_id()` could hand one client's rating to another
+  client's document. `record_last_doc()` now files coordinates per session and
+  `get_last_doc_id()` confines the lookup to the caller's session. Attribution
+  happens in a new `_index_and_record()` coroutine rather than inside
+  `_write_document`, because that function runs in a worker thread where the
+  session context variable is invisible; the session id is captured on the
+  event loop and passed explicitly. `_write_document` now returns
+  `(index, doc_id)` on success so the wrapper has something to file, and keeps
+  its single-argument signature so existing callers and test doubles are
+  unaffected.
+
+  Latent rather than dormant: concurrent chat use was light enough to hide it,
+  and the arrival rate a "Analyze failure" button on every failed job page
+  implies is what makes it certain.
+
 - **Synthesis asserted lock ownership it had just said it could not read**
   (`packages/askpanda_atlas/askpanda_atlas/_core_dump_analyzer.py`). Job
   7272161793's analysis described a three-way cycle in which the XRootD timer

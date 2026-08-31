@@ -69,11 +69,23 @@ def _installed_mcp_version() -> str:
 
     Returns:
         The version string of the installed ``mcp`` distribution.
+
+    Raises:
+        AssertionError: Never in practice.  See the comment below the
+            ``pytest.skip()`` call for why the statement has to be written.
     """
     try:
         return metadata.version("mcp")
     except metadata.PackageNotFoundError:
         pytest.skip("mcp is not installed; nothing to verify.")
+    # Unreachable.  pytest.skip() is annotated NoReturn, but pyright only sees
+    # that annotation when it can resolve pytest, and the pre-commit hook runs
+    # pyright from a Node environment against an interpreter that need not have
+    # the test dependencies installed.  Unresolved, pytest.skip() is Unknown,
+    # the except branch appears to fall through, and the declared -> str fails
+    # with reportReturnType.  An explicit raise terminates the path whether or
+    # not the annotation is visible.
+    raise AssertionError("unreachable: pytest.skip() does not return")
 
 
 def test_installed_mcp_major_version_is_supported() -> None:

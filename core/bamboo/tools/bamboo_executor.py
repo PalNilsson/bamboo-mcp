@@ -26,6 +26,7 @@ import re
 from typing import Any
 
 from bamboo.llm.types import Message
+from bamboo.session_scope import EVIDENCE_BUCKET, ScopedMapping
 from bamboo.tools.base import MCPContent, text_content
 from bamboo.tools.llm_passthrough import bamboo_llm_answer_tool
 from bamboo.tools.loader import find_tool_by_name
@@ -34,7 +35,7 @@ from bamboo.tools.planner import Plan
 from bamboo.tracing import EVENT_PLAN, EVENT_RETRIEVAL, EVENT_SYNTHESIS, span
 
 # ---------------------------------------------------------------------------
-# In-process evidence store
+# Session-scoped evidence store
 #
 # Populated by execute_plan() after every successful tool call so that the
 # TUI /json and /inspect commands can retrieve the last evidence dict without
@@ -46,9 +47,23 @@ from bamboo.tracing import EVENT_PLAN, EVENT_RETRIEVAL, EVENT_SYNTHESIS, span
 # on an exact literal (_CORE_DUMP_TOOL, "panda_log_analysis") without also
 # handling every alias _resolve_tool would have accepted.  Anything else
 # writing to this store must canonicalise its key too.
+#
+# This looks like a module-level dict and behaves like one, but the storage
+# belongs to the *active session* rather than the process — see
+# bamboo.session_scope.  It has to, because two readers here consult the store
+# across turns rather than within one:
+#
+#   * get_last_core_dump_offer() gates the bare-affirmative rule, so a
+#     process-global store let one user's "yes" start a core-dump analysis on
+#     another user's job;
+#   * get_last_traceback_evidence() gates the rule 1b pilot-source route, so a
+#     question could be answered against another user's traceback.
+#
+# Under stdio no session is bound and every access lands in the default
+# bucket, which is byte-for-byte the old process-global behaviour.
 # ---------------------------------------------------------------------------
 
-_last_evidence_store: dict[str, Any] = {}
+_last_evidence_store: ScopedMapping = ScopedMapping(EVIDENCE_BUCKET)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
