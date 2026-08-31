@@ -71,7 +71,7 @@ def _new(job_id: int = _JOB, mode: str = "failure") -> store.AnalysisRecord:
     return store.create(job_id, mode, key)
 
 
-def _claim_from_subprocess(root: str, cache_key: str, analysis_id: str, out: str) -> None:
+def _claim_from_subprocess(root: str, cache_key: str, analysis_id: str, out: str, gate: str) -> None:
     """Take a claim from a separate process and write the outcome.
 
     Args:
@@ -79,9 +79,16 @@ def _claim_from_subprocess(root: str, cache_key: str, analysis_id: str, out: str
         cache_key: Key to claim.
         analysis_id: Caller's analysis id.
         out: File to write the result into.
+        gate: File whose appearance releases every child at once, so they
+            contend rather than arriving in start order.
     """
     os.environ["BAMBOO_REST_STORE_ROOT"] = root
     from bamboo import analysis_store as st
+
+    gate_path = Path(gate)
+    deadline = time.time() + 30
+    while not gate_path.exists() and time.time() < deadline:
+        pass
 
     result = st.try_claim(cache_key, analysis_id)
     Path(out).write_text(json.dumps({"result": result}), encoding="utf-8")
@@ -371,28 +378,84 @@ class TestSingleFlight:
 
         assert store.try_claim(key, "live") is None
 
+    def test_a_claim_is_never_visible_without_a_body(self, _store_root: Path) -> None:
+        """A published claim always has a readable holder in it.
+
+        The invariant behind the fix: the file is written in full before it
+        becomes visible under its final name.
+        """
+        key = store.cache_key_for(_JOB, "failure", _MODEL)
+        store.try_claim(key, "aaa")
+
+        holder = json.loads(
+            (store.inflight_dir() / f"{key}.json").read_text(encoding="utf-8")
+        )
+
+        assert holder["analysis_id"] == "aaa"
+        assert holder["pid"] == os.getpid()
+
+    def test_claim_being_written_is_not_stolen(self, _store_root: Path) -> None:
+        """A caller arriving mid-write must wait, not take over.
+
+        This is the CI failure, reproduced deterministically. ``O_CREAT |
+        O_EXCL`` creates a zero-length file and the body lands on the next
+        line; a caller inside that window used to read nothing, conclude the
+        claim was corrupt, overwrite it, and become a second winner.
+        """
+        import threading
+
+        key = store.cache_key_for(_JOB, "failure", _MODEL)
+        store.inflight_dir().mkdir(parents=True, exist_ok=True)
+        path = store.inflight_dir() / f"{key}.json"
+
+        # Simulate the window: the file exists, its body arrives shortly.
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+
+        def _finish_write() -> None:
+            time.sleep(0.05)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"analysis_id": "winner", "pid": os.getpid(), "started_utc": "x"},
+                    handle,
+                )
+
+        writer = threading.Thread(target=_finish_write)
+        writer.start()
+        try:
+            assert store.try_claim(key, "loser") == "winner"
+        finally:
+            writer.join()
+
     def test_exactly_one_winner_across_processes(self, _store_root: Path, tmp_path: Path) -> None:
-        """The O_EXCL claim holds against genuinely parallel callers.
+        """The claim holds against genuinely parallel callers.
 
         Multi-process rather than multi-threaded on purpose: threads in one
         interpreter would be serialised tightly enough by the GIL that the race
         never happens, and processes are the real case once more than one
         uvicorn worker is running.
+
+        The children spin on a gate file so they collide as hard as the
+        scheduler allows, rather than arriving in whatever order ``spawn``
+        happens to start them.  The run that caught the original bug had four
+        unsynchronised children, so this is strictly harder to pass by luck.
         """
         import multiprocessing
 
         key = store.cache_key_for(_JOB, "failure", _MODEL)
+        gate = tmp_path / "gate"
         context = multiprocessing.get_context("spawn")
-        outputs = [tmp_path / f"out{i}.json" for i in range(4)]
+        outputs = [tmp_path / f"out{i}.json" for i in range(8)]
         procs = [
             context.Process(
                 target=_claim_from_subprocess,
-                args=(str(_store_root), key, f"id{i}", str(outputs[i])),
+                args=(str(_store_root), key, f"id{i}", str(outputs[i]), str(gate)),
             )
-            for i in range(4)
+            for i in range(8)
         ]
         for proc in procs:
             proc.start()
+        time.sleep(1.5)
+        gate.write_text("go", encoding="utf-8")
         for proc in procs:
             proc.join(timeout=60)
 

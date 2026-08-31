@@ -124,6 +124,12 @@ DEFAULT_MAX_RECORD_CHARS: int = 1_000_000
 #: previously cached answers.
 DEFAULT_PROMPT_VERSION: str = "1"
 
+#: Reads attempted before an unreadable claim file is declared abandoned, and
+#: the pause between them.  Insurance for the hard-link fallback path, where a
+#: claim can briefly exist with no body yet.
+_CLAIM_READ_ATTEMPTS: int = 5
+_CLAIM_READ_DELAY_S: float = 0.05
+
 
 class AnalysisState:
     """The states a record moves through.
@@ -398,11 +404,14 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
+def _read_json(path: Path, quiet: bool = False) -> dict[str, Any] | None:
     """Read JSON from *path*, tolerating absence and corruption.
 
     Args:
         path: File to read.
+        quiet: Log at debug rather than warning. Used by the claim-read retry,
+            where a momentarily unreadable file is expected rather than a
+            problem worth reporting three times.
 
     Returns:
         The parsed object, or ``None`` when missing or unreadable.
@@ -412,7 +421,10 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     except FileNotFoundError:
         return None
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("analysis_store: cannot read %s: %s", path, exc)
+        if quiet:
+            logger.debug("analysis_store: cannot read %s yet: %s", path, exc)
+        else:
+            logger.warning("analysis_store: cannot read %s: %s", path, exc)
         return None
     return data if isinstance(data, dict) else None
 
@@ -679,11 +691,17 @@ def lookup_cache(cache_key: str) -> AnalysisRecord | None:
 def try_claim(cache_key: str, analysis_id: str) -> str | None:
     """Claim the right to run an analysis, or report who already has it.
 
-    The claim file is created with ``O_CREAT | O_EXCL``, which is atomic on
-    POSIX, so exactly one caller wins a race and the others are told the
-    winner's id rather than starting duplicate work.  A claim whose owner
-    process is gone is taken over: the alternative is a job that can never be
-    analysed again until somebody clears the directory by hand.
+    The claim is written to a temporary file first and published with
+    ``os.link``, which on POSIX both fails when the destination exists and
+    makes the file visible complete.  ``O_CREAT | O_EXCL`` alone is not enough:
+    it creates a zero-length file and the body lands on the next line, so a
+    caller arriving inside that window reads an empty file, concludes the claim
+    is corrupt, takes it over, and there are two winners.  That is not
+    theoretical — it is what CI caught.
+
+    A claim whose owner process is gone is taken over: the alternative is a job
+    that can never be analysed again until somebody clears the directory by
+    hand.
 
     Args:
         cache_key: Key identifying the question.
@@ -700,6 +718,34 @@ def try_claim(cache_key: str, analysis_id: str) -> str | None:
         "started_utc": _utc_now(),
     }
 
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        try:
+            os.link(tmp, path)
+            return None
+        except FileExistsError:
+            return _take_over_or_report(path, payload)
+        except OSError as exc:
+            # Some filesystems refuse hard links.  Fall back to the exclusive
+            # create, accepting the narrow window it reopens; the retry in
+            # _take_over_or_report is what covers it.
+            logger.debug("analysis_store: os.link unavailable (%s); using O_EXCL", exc)
+            return _claim_without_link(path, payload)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _claim_without_link(path: Path, payload: dict[str, Any]) -> str | None:
+    """Claim using an exclusive create, for filesystems without hard links.
+
+    Args:
+        path: The claim file.
+        payload: The caller's claim.
+
+    Returns:
+        ``None`` when the claim was taken, or the holder's analysis id.
+    """
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
@@ -713,6 +759,11 @@ def try_claim(cache_key: str, analysis_id: str) -> str | None:
 def _take_over_or_report(path: Path, payload: dict[str, Any]) -> str | None:
     """Resolve a claim collision.
 
+    An unreadable claim is retried before being declared abandoned.  An empty
+    or truncated file is far more likely to be a claim being written this
+    instant than one left by a crash, and stealing it would produce exactly the
+    duplicate work the claim exists to prevent.
+
     Args:
         path: The existing claim file.
         payload: The caller's claim, written if the holder is gone.
@@ -720,11 +771,11 @@ def _take_over_or_report(path: Path, payload: dict[str, Any]) -> str | None:
     Returns:
         ``None`` when the claim was taken over, or the holder's analysis id.
     """
-    holder = _read_json(path)
+    holder = _read_claim_with_retry(path)
+
     if holder is None:
-        # Unreadable claim: treat as abandoned rather than deadlocking on it.
-        _write_json(path, payload)
-        return None
+        logger.info("analysis_store: claim %s is unreadable; taking it over", path.name)
+        return _publish_takeover(path, payload)
 
     if pid_alive(int(holder.get("pid", 0) or 0)):
         return str(holder.get("analysis_id", "")) or None
@@ -734,7 +785,49 @@ def _take_over_or_report(path: Path, payload: dict[str, Any]) -> str | None:
         path.name,
         holder.get("pid"),
     )
+    return _publish_takeover(path, payload)
+
+
+def _read_claim_with_retry(path: Path) -> dict[str, Any] | None:
+    """Read a claim file, allowing for one being written right now.
+
+    Args:
+        path: The claim file.
+
+    Returns:
+        The parsed claim, or ``None`` if it stays unreadable.
+    """
+    for attempt in range(_CLAIM_READ_ATTEMPTS):
+        holder = _read_json(path, quiet=True)
+        if holder is not None and holder.get("analysis_id"):
+            return holder
+        if not path.exists():
+            # The holder released it while we looked; nothing to report.
+            return None
+        if attempt < _CLAIM_READ_ATTEMPTS - 1:
+            time.sleep(_CLAIM_READ_DELAY_S)
+    return None
+
+
+def _publish_takeover(path: Path, payload: dict[str, Any]) -> str | None:
+    """Replace an abandoned claim, confirming the result by reading it back.
+
+    Two callers can decide to take over the same abandoned claim at the same
+    moment, and ``os.replace`` would let both believe they succeeded.  Reading
+    back settles it: whoever's id survives owns the claim.
+
+    Args:
+        path: The claim file.
+        payload: The caller's claim.
+
+    Returns:
+        ``None`` when the caller owns the claim, or the winner's analysis id.
+    """
     _write_json(path, payload)
+    settled = _read_json(path) or {}
+    winner = str(settled.get("analysis_id", ""))
+    if winner and winner != payload["analysis_id"]:
+        return winner
     return None
 
 

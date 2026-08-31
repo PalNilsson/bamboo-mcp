@@ -97,11 +97,16 @@ All notable changes to Bamboo are documented here.
   seconds, since a job that has just failed may still be uploading. Failures
   are never cached: most are transient rather than properties of the job.
 
-  Claims are taken with `O_CREAT | O_EXCL`, atomic on POSIX, so twenty clicks
-  on the same failed job start one analysis and the other nineteen are handed
-  the winner's id. A claim or record whose owning process is gone is taken over
-  or marked failed rather than blocking that job until somebody clears the
-  directory by hand.
+  Claims are published by writing a temporary file and hard-linking it into
+  place, so twenty clicks on the same failed job start one analysis and the
+  other nineteen are handed the winner's id. `O_CREAT | O_EXCL` alone is not
+  enough: it creates a zero-length file and the body lands on the next line, so
+  a caller arriving inside that window reads nothing, concludes the claim is
+  corrupt and takes it over, producing two winners. A claim that is unreadable
+  is therefore re-read a few times before being declared abandoned, and a
+  take-over is confirmed by reading back who owns the file. A claim or record
+  whose owning process is gone is taken over or marked failed rather than
+  blocking that job until somebody clears the directory by hand.
 
   Records tolerate unknown fields on read, so a rolling upgrade with old code
   reading newer manifests does not strand a poller. Analysis ids are validated
