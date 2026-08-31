@@ -28,6 +28,56 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **Spend accounting and admission control** (`core/bamboo/cost_guard.py`,
+  `core/bamboo/llm/metered.py`, `core/bamboo/llm/factory.py`). A daily USD
+  counter, a price table, and a concurrency limiter, ahead of the PanDA
+  monitor's "Analyze failure" button turning LLM spend from something a few
+  chat users generate into something a page view generates.
+
+  Token usage was already normalised as `TokenUsage` on every `LLMResponse`,
+  but it was read only for tracing spans and then discarded, so nothing could
+  meter it and the prompt-log's `input_tokens` and `output_tokens` fields were
+  always null. `MeteredLLMClient` now wraps every client returned by
+  `build_client`. That seam was chosen over any individual call site because
+  `client.generate()` is called from at least ten places — synthesis, the LLM
+  planner, the topic guard, the promptlog NL-to-DSL translator, the
+  connectivity probe, and several ATLAS plugin implementations — and metering
+  one would miss the rest. The planner is not a rounding error: its prompt
+  carries the whole tool catalogue.
+
+  The counter is a JSON file per UTC date updated under `flock`, not a process
+  global, for three reasons: a restart must not reset the day's spend; the
+  core-dump analyzer builds its own client in a detached worker process and its
+  spend must land in the same total; and multiple uvicorn workers, if ever
+  enabled, must share one budget.
+
+  Accounting is always on; enforcement is not. `check_budget()` is for
+  admission time, so a refusal is a clean early answer rather than a failure
+  halfway through an analysis. Interactive chat is deliberately not gated by
+  default — cutting a user off mid-conversation to save a fraction of a cent is
+  the worse outcome — but `BAMBOO_COST_ENFORCE=1` makes the metered client
+  refuse calls once the budget is gone.
+
+  A model with no price entry has its tokens counted and its calls counted
+  under `unpriced_calls`, so it shows up as a visible gap rather than as free,
+  and logs once per process rather than once per call. Prices are overridable
+  at runtime through `BAMBOO_MODEL_PRICES` because model prices change without
+  any signal reaching this repository; the built-in table is a starting point
+  and must be verified against the provider's pricing page before a budget is
+  enforced.
+
+  `ConcurrencyLimiter` bounds both slots and the queue waiting for them. A
+  semaphore alone gives an unbounded queue, which converts a spike into a
+  slow-motion outage: every caller waits, none is told to go away, and the ones
+  at the back have long since given up by the time they are served.
+
+  New environment variables: `BAMBOO_COST_STATE_ROOT` (default
+  `/tmp/bamboo/cost` — note `/tmp` does not survive a reboot, so set a
+  persistent path where the budget matters), `BAMBOO_ANALYSIS_DAILY_BUDGET_USD`
+  (default `0`, meaning no ceiling), `BAMBOO_MODEL_PRICES`,
+  `BAMBOO_COST_ENFORCE`, `BAMBOO_ANALYSIS_MAX_CONCURRENCY` (default 4) and
+  `BAMBOO_ANALYSIS_MAX_QUEUE` (default 20).
+
 - **Session-scoped conversational state** (`core/bamboo/session_scope.py`). A
   context variable naming the active session plus a bounded LRU registry of
   named per-session buckets. The session id is bound once per session at the
