@@ -28,6 +28,40 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **Disk-backed store for asynchronous analyses**
+  (`core/bamboo/analysis_store.py`). Records, an answer cache and single-flight
+  claims, all as small JSON files under `BAMBOO_REST_STORE_ROOT` (default
+  `/tmp/bamboo/rest-analysis`).
+
+  On disk rather than in a dict because a log analysis takes tens of seconds,
+  which is longer than a browser request should wait behind an nginx proxy, so
+  the REST facade has to hand back an identifier to poll — and that identifier
+  must survive three things a process global does not: a restart, which would
+  otherwise strand every client mid-poll with nothing anywhere saying why; a
+  second uvicorn worker, which would round-robin a poll to a process that never
+  saw the request; and a concurrent caller asking the same question, who needs
+  to see the claim.
+
+  The cache key folds in the model and a prompt version alongside the job and
+  mode, because an answer produced by a different model or a since-revised
+  prompt is a different answer and serving it would make a model change
+  invisible. `BAMBOO_ANALYSIS_PROMPT_VERSION` invalidates every cached answer
+  without deleting anything. Job logs are immutable once uploaded, so the
+  default TTL is a week — except when the analysis found no log, which gets 300
+  seconds, since a job that has just failed may still be uploading. Failures
+  are never cached: most are transient rather than properties of the job.
+
+  Claims are taken with `O_CREAT | O_EXCL`, atomic on POSIX, so twenty clicks
+  on the same failed job start one analysis and the other nineteen are handed
+  the winner's id. A claim or record whose owning process is gone is taken over
+  or marked failed rather than blocking that job until somebody clears the
+  directory by hand.
+
+  Records tolerate unknown fields on read, so a rolling upgrade with old code
+  reading newer manifests does not strand a poller. Analysis ids are validated
+  before they touch a path, since they arrive from a URL. `sweep()` enforces
+  `BAMBOO_ANALYSIS_RETENTION_S` (default two weeks).
+
 - **Spend accounting and admission control** (`core/bamboo/cost_guard.py`,
   `core/bamboo/llm/metered.py`, `core/bamboo/llm/factory.py`). A daily USD
   counter, a price table, and a concurrency limiter, ahead of the PanDA
