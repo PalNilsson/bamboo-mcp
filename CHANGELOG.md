@@ -28,6 +28,52 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **REST analysis facade for the PanDA monitor**
+  (`core/bamboo/entrypoints/rest.py`, `core/bamboo/entrypoints/http.py`). Four
+  endpoints under `/api/v1`, served by the existing uvicorn process, so a
+  button on a failed job page can ask Bamboo why the job failed.
+
+  A REST surface rather than MCP because the browser cannot speak MCP
+  sensibly: Streamable HTTP means JSON-RPC plus a session handshake plus SSE
+  plus a bearer token, and putting that token in page JavaScript hands it to
+  every monitor visitor. The browser talks to the monitor's own backend, which
+  talks to this facade with a service token held server-side.
+
+  ```
+  POST /api/v1/analysis            {job_id, mode?}  -> 200 done | 202 running
+  GET  /api/v1/analysis/{id}                        -> 200
+  POST /api/v1/analysis/{id}/rating {rating: 1..5}  -> 204
+  GET  /api/v1/capabilities                         -> 200
+  ```
+
+  The work is `bamboo_answer` asked "Analyze job N and explain the failure" —
+  the same sentence a chat user would type, taking the same code path, so the
+  button cannot drift from chat behaviour. `bypass_fast_path` is pinned to
+  `False` rather than left to the environment, because `BAMBOO_FAST_PATH` is
+  read only by the Streamlit and Textual interfaces and a REST caller should
+  not inherit an interface's debugging switch. `tests/test_rest_routing.py`
+  pins the phrasing to `panda_log_analysis`, including a check that the
+  f-string in `_execute` still matches, so a routing change breaks a test
+  rather than the button.
+
+  Admission order is cache, claim, budget, then concurrency slot. Refusing
+  early is the point: a 429 before anything runs is a clean answer, whereas
+  discovering the budget is gone halfway through wastes the tokens it took to
+  find out. Errors carry a machine-readable `code`, because the monitor renders
+  a different panel for "budget spent" than for "job unknown" and matching on
+  prose breaks the first time the wording improves.
+
+  Core-dump analysis is deliberately not offered: it holds a single global slot
+  and serialises, so it cannot back a button that appears on every failed job
+  page.
+
+  Auth is shared with `/mcp` through one `authenticate()` helper rather than a
+  second copy of the same check. Everything is off unless `BAMBOO_REST_ENABLED`
+  is set, so deploying this changes nothing until somebody decides otherwise.
+  `BAMBOO_REST_INLINE_WAIT_S` (default 8 s) controls how long a request waits
+  before answering 202, so quick analyses and every cache hit still complete in
+  one round trip.
+
 - **Disk-backed store for asynchronous analyses**
   (`core/bamboo/analysis_store.py`). Records, an answer cache and single-flight
   claims, all as small JSON files under `BAMBOO_REST_STORE_ROOT` (default

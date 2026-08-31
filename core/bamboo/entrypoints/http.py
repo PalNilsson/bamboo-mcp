@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -52,6 +52,7 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from bamboo.auth import TokenAuthError
 
 from bamboo import session_scope
+from bamboo.entrypoints import rest
 
 from bamboo.core import create_server
 
@@ -190,6 +191,9 @@ def _get_session_id_from_scope(scope: Scope) -> str | None:
 def _get_header_from_scope(scope: Scope, header_name: bytes) -> str | None:
     """Get a header value from the ASGI scope.
 
+    Delegates to :func:`bamboo.entrypoints.rest.header_value` so the MCP and
+    REST surfaces read headers the same way.
+
     Args:
         scope: ASGI scope.
         header_name: Lowercase header name as bytes (e.g. b"authorization").
@@ -197,14 +201,7 @@ def _get_header_from_scope(scope: Scope, header_name: bytes) -> str | None:
     Returns:
         Header value decoded as UTF-8, or None if not present/decodable.
     """
-    headers: Sequence[tuple[bytes, bytes]] = scope.get("headers") or []
-    for k, v in headers:
-        if k.lower() == header_name:
-            try:
-                return v.decode("utf-8").strip()
-            except UnicodeDecodeError:  # pragma: no cover
-                return None
-    return None
+    return rest.header_value(scope, header_name)
 
 
 async def _run_session(session_id: str, transport: StreamableHTTPServerTransport, ready_evt: asyncio.Event) -> None:
@@ -318,6 +315,7 @@ async def app(scope: Scope, receive: Receive, send: Send) -> None:  # pylint: di
 
     Routes:
       - GET /healthz -> "ok"
+      - * /api/v1/... -> REST analysis facade (off unless BAMBOO_REST_ENABLED)
       - * /mcp -> MCP Streamable HTTP handler
 
     Args:
@@ -355,22 +353,25 @@ async def app(scope: Scope, receive: Receive, send: Send) -> None:  # pylint: di
         await _send_plain_text(send, 200, "ok")
         return
 
+    auth = getattr(server, "auth", None)
+
+    if str(path).startswith(f"{rest.API_PREFIX}/"):
+        await rest.handle(scope, receive, send, auth=auth)
+        return
+
     if path != "/mcp":
         await _send_plain_text(send, 404, "not found")
         return
 
     # ---- Auth (Bearer tokens) ----
     # Auth is enabled only when BAMBOO_MCP_TOKENS_FILE or BAMBOO_MCP_TOKENS is set.
-    auth = getattr(server, "auth", None)
-    if auth is not None and getattr(auth, "enabled", False):
-        auth_header = _get_header_from_scope(scope, _AUTH_HEADER)
-        try:
-            _ = auth.verify_bearer_token(auth_header)
-        except TokenAuthError as exc:
-            msg = str(exc)
-            status = 403 if "Invalid token" in msg else 401
-            await _send_plain_text(send, status, msg)
-            return
+    try:
+        _ = rest.authenticate(auth, scope)
+    except TokenAuthError as exc:
+        msg = str(exc)
+        status = 403 if "Invalid token" in msg else 401
+        await _send_plain_text(send, status, msg)
+        return
 
     session_id = _get_session_id_from_scope(scope)
     if not session_id:
