@@ -28,6 +28,35 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **Deep links into the Streamlit chat** (`interfaces/shared/deeplink.py`,
+  `interfaces/streamlit/chat.py`). `?job_id=7272161793` opens the chat with
+  "Analyze job 7272161793 and explain the failure" already asked.
+
+  This is the cheapest form of the monitor's button — an anchor tag, no REST
+  call, no proxy view, no polling — and it stays useful after the REST facade
+  ships, as the "continue in Bamboo" target from the answer panel and as the
+  fallback when the API is down. The question is byte-identical to the one
+  `bamboo.entrypoints.rest` sends, and a test reads it out of `rest._execute`
+  rather than restating it, so the two cannot drift apart.
+
+  The parsing lives in `interfaces/shared/` rather than in `chat.py` because
+  Streamlit is an optional dependency that is not installed in the test
+  environment; this way the logic is testable and the Textual interface can
+  reuse it.
+
+  Job ids are accepted only in the four-to-twelve digit range `_LOG_PATTERN`
+  can route, so a malformed link is a clean no-op rather than a confusing
+  answer. A free-text `q` parameter requires
+  `BAMBOO_DEEPLINK_ALLOW_QUESTION=1`: accepting arbitrary text from a URL means
+  anybody who can get a person to click a link can put a question in their
+  history as though they typed it, and spend tokens against the deployment's
+  budget. When enabled, control characters are collapsed so a crafted link
+  cannot inject newlines that read as separate prompt instructions, and
+  `job_id` takes precedence so a link carrying both cannot use the job id as
+  cover. Seeding happens once per session and clears the parameters from the
+  URL, so neither a Streamlit rerun nor a browser refresh silently repeats the
+  question.
+
 - **REST analysis facade for the PanDA monitor**
   (`core/bamboo/entrypoints/rest.py`, `core/bamboo/entrypoints/http.py`). Four
   endpoints under `/api/v1`, served by the existing uvicorn process, so a

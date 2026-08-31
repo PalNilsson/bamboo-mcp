@@ -50,6 +50,7 @@ if _REPO_ROOT not in sys.path:
 import streamlit as st  # noqa: E402
 
 from interfaces.shared.mcp_client import MCPClientSync, MCPServerConfig  # noqa: E402
+from interfaces.shared.deeplink import question_from_params  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -928,6 +929,9 @@ def _init_session() -> None:
             tempfile.gettempdir(), f"bamboo_streamlit_{os.getpid()}.jsonl"
         ),
         "pending_question": None,
+        # Set once the URL query parameters have been turned into an opening
+        # question, so a rerun does not ask it again.
+        "deeplink_consumed": False,
         "promptlog_notices": [],
         "poll_promptlog": False,
         "retry_promptlog": False,  # one deferred retry if first poll misses doc_id
@@ -937,6 +941,44 @@ def _init_session() -> None:
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+
+
+def _seed_from_query_params() -> None:
+    """Turn URL query parameters into an opening question, once per session.
+
+    Lets the PanDA monitor link straight to an answer:
+    ``?job_id=7272161793`` opens the chat with "Analyze job 7272161793 and
+    explain the failure" already asked.  The same link is the "continue in
+    Bamboo" target from the REST answer panel, and the fallback when the REST
+    API is down.
+
+    Guarded twice against asking the same question again.  ``deeplink_consumed``
+    stops a Streamlit rerun resubmitting it, and the parameters are cleared from
+    the URL so a browser refresh does not either — each repeat would be a
+    silent LLM call the user did not ask for.
+    """
+    if st.session_state.get("deeplink_consumed"):
+        return
+    st.session_state["deeplink_consumed"] = True
+
+    try:
+        params = dict(st.query_params)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Older Streamlit builds, or a context without a script run.
+        return
+
+    question = question_from_params(params)
+    if not question:
+        return
+
+    st.session_state["messages"].append({"role": "user", "content": question})
+    st.session_state["pending_question"] = question
+    st.session_state["last_rating"] = None
+
+    try:
+        st.query_params.clear()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
 
 
 def _connect(mcp: MCPClientSync, plugin_id: str) -> None:
@@ -2292,6 +2334,7 @@ def main() -> None:
     )
 
     _init_session()
+    _seed_from_query_params()
 
     transport, http_url, bearer_token, plugin_id, stdio_command = _render_sidebar()
 
