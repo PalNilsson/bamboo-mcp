@@ -747,6 +747,61 @@ All notable changes to Bamboo are documented here.
   every ATLAS name unchecked while the run still looked green. Each guard also
   asserts it checked something, so it cannot go inert.
 
+### Documentation
+- **`docs/rest-api.md`** (new). The full contract for the `/api/v1` surface:
+  the four endpoints, the shared response envelope field by field, the state
+  machine, error codes as a table the monitor can switch on, the polling
+  contract, caching and single-flight, admission order and budgets, and the
+  PanDA monitor integration guide.
+
+  Written from `rest.py` and `analysis_store.py` as they are rather than from
+  the plan that produced them, which surfaced two behaviours worth stating
+  plainly rather than leaving for an integrator to discover:
+
+  - A queue overflow is not a 429. The concurrency slot is acquired inside the
+    analysis task rather than at admission, so `AdmissionRefused` is caught and
+    stored, and the client sees an ordinary `200` carrying `state: "failed"`.
+    A monitor that treats any `failed` state as "could not answer, try again"
+    handles it correctly, but it is not the response code the design implies.
+  - `poll_after_s == null`, not `state == "complete"`, is the signal to stop
+    polling. A client keying on state alone spins forever on a failure.
+
+  The rendering warning is stated as the load-bearing rule it is: the answer
+  embeds job log text, which is attacker-influenceable content wrapped in LLM
+  output, arriving at a page authenticated as the viewing user. Server-side
+  markdown through bleach, never `innerHTML`.
+
+- **`docs/http-server.md`**: the REST surface added to the architecture diagram
+  and given its own section; the `/healthz` note corrected, since paths under
+  `/api/v1/` no longer fall through to the plain-text 404; REST variables added
+  to the environment reference; two REST entries added to troubleshooting;
+  sample startup banner updated from v1.0.8.
+
+- **`docs/http-server.md` recommended a broken configuration.** The "Multiple
+  workers" section suggested `--workers 4` for higher concurrency. The
+  per-session MCP state in `entrypoints/http.py` — `_transports`, `_tasks`,
+  `_ready` — is a module-level dict and therefore per-process, so round-robin
+  dispatch builds a second transport for a session that already exists in
+  another worker. The symptom is intermittent rather than a clean failure,
+  which is the worst kind to ship advice for. The section now says run one
+  worker, explains why, and points at in-process concurrency as the intended
+  answer.
+
+- **`docs/security.md`**: a section noting that `/api/v1` and `/mcp` share one
+  allowlist and one implementation, that the monitor should have its own
+  `panda-monitor` client id, and that an unconfigured deployment records every
+  caller as `auth-disabled` — which on a shared node means any local account
+  can spend the daily LLM budget, localhost binding notwithstanding.
+
+- **`docs/remote_testing.md`**: sample startup banner updated from v1.0.8.
+
+- **`README.md`**: documentation index entry for `docs/rest-api.md`.
+
+- **`docs/tools/panda_log_analysis.md`**: cross-reference to the REST facade,
+  which reaches this tool through `bamboo_answer`. No `docs/tools/` entry was
+  added for the facade itself: that directory is defined as one document per
+  MCP tool, and the facade is not one.
+
 ---
 
 ## v1.0.8 — 2026-08-20

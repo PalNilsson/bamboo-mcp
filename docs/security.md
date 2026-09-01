@@ -95,6 +95,29 @@ Tokens are generated using Python's `secrets` module.
 
 ---
 
+## REST analysis API
+
+The `/api/v1` REST surface enforces the same policy as `/mcp`: both call
+`bamboo.entrypoints.rest.authenticate()`, so there is one allowlist and one
+implementation rather than two things to forget to update. A token that works
+for MCP works for REST.
+
+Two consequences worth stating plainly:
+
+- **Give the PanDA monitor its own client id** (`panda-monitor: <token>`) so
+  service traffic is distinguishable from a human's in the logs, and so the
+  monitor's token can be rotated without touching anyone else's.
+- **When no tokens are configured, authentication is disabled and every caller
+  is recorded as `auth-disabled`.** That is fine on a laptop. On a shared node
+  it means any local account can spend the deployment's daily LLM budget, even
+  with the port bound to `127.0.0.1`. Configure tokens before enabling
+  `BAMBOO_REST_ENABLED` anywhere shared.
+
+The token never reaches the browser. The monitor's Django backend holds it and
+proxies; see [`rest-api.md`](rest-api.md#integrating-the-panda-monitor).
+
+---
+
 ## Recommended Deployment Pattern (CERN / Internal)
 
 1. Bind HTTP server to `127.0.0.1`

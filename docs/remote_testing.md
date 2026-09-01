@@ -57,7 +57,7 @@ python -m bamboo.server_http --host 127.0.0.1 --port 8000
 Expected output:
 
 ```
-Bamboo MCP HTTP server  v1.0.8
+Bamboo MCP HTTP server  v1.1.0
   MCP endpoint : http://127.0.0.1:8000/mcp
   Health check : http://127.0.0.1:8000/healthz
   Workers      : 1

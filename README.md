@@ -315,6 +315,7 @@ npx @modelcontextprotocol/inspector --url http://localhost:8000/mcp
 |---|---|
 | [`docs/developer.md`](docs/developer.md) | Full setup, editable installs, testing, linting |
 | [`docs/http-server.md`](docs/http-server.md) | Running the HTTP server for shared/testbed deployments |
+| [`docs/rest-api.md`](docs/rest-api.md) | REST analysis API — endpoints, polling, caching, budgets, PanDA monitor integration |
 | [`docs/mcp.md`](docs/mcp.md) | MCP protocol, tool contracts, LLM roles, orchestration |
 | [`docs/architecture.md`](docs/architecture.md) | Process boundary, MCP wire, `bamboo_answer` routing flow |
 | [`docs/interfaces.md`](docs/interfaces.md) | TUI, Streamlit UI, HTTP transport, context memory |

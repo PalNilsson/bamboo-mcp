@@ -267,3 +267,4 @@ The analysis logic (log extraction, failure classification, evidence structure) 
 - [`panda_job_status`](panda_job_status.md) — job status without log analysis (for status/metadata questions)
 - [`pilot_source_analysis`](pilot_source_analysis.md) — follow-up tool for `pilot_monitoring_error`: fetches the relevant pilot3 source modules from GitHub and extracts the functions named in the traceback for LLM analysis
 - [`bamboo_last_evidence`](bamboo_last_evidence.md) — inspect the raw evidence dict via `/inspect` or `/json`
+- [`docs/rest-api.md`](../rest-api.md) — the REST facade behind the PanDA monitor's "Analyze failure" button, which reaches this tool by asking `bamboo_answer` "Analyze job N and explain the failure"
