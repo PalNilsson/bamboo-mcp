@@ -159,10 +159,12 @@ Responses:
 Poll a running analysis, or re-read a finished one.  Same envelope as the POST.
 
 - `200` — the record, in whatever state it is in.
-- `400 invalid_request` — the id is not a bare identifier.  Ids arrive straight
-  from a URL path, so anything that could climb out of the store directory is
-  refused rather than sanitised.
-- `404 not_found` — no such record.  Records are swept after
+- `404 not_found` — no such record, or an id that is not a bare identifier.
+  Ids arrive straight from a URL path, so the route only matches when the id
+  matches `[A-Za-z0-9_-]{1,64}`; anything that could climb out of the store
+  directory fails to match and is refused before any id validation runs.  That
+  means a malformed id and an absent one are indistinguishable to a caller,
+  which is deliberate.  Records are swept after
   `BAMBOO_ANALYSIS_RETENTION_S`, so a very old id gives this too.
 
 ### `POST /api/v1/analysis/{id}/rating`
@@ -251,6 +253,18 @@ answer arrived inline, from cache, or after polling.
 | `evidence` | object \| null | Structured evidence behind the answer. |
 | `promptlog` | object \| null | `{index, doc_id}`, or `null` when there is nothing to rate. |
 | `error` | string \| null | Set when `state` is `failed`. |
+
+Two things to know about a cached response, both observed on a running
+deployment rather than inferred:
+
+- `elapsed_s` is the *original* analysis duration, not the lookup time.  A
+  cache hit returns in milliseconds while reporting the 33 seconds the first
+  analysis took.  A panel should show `elapsed_s` only when `cached` is false.
+- `promptlog` points at the *original* turn's document.  Every rating submitted
+  against a cached analysis therefore writes to the same document, last write
+  wins.  For a widget offered to many users on the same popular failure this
+  loses signal; a monitor that wants per-user ratings needs to keep them on its
+  own side.
 
 ### States
 
@@ -497,10 +511,10 @@ time the wording is improved.
 
 | Status | `code` | Cause |
 |---|---|---|
-| 400 | `invalid_request` | Bad or missing `job_id`, unsupported `mode`, malformed or oversized body, bad rating, malformed analysis id. |
+| 400 | `invalid_request` | Bad or missing `job_id`, unsupported `mode`, malformed or oversized body, bad rating. |
 | 401 | `unauthorized` | No `Authorization` header, or a malformed one. |
 | 403 | `unauthorized` | Token present but not in the allowlist. |
-| 404 | `not_found` | Unknown analysis id, unrouted path, or the API is disabled. |
+| 404 | `not_found` | Unknown or malformed analysis id, unrouted path, or the API is disabled. |
 | 405 | `method_not_allowed` | Right path, wrong verb. |
 | 409 | `no_promptlog` | Rating an analysis with no prompt-log document. |
 | 429 | `budget_exhausted` | Daily budget spent.  `Retry-After` header set. |
@@ -565,6 +579,15 @@ The two that matter most on a real deployment are `BAMBOO_REST_STORE_ROOT` and
 
 **404 on `/api/v1` exactly**
 : The prefix needs a path segment.  Use `/api/v1/capabilities`.
+
+**Every request succeeds, including one with no token or a nonsense token**
+: No tokens are configured, so authentication is disabled and every caller is
+  recorded as `auth-disabled`.  Check `BAMBOO_MCP_TOKENS_FILE` and
+  `BAMBOO_MCP_TOKENS` in the *server process* environment.  This fails open and
+  silently: a token that appears to work may never have been checked.  Verify
+  enforcement positively by confirming that a request with no token returns
+  `401` and one with a wrong token returns `403` — not merely that a request
+  with the right token returns `200`.
 
 **401 from the monitor but curl works**
 : The proxy view is not forwarding `Authorization`, or is forwarding the user's
