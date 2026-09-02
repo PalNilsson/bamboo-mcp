@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bamboo"
-version = "1.0.8"
+version = "1.1.0"
 description = "Bamboo — lightweight MCP-based runtime with a plugin architecture for AI-assisted scientific tools."
 requires-python = ">=3.10"
 # mcp upper bound: 2.0.0 removed the low-level Server decorator API used by
