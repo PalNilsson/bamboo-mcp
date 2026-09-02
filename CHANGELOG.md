@@ -747,6 +747,56 @@ All notable changes to Bamboo are documented here.
   every ATLAS name unchecked while the run still looked green. Each guard also
   asserts it checked something, so it cannot go inert.
 
+### Fixed
+- **Prompt-log documents recorded no token counts**
+  (`core/bamboo/tools/llm_passthrough.py`,
+  `core/bamboo/tools/bamboo_executor.py`). Every document in
+  `bamboomcp-promptlog-*` carried `input_tokens: null` and
+  `output_tokens: null`, for every provider, since prompt logging shipped.
+
+  The numbers existed and were thrown away two functions apart.
+  `LLMPassthroughTool.call()` read `resp.usage`, wrote it into the tracing
+  span, and returned `text_content(resp.text)` — a content list, which is the
+  right return type for an MCP tool and cannot carry the usage. `call_llm` then
+  built the `log_prompt` call with `input_tokens=None, output_tokens=None`
+  hardcoded, because by that point there was nothing else to pass.
+
+  `docs/opensearch.md` has documented these fields as populated all along,
+  with a worked example showing `847`/`312` and a suggested "average output
+  token count per model this week" aggregation. That aggregation has been
+  returning nothing.
+
+  Commit 2's metering does not address this. `MeteredLLMClient` wraps the
+  factory output and so sees every call including the planner's, but it feeds a
+  daily counter keyed by provider and model with no notion of which turn a call
+  belonged to. "What did today cost" and "what did this answer cost" need
+  different plumbing.
+
+  `call()` is now a thin wrapper over a new `generate_text()` returning
+  `tuple[str, TokenUsage | None]`. The usage travels as an explicit return
+  value rather than through a slot the caller reads back: with several
+  syntheses in flight, ambient state makes the pairing depend on interleaving,
+  and a wrong pairing is invisible in the index because the totals still look
+  plausible. `tests/test_promptlog_token_usage.py` pins the attribution under
+  `asyncio.gather`.
+
+  The guard in `call_llm` is `is not None`, not truthiness. A provider may
+  report zero, and coercing a real zero to `null` reintroduces the same
+  ambiguity for the cases hardest to notice — `tests/test_narrow_waist.py`
+  builds its fake response with `TokenUsage(0, 0, 0)`, so the truthiness
+  version passes the rest of the suite. Verified by mutation: reverting to the
+  hardcoded `None`s fails four tests, swapping `is not None` for truthiness
+  fails exactly the zero test, and returning the tuple from `call()` fails both
+  the new MCP-shape test and the narrow-waist assertion for
+  `bamboo_llm_answer`.
+
+  **Scope is the synthesis call only.** Planner and topic-guard tokens are
+  still unattributed at document level; they remain in the `cost_guard` daily
+  total, which therefore legitimately exceeds the sum of all documents.
+  Recorded in `docs/opensearch.md` under "Scope of the token counts", together
+  with the note that pre-1.1.0 documents are null regardless of provider so
+  historical aggregations need a date bound.
+
 ### Documentation
 - **`docs/rest-api.md`** (new). The full contract for the `/api/v1` surface:
   the four endpoints, the shared response envelope field by field, the state
