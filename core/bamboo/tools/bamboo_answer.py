@@ -28,6 +28,7 @@ from bamboo.llm.types import Message
 from bamboo.tools.base import MCPContent, coerce_messages, text_content
 from bamboo.tools.llm_passthrough import bamboo_llm_answer_tool
 from bamboo.tools.bamboo_executor import (
+    _extract_delegated_text,
     execute_plan,
     get_last_core_dump_offer,
     get_last_traceback_evidence,
@@ -2345,9 +2346,7 @@ async def _bypass_response(
     delegated = await bamboo_llm_answer_tool.call(
         {"messages": msgs} if msgs else {"question": question}
     )
-    if delegated and isinstance(delegated[0], dict):
-        return text_content(str(delegated[0].get("text", "")))
-    return text_content(str(delegated))
+    return text_content(_extract_delegated_text(delegated))
 
 
 async def _run_topic_guard(

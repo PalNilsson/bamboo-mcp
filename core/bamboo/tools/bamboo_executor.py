@@ -867,6 +867,11 @@ async def retrieve_rag_context(question: str) -> str:
 def _extract_delegated_text(delegated: Any) -> str:
     """Extract the text body from a delegated bamboo_llm_answer_tool result.
 
+    Used by :func:`~bamboo.tools.bamboo_answer._bypass_response`, which is now
+    the only caller: ``call_llm`` in this module reaches the passthrough
+    through ``generate_text()`` instead, so that it receives the token usage
+    alongside the text rather than a content list it would have to unwrap.
+
     Args:
         delegated: Raw return value from ``bamboo_llm_answer_tool.call()``.
 

@@ -797,6 +797,20 @@ All notable changes to Bamboo are documented here.
   with the note that pre-1.1.0 documents are null regardless of provider so
   historical aggregations need a date bound.
 
+- **`_bypass_response` open-coded the delegated-text extraction**
+  (`core/bamboo/tools/bamboo_answer.py`). It duplicated
+  `_extract_delegated_text` inline rather than calling it. Harmless
+  duplication until the token-usage fix above moved `call_llm` off
+  `.call()`, at which point the helper's only remaining caller was its own
+  test file — five tests that would have kept passing while guarding nothing
+  reachable from production.
+
+  `_bypass_response` now calls the helper. Verified by mutation: replacing the
+  helper body with a constant fails its four unit tests *and*
+  `test_bypass_routing_skips_guard_and_execute` and
+  `test_bypass_routing_threads_history`, which reach it through real routing.
+  Before this change only the first four failed.
+
 ### Documentation
 - **`docs/rest-api.md`** (new). The full contract for the `/api/v1` surface:
   the four endpoints, the shared response envelope field by field, the state
