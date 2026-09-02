@@ -115,6 +115,28 @@ Each LLM call produces one document:
 | `input_tokens` | int \| null | Input token count from provider usage object; null when unavailable |
 | `output_tokens` | int \| null | Output token count; null when unavailable |
 
+#### Scope of the token counts
+
+`input_tokens` and `output_tokens` cover **the synthesis call that produced
+`response`, and nothing else**.  A turn that also ran the LLM planner or the
+topic guard spent tokens that no prompt-log document accounts for, and the
+planner's prompt carries the whole tool catalogue, so the gap is not a
+rounding error.
+
+Two consequences when aggregating:
+
+- The daily spend recorded by `bamboo.cost_guard` — which meters every
+  `client.generate()` call through `MeteredLLMClient` — legitimately exceeds
+  the sum of every document's counts.  A mismatch is expected, not a bug.
+- `null` means the provider adapter reported no usage.  Zero means it reported
+  zero.  Use `exists` rather than a comparison against zero when filtering for
+  documents with real counts.
+
+Documents written before v1.1.0 have `null` in both fields regardless of
+provider: the usage was read into the tracing span and discarded before the
+prompt log was built.  Bound any historical aggregation with a date range
+after that release.
+
 ### Reconstructing a conversation
 
 To replay a full session in order:

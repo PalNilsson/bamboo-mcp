@@ -867,6 +867,11 @@ async def retrieve_rag_context(question: str) -> str:
 def _extract_delegated_text(delegated: Any) -> str:
     """Extract the text body from a delegated bamboo_llm_answer_tool result.
 
+    Used by :func:`~bamboo.tools.bamboo_answer._bypass_response`, which is now
+    the only caller: ``call_llm`` in this module reaches the passthrough
+    through ``generate_text()`` instead, so that it receives the token usage
+    alongside the text rather than a content list it would have to unwrap.
+
     Args:
         delegated: Raw return value from ``bamboo_llm_answer_tool.call()``.
 
@@ -930,6 +935,16 @@ async def call_llm(
     :func:`~bamboo.llm.prompt_log.log_prompt` for optional OpenSearch logging
     (fire-and-forget; only active when ``BAMBOO_OPENSEARCH_PROMPTLOG`` is set).
 
+    Token counts come from
+    :meth:`~bamboo.tools.llm_passthrough.LLMPassthroughTool.generate_text`,
+    which is called rather than ``call()`` precisely because an MCP tool's
+    return value cannot carry the usage.  They cover **this synthesis call
+    only** — a turn that also ran the planner or the topic guard spent tokens
+    that no prompt-log document accounts for.  Those are still recorded in the
+    daily total by :class:`~bamboo.llm.metered.MeteredLLMClient`, so the day's
+    spend legitimately exceeds the sum of every document's counts.  ``None``
+    means the provider adapter reported no usage; zero means it reported zero.
+
     Args:
         system: System prompt string.
         user: Synthesised user prompt for the current turn.
@@ -939,6 +954,8 @@ async def call_llm(
         max_tokens: Maximum tokens for the LLM response (default 2048).
         tools_used: Names of MCP tools called during this turn, forwarded to
             the prompt log for observability.  Defaults to an empty list.
+        raw_question: The user's question as typed, forwarded to the prompt log
+            as a keyword field for frequency aggregations.
 
     Returns:
         LLM response text.
@@ -948,11 +965,16 @@ async def call_llm(
         messages.extend(_truncate_history(history))
     messages.append({"role": "user", "content": user})
 
-    delegated = await bamboo_llm_answer_tool.call({
+    response_text, _usage = await bamboo_llm_answer_tool.generate_text({
         "messages": messages,
         "max_tokens": max_tokens,
     })
-    response_text = _extract_delegated_text(delegated)
+
+    # A provider may legitimately report zero, so the guard is ``is not None``.
+    # Truthiness here would silently null out real zeros, which is the same
+    # class of bug as never capturing the usage at all but harder to see.
+    _input_tokens = _usage.input_tokens if _usage is not None else None
+    _output_tokens = _usage.output_tokens if _usage is not None else None
 
     # Fire-and-forget prompt logging — only active when
     # BAMBOO_OPENSEARCH_PROMPTLOG is set.  Deferred import keeps this module
@@ -976,8 +998,8 @@ async def call_llm(
                 provider=_provider,
                 model=_model,
                 max_tokens=max_tokens,
-                input_tokens=None,
-                output_tokens=None,
+                input_tokens=_input_tokens,
+                output_tokens=_output_tokens,
                 raw_question=raw_question,
             ),
             name="bamboo.prompt_log",
