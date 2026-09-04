@@ -7,32 +7,6 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Every HTTP connection failure was reported as a subprocess problem**
-  (`interfaces/shared/mcp_client.py`). A refused endpoint, an unresolvable
-  host, a stopped server, an expired token — all of them produced *"This can
-  happen during startup if the server subprocess exits immediately. Check that
-  the server starts correctly: `python -m bamboo.server`"*. On the HTTP
-  transport the server is a separate long-running process, usually on another
-  host and reached through an SSH tunnel, so that advice is wrong and sends
-  the reader to the wrong machine.
-
-  `_wrap_error` now takes the server config and classifies on the originating
-  error rather than on whatever reached it. HTTP failures name the endpoint and
-  say what to check: an unreachable endpoint points at the server and the
-  tunnel; a connect timeout names its own budget and
-  `BAMBOO_MCP_HTTP_CONNECT_TIMEOUT`; a stalled request names
-  `BAMBOO_MCP_HTTP_TIMEOUT`; a 401 or 403 points at the bearer token, including
-  the raw-value-not-`client_id: token` trap; a completed request that failed
-  the MCP handshake says so rather than blaming reachability. stdio failures
-  keep the subprocess advice, which is correct there, and a subprocess that
-  exits immediately is now diagnosed as exactly that instead of falling into
-  the generic branch.
-
-  Errors this module raises with advice already attached are marked and passed
-  through, so the stdio message naming the command and args is no longer
-  re-wrapped into `"Failed to create MCP client: RuntimeError: Failed to
-  connect to MCP server via stdio. …"` with two sets of instructions.
-
 - **A failed HTTP connect reported a cancellation instead of the error that
   caused it** (`interfaces/shared/mcp_client.py`). Confirmed against mcp 1.29.1
   for connection refused, DNS failure and HTTP 401, on both transport shapes:

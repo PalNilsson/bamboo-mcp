@@ -359,156 +359,25 @@ def _connect_error(exc: BaseException, rollback: BaseException | None) -> BaseEx
     return _originating_error(rollback) or exc
 
 
-class _MCPSetupError(RuntimeError):
-    """A ``RuntimeError`` this module raised, already carrying actionable advice.
+def _wrap_error(exc: BaseException) -> RuntimeError:
+    """Map a transport or session exception onto an actionable RuntimeError.
 
-    :func:`_wrap_error` returns these unchanged.  Without the marker it cannot
-    tell its own message from an arbitrary ``RuntimeError`` and re-wraps it,
-    producing ``"Failed to create MCP client: RuntimeError: Failed to start MCP
-    server subprocess. …"`` with two sets of instructions.
-
-    A ``RuntimeError`` subclass, so every existing ``except RuntimeError`` and
-    ``pytest.raises(RuntimeError)`` continues to match.
-    """
-
-
-def _is_protocol_error(exc: BaseException) -> bool:
-    """Return True for the MCP SDK's ``McpError``, matched by class name.
-
-    Matched by name rather than with ``isinstance``, because
-    ``mcp.shared.exceptions`` cannot be imported at module scope here:
-    ``tests/conftest.py`` installs stub ``mcp`` sub-modules into
-    ``sys.modules`` which shadow a genuine installation, leaving ``mcp`` a
-    plain module rather than a package, so the import raises during collection
-    and takes the whole suite with it.
-
-    The MRO is walked so that SDK subclasses match too.
+    Shared by the per-call path (:meth:`MCPClientSync._run`) and the session
+    startup path (:meth:`MCPClientSync._start_session`) so both report a
+    failure the same way.
 
     Args:
-        exc: The exception to inspect.
+        exc: The exception raised on the loop thread.
 
     Returns:
-        True when ``exc`` is an MCP protocol error.
+        A ``RuntimeError`` carrying ``exc`` as its cause.
     """
-    return any(cls.__name__ == "McpError" for cls in type(exc).__mro__)
-
-
-def _http_status_of(exc: BaseException) -> int | None:
-    """Return the HTTP status carried by an ``httpx.HTTPStatusError``.
-
-    Args:
-        exc: The exception to inspect.
-
-    Returns:
-        The status code, or None when the exception carries no usable
-        response — which happens for hand-constructed instances.
-    """
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    return status if isinstance(status, int) else None
-
-
-def _http_error(exc: BaseException, cfg: MCPServerConfig | None) -> RuntimeError:
-    """Build an actionable error for a failure on the HTTP transport.
-
-    None of the advice mentions starting a server subprocess: on this transport
-    the server is a separate long-running process, usually on another host and
-    often reached through an SSH tunnel, so ``python -m bamboo.server`` is not
-    the remedy and sends the reader looking in the wrong place.
-
-    Args:
-        exc: The originating error, already unwrapped from any task group.
-        cfg: Server configuration, used to name the endpoint.
-
-    Returns:
-        A ``RuntimeError`` describing the failure and what to check.
-    """
-    url = cfg.http_url if cfg is not None else "the configured MCP endpoint"
-    reach = (
-        f"Check that the server is listening at {url}, and that any SSH tunnel "
-        "to it is still up."
-    )
-    if isinstance(exc, httpx.ConnectTimeout):
-        budget = cfg.http_connect_timeout_s if cfg is not None else DEFAULT_HTTP_CONNECT_TIMEOUT_S
-        return RuntimeError(
-            f"No answer from the MCP server at {url} within {budget:g} seconds "
-            "(TCP connect timed out).\n"
-            "The host may be unreachable or a firewall may be dropping the connection.\n"
-            "Raise BAMBOO_MCP_HTTP_CONNECT_TIMEOUT if the link is genuinely that slow.\n"
-            f"Original error: {exc}"
-        )
-    if isinstance(exc, httpx.TimeoutException):
-        return RuntimeError(
-            f"The MCP server at {url} stopped responding mid-request.\n"
-            "Raise BAMBOO_MCP_HTTP_TIMEOUT if the tool being called is expected "
-            "to run this long.\n"
-            f"Original error: {type(exc).__name__}: {exc}"
-        )
-    if isinstance(exc, (httpx.ConnectError, ConnectionRefusedError)):
-        return RuntimeError(
-            f"Cannot reach the MCP server at {url} (connection failed).\n"
-            f"{reach}\n"
-            f"Original error: {exc}"
-        )
-    status = _http_status_of(exc)
-    if status in (401, 403):
-        return RuntimeError(
-            f"The MCP server at {url} rejected the request (HTTP {status}).\n"
-            "Check the bearer token: paste the raw token value, not a "
-            "'client_id: token' pair.\n"
-            f"Original error: {exc}"
-        )
-    if status is not None:
-        return RuntimeError(
-            f"The MCP server at {url} returned HTTP {status}.\n"
-            f"Original error: {exc}"
-        )
-    if _is_protocol_error(exc):
-        return RuntimeError(
-            f"The MCP session at {url} closed before it finished initialising.\n"
-            "The endpoint answered but did not complete the MCP handshake — check "
-            "that this is the /mcp endpoint of a Bamboo server and not another service.\n"
-            f"Original error: {exc}"
-        )
-    if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError)):
-        return RuntimeError(
-            f"Connecting to the MCP server at {url} was cancelled, with no "
-            "underlying error reported.\n"
-            f"{reach}\n"
-            f"Original error: {type(exc).__name__}"
-        )
-    return RuntimeError(
-        f"Failed to reach the MCP server at {url}: {type(exc).__name__}: {exc}\n"
-        f"{reach}"
-    )
-
-
-def _stdio_error(exc: BaseException, cfg: MCPServerConfig | None) -> RuntimeError:
-    """Build an actionable error for a failure on the stdio transport.
-
-    Here the server *is* a subprocess this client spawns, so advice about
-    starting it manually is the right advice.
-
-    Args:
-        exc: The originating error, already unwrapped from any task group.
-        cfg: Server configuration, used to name the command being spawned.
-
-    Returns:
-        A ``RuntimeError`` describing the failure and what to check.
-    """
-    start = "Check that the server starts correctly:\n  python -m bamboo.server"
-    if _is_protocol_error(exc):
-        command = f"{cfg.stdio_command} {' '.join(cfg.stdio_args)}" if cfg is not None else "?"
-        return RuntimeError(
-            "The MCP server subprocess exited before the session was established.\n"
-            f"Command: {command}\n"
-            f"{start}\n"
-            f"Original error: {exc}"
-        )
     if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError)):
         return RuntimeError(
             "MCP server connection was cancelled.\n"
             "This can happen during startup if the server subprocess exits immediately.\n"
-            f"{start}\n"
+            "Check that the server starts correctly:\n"
+            "  python -m bamboo.server\n"
             f"Original error: {type(exc).__name__}"
         )
     if isinstance(exc, ConnectionRefusedError):
@@ -531,39 +400,6 @@ def _stdio_error(exc: BaseException, cfg: MCPServerConfig | None) -> RuntimeErro
         "Is the MCP server running?\n"
         "  python -m bamboo.server"
     )
-
-
-def _wrap_error(exc: BaseException, cfg: MCPServerConfig | None = None) -> RuntimeError:
-    """Map a transport or session exception onto an actionable RuntimeError.
-
-    Shared by the per-call path (:meth:`MCPClientSync._run`) and the session
-    startup path (:meth:`MCPClientSync._start_session`) so both report a
-    failure the same way.
-
-    Classification runs on the *originating* error rather than on whatever
-    reached this function: a transport failure arrives wrapped in anyio task
-    groups, and on the HTTP transport it used to arrive as a bare
-    ``CancelledError`` that was then reported as a subprocess problem.
-
-    Args:
-        exc: The exception raised on the loop thread.
-        cfg: Server configuration.  Selects the advice, since almost nothing
-            said about a spawned subprocess applies to an HTTP endpoint and
-            vice versa.  When omitted, stdio advice is used, matching the
-            default transport in :class:`MCPServerConfig`.
-
-    Returns:
-        A ``RuntimeError`` describing the failure, or ``exc`` itself when it is
-        already one of this module's actionable errors.
-    """
-    if isinstance(exc, _MCPSetupError):
-        return exc
-    origin = _originating_error(exc) or exc
-    if isinstance(origin, _MCPSetupError):
-        return origin
-    if cfg is not None and cfg.transport == "http":
-        return _http_error(origin, cfg)
-    return _stdio_error(origin, cfg)
 
 
 @dataclass
@@ -690,7 +526,7 @@ class MCPAsyncClient:
                 self._transport_cm = stdio_client(params)
                 read_stream, write_stream = await stack.enter_async_context(self._transport_cm)
             except (BrokenPipeError, EOFError, subprocess.SubprocessError) as e:
-                raise _MCPSetupError(
+                raise RuntimeError(
                     f"Failed to start MCP server subprocess. Is the MCP server running?\n"
                     f"Command: {self.cfg.stdio_command}\n"
                     f"Args: {self.cfg.stdio_args}\n"
@@ -699,7 +535,7 @@ class MCPAsyncClient:
                     f"Original error: {e}"
                 ) from e
             except Exception as e:  # pylint: disable=broad-exception-caught
-                raise _MCPSetupError(
+                raise RuntimeError(
                     f"Failed to connect to MCP server via stdio. Is the MCP server running?\n"
                     f"Command: {self.cfg.stdio_command}\n"
                     f"Args: {self.cfg.stdio_args}\n"
@@ -733,9 +569,7 @@ class MCPAsyncClient:
                 func = None
 
             if func is None:
-                raise _MCPSetupError(
-                    "streamable_http_client is not available in this environment"
-                )
+                raise RuntimeError("streamable_http_client is not available in this environment")
 
             # Detect signature to handle both mcp SDK shapes.
             _params = inspect.signature(func).parameters
@@ -816,13 +650,13 @@ class MCPAsyncClient:
     async def list_tools(self) -> Any:
         """List tools from the MCP server."""
         if self._session is None:
-            raise _MCPSetupError("MCP session not connected.")
+            raise RuntimeError("MCP session not connected.")
         return await self._session.list_tools()
 
     async def list_prompts(self) -> Any:
         """List prompts from the MCP server."""
         if self._session is None:
-            raise _MCPSetupError("MCP session not connected.")
+            raise RuntimeError("MCP session not connected.")
         return await self._session.list_prompts()
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -836,7 +670,7 @@ class MCPAsyncClient:
             Tool call result.
         """
         if self._session is None:
-            raise _MCPSetupError("MCP session not connected.")
+            raise RuntimeError("MCP session not connected.")
         return await self._session.call_tool(name, arguments)
 
 
@@ -996,9 +830,9 @@ class MCPClientSync:
         except (asyncio.CancelledError, concurrent.futures.CancelledError) as e:
             # CancelledError is a BaseException, so it must be caught ahead of
             # the bare re-raise below to keep its actionable message.
-            raise _wrap_error(e, self.cfg) from e
+            raise _wrap_error(e) from e
         except Exception as e:
-            raise _wrap_error(e, self.cfg) from e
+            raise _wrap_error(e) from e
         except BaseException:
             # KeyboardInterrupt / SystemExit in the calling thread while the
             # coroutine is still in flight.  Same orphaning hazard as the
@@ -1053,7 +887,7 @@ class MCPClientSync:
         if self._startup_error is not None:
             error = self._startup_error
             self._shutdown_loop_thread()
-            raise _wrap_error(error, self.cfg)
+            raise _wrap_error(error)
 
         self._connected = True
 
