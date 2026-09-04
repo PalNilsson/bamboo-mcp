@@ -12,10 +12,16 @@ Streamlit runs scripts in a managed thread and may interrupt execution during re
 Running the MCP async session on a dedicated event-loop thread and calling it via
 `run_coroutine_threadsafe` avoids cancellation issues and makes the UI stable.
 
-Compatible with MCP streamable HTTP client signature:
+The streamable HTTP transport is resolved at runtime, because which helper
+exists and what it accepts varies across mcp SDK releases:
 
-  streamable_http_client(url, *, http_client=None, terminate_on_close=True)
-    -> async generator yielding (read_stream, write_stream, get_session_id_callback)
+  mcp 1.x: streamablehttp_client(url, headers, timeout, sse_read_timeout,
+           terminate_on_close, httpx_client_factory, auth)
+           and also streamable_http_client(url, http_client, terminate_on_close)
+  mcp 2.x: streamable_http_client(url, http_client, terminate_on_close) only
+
+Either yields an async generator of (read_stream, write_stream) or
+(read_stream, write_stream, get_session_id_callback).
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from collections.abc import Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal
 
 import httpx
 
@@ -39,16 +45,6 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 logger = logging.getLogger(__name__)
-
-# At runtime we import dynamically (some environments may not provide the helper).
-# For static type checkers, import the symbol under TYPE_CHECKING so pyright can see it.
-if TYPE_CHECKING:
-    try:
-        from mcp.client.streamable_http import streamable_http_client  # type: ignore
-    except Exception:  # pylint: disable=broad-exception-caught  # pragma: no cover - only for static analysis
-        streamable_http_client = None  # type: ignore
-
-streamable_http_client: Any = None
 
 
 def _merge_stdio_env(stdio_env: dict[str, str] | None) -> dict[str, str] | None:
@@ -605,12 +601,16 @@ class MCPServerConfig:
 class MCPAsyncClient:
     """Async MCP client with stdio and HTTP transports."""
 
-    def __init__(self, cfg: MCPServerConfig, *, connect_on_init: bool = True):
+    def __init__(self, cfg: MCPServerConfig):
         """Initialize the async client.
+
+        Construction never opens a session: call :meth:`connect`, or use the
+        client as an async context manager.  A ``connect_on_init`` keyword was
+        accepted here and then ignored, which promised a choice that did not
+        exist — nothing connected on construction either way.
 
         Args:
             cfg: Server connection configuration.
-            connect_on_init: If True, connect immediately. If False, connect lazily on first use.
         """
         self.cfg = cfg
         self._session: ClientSession | None = None
@@ -777,7 +777,7 @@ class MCPAsyncClient:
 
             # New SDK yields (read_stream, write_stream, get_session_id_callback);
             # older SDK yields only (read_stream, write_stream).
-            _entered = await stack.enter_async_context(self._transport_cm)
+            _entered = tuple(await stack.enter_async_context(self._transport_cm))
             if len(_entered) == 3:
                 read_stream, write_stream, get_session_id = _entered
                 try:

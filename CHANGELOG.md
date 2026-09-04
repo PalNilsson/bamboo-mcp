@@ -188,6 +188,33 @@ All notable changes to Bamboo are documented here.
   share `_env_timeout`, which falls back on anything unusable.
 
 ### Changed
+- **Removed dead parameters and symbols from the MCP client**
+  (`interfaces/shared/mcp_client.py`). `MCPAsyncClient.__init__` accepted a
+  `connect_on_init` keyword documented as "connect immediately, or lazily on
+  first use" and then ignored it: construction never opened a session either
+  way, so the keyword offered a choice that did not exist. Nothing in the tree
+  passed it. `MCPClientSync` keeps its own `connect_on_init`, which is real and
+  is used by `interfaces/textual/chat.py`.
+
+  A module-level `streamable_http_client: Any = None` shadowed a
+  `TYPE_CHECKING` import of the same name, and neither was ever read — the
+  transport helper is resolved dynamically into a local on every connect. Both
+  are gone, along with the now-unused `TYPE_CHECKING` import.
+
+  The transport's yielded streams are now converted with `tuple()` before
+  `len()`. Both SDK shapes yield a tuple today, but an async generator is only
+  obliged to yield an iterable, and a generator would have produced
+  `TypeError: object of type 'generator' has no len()` in place of connecting.
+
+  The module docstring described only the mcp 2.x transport signature; it now
+  documents both, matching what the code actually probes for.
+
+- **`tests/test_normalise_latex.py` no longer depends on test order**. It stubs
+  `interfaces.shared` as a bare module with no `__path__` but did not stub
+  `interfaces.shared.deeplink`, so importing `chat.py` succeeded only when
+  another test module had already put the real submodule in `sys.modules`. Run
+  on its own, all 12 tests errored at collection.
+
 - **The evidence budget was truncating the one field worth reading**
   (`packages/askpanda_atlas/askpanda_atlas/core_dump_analysis_impl.py`).
   `load_core_evidence` used the analyzer's CLI default of 50 000 characters —

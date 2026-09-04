@@ -40,6 +40,7 @@ def _import_normalise_latex():
         "interfaces",
         "interfaces.shared",
         "interfaces.shared.mcp_client",
+        "interfaces.shared.deeplink",
         "interfaces.shared.superuser_guard",
     ]
     stubs = {
@@ -52,6 +53,7 @@ def _import_normalise_latex():
         "interfaces": types.ModuleType("interfaces"),
         "interfaces.shared": types.ModuleType("interfaces.shared"),
         "interfaces.shared.mcp_client": MagicMock(),
+        "interfaces.shared.deeplink": MagicMock(),
         "interfaces.shared.superuser_guard": MagicMock(),
     }
 

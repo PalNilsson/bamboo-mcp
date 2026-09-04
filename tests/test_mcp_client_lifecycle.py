@@ -13,9 +13,12 @@ held a reference through which it could be closed.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
 import threading
-from collections.abc import Iterator
-from contextlib import AsyncExitStack
+import types
+from collections.abc import AsyncIterator, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 import pytest
@@ -1562,3 +1565,160 @@ class TestAsyncContextManager:
         asyncio.run(_scenario())
 
         assert closed == ["transport"], "the transport was closed twice"
+
+
+class _FakeSession:
+    """Minimal stand-in for ``mcp.client.session.ClientSession``.
+
+    Only what :meth:`MCPAsyncClient._connect_into` needs: the async context
+    manager protocol and an ``initialize`` coroutine.
+    """
+
+    def __init__(self, read_stream: Any, write_stream: Any) -> None:
+        """Record the streams handed over by the transport.
+
+        Args:
+            read_stream: Read stream from the transport.
+            write_stream: Write stream from the transport.
+        """
+        self.read_stream = read_stream
+        self.write_stream = write_stream
+
+    async def __aenter__(self) -> "_FakeSession":
+        """Enter the session.
+
+        Returns:
+            Self.
+        """
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        """Exit the session.
+
+        Args:
+            *exc_info: Exception triple, ignored.
+        """
+
+    async def initialize(self) -> None:
+        """Stand in for the MCP handshake."""
+
+
+class TestConstructionOpensNothing:
+    """Tests that building an :class:`MCPAsyncClient` connects nothing.
+
+    ``__init__`` accepted a ``connect_on_init`` keyword and then ignored it,
+    offering a choice that did not exist: construction never opened a session
+    either way. The keyword is gone; this pins the behaviour it misdescribed.
+    """
+
+    def test_a_new_client_has_no_session(self) -> None:
+        """Nothing is opened until ``connect`` or ``async with``."""
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        assert client._session is None
+        assert client._transport_cm is None
+        assert client._stack is None
+        assert client.http_session_id is None
+
+    def test_the_constructor_takes_only_a_config(self) -> None:
+        """Guards against re-adding a keyword the constructor would ignore."""
+        params = list(inspect.signature(MCPAsyncClient.__init__).parameters)
+
+        assert params == ["self", "cfg"], params
+
+
+class TestTransportYieldUnpacking:
+    """Tests that the transport's yielded streams need not be a sized object.
+
+    The code called ``len()`` on whatever the transport yielded. Both SDK
+    shapes yield a tuple today, but an async generator is only required to
+    yield an iterable, and a generator would have raised ``TypeError: object of
+    type 'generator' has no len()`` in place of connecting.
+    """
+
+    @staticmethod
+    def _client_with_yield(monkeypatch: pytest.MonkeyPatch, value: Any) -> MCPAsyncClient:
+        """Build a client whose HTTP transport yields ``value``.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+            value: What the transport context manager should yield.
+
+        Returns:
+            A client ready to connect.
+        """
+        @asynccontextmanager
+        async def _transport(*_args: Any, **_kwargs: Any) -> AsyncIterator[Any]:
+            """Yield the configured value.
+
+            Yields:
+                The configured value.
+            """
+            yield value
+
+        module = types.SimpleNamespace(streamable_http_client=_transport)
+        real_import = importlib.import_module
+
+        def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+            """Return the fake transport module for the SDK path only.
+
+            Args:
+                name: Module name being imported.
+                *args: Passed through.
+                **kwargs: Passed through.
+
+            Returns:
+                The fake module, or the real import result.
+            """
+            if name == "mcp.client.streamable_http":
+                return module
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib, "import_module", _import)
+        # tests/conftest.py stubs ClientSession with a MagicMock, which is not
+        # an async context manager, so the real class cannot be used here.
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.ClientSession", _FakeSession, raising=False
+        )
+        return MCPAsyncClient(MCPServerConfig(transport="http"))
+
+    def test_a_three_tuple_yields_a_session_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The newer shape carries a session-id callback.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        client = self._client_with_yield(
+            monkeypatch, (object(), object(), lambda: "session-abc")
+        )
+
+        asyncio.run(client.connect())
+
+        assert client.http_session_id == "session-abc"
+
+    def test_a_two_tuple_has_no_session_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The older shape yields only the two streams.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        client = self._client_with_yield(monkeypatch, (object(), object()))
+
+        asyncio.run(client.connect())
+
+        assert client.http_session_id is None
+
+    def test_an_unsized_iterable_still_connects(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A generator has no ``len()``, and must not fail the connect.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        streams = (object(), object(), lambda: "session-xyz")
+        client = self._client_with_yield(monkeypatch, (item for item in streams))
+
+        asyncio.run(client.connect())
+
+        assert client.http_session_id == "session-xyz"
