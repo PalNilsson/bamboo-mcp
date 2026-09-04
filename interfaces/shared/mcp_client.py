@@ -96,23 +96,49 @@ DEFAULT_HTTP_TIMEOUT_S: float = 300.0
 DEFAULT_CLIENT_TIMEOUT_S: float = 300.0
 
 
+def _env_timeout(var: str, default: float) -> float:
+    """Read a positive timeout, in seconds, from an environment variable.
+
+    An unset, blank, unparsable or non-positive value falls back to ``default``
+    rather than raising.  A typo in a deployment environment must not be able to
+    stop the client from starting, nor to turn every subsequent MCP call into a
+    :class:`ValueError`.
+
+    Args:
+        var: Environment variable name to read.
+        default: Value to fall back to.
+
+    Returns:
+        The parsed timeout in seconds, or ``default``.
+    """
+    raw = os.environ.get(var, "")
+    if not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _default_http_timeout() -> float:
     """Resolve the HTTP transport timeout from the environment.
 
     Returns:
         ``BAMBOO_MCP_HTTP_TIMEOUT`` as a float, or
-        :data:`DEFAULT_HTTP_TIMEOUT_S` when it is unset or unparsable.  An
-        unparsable value falls back rather than raising, so a typo in a
-        deployment environment cannot stop the client from starting.
+        :data:`DEFAULT_HTTP_TIMEOUT_S` when it is unset or unparsable.
     """
-    raw = os.environ.get("BAMBOO_MCP_HTTP_TIMEOUT", "")
-    if not raw.strip():
-        return DEFAULT_HTTP_TIMEOUT_S
-    try:
-        value = float(raw)
-    except ValueError:
-        return DEFAULT_HTTP_TIMEOUT_S
-    return value if value > 0 else DEFAULT_HTTP_TIMEOUT_S
+    return _env_timeout("BAMBOO_MCP_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_S)
+
+
+def _default_client_timeout() -> float:
+    """Resolve the client-side per-call deadline from the environment.
+
+    Returns:
+        ``BAMBOO_MCP_CLIENT_TIMEOUT`` as a float, or
+        :data:`DEFAULT_CLIENT_TIMEOUT_S` when it is unset or unparsable.
+    """
+    return _env_timeout("BAMBOO_MCP_CLIENT_TIMEOUT", DEFAULT_CLIENT_TIMEOUT_S)
 
 
 @dataclass
@@ -347,13 +373,44 @@ class MCPClientSync:
 
         # Optionally connect on the loop thread (e.g., Streamlit wants immediate readiness).
         if self._connect_on_init:
-            self._run(self._client.connect())
+            try:
+                self._run(self._client.connect())
+            except BaseException:
+                # A failed connect must not leave the loop thread running.  The
+                # thread is a daemon and ``__init__`` is propagating, so the
+                # caller never receives a reference to call ``close()`` on:
+                # without this teardown the thread survives for the life of the
+                # process, still owning whatever half-open transport
+                # ``connect()`` had reached.  Streamlit's
+                # ``@st.cache_resource`` does not memoise exceptions, so the
+                # next rerun constructs another client and the orphans
+                # accumulate one per failed attempt.
+                self._shutdown_loop_thread()
+                raise
             self._connected = True
 
     def _run_loop(self) -> None:
         """Event loop thread target."""
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
+
+    def _shutdown_loop_thread(self, *, join_timeout: float = 2.0) -> None:
+        """Stop the background event loop and join its thread.
+
+        Safe to call repeatedly, and safe on a partially initialised client.
+        The loop is closed only once the thread has actually exited, because
+        closing a running loop raises :class:`RuntimeError` — which, on the
+        failure path in :meth:`__init__`, would mask the original connection
+        error.
+
+        Args:
+            join_timeout: Seconds to wait for the loop thread to exit.
+        """
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=join_timeout)
+        if not self._thread.is_alive() and not self._loop.is_closed():
+            self._loop.close()
 
     def _run(self, coro: "asyncio.Future[Any] | Coroutine[Any, Any, Any]") -> Any:
         """Run a coroutine on the background loop and wait for the result.
@@ -378,10 +435,22 @@ class MCPClientSync:
         # sized for large BigPanDA task fetches (60–90 s for tasks with many
         # thousands of jobs); a long-running tool that waits inline, plus the
         # planner and synthesis LLM calls around it, does not fit in that.
-        _timeout = int(os.environ.get("BAMBOO_MCP_CLIENT_TIMEOUT", str(int(DEFAULT_CLIENT_TIMEOUT_S))))
+        _timeout = _default_client_timeout()
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)  # type: ignore[arg-type]
         try:
             return fut.result(timeout=_timeout)
+        except concurrent.futures.TimeoutError as e:
+            # Giving up on the *future* does not stop the coroutine: it keeps
+            # running on the loop thread, still holding its transport, with no
+            # remaining reference through which it could ever be closed.  A
+            # timed-out ``connect()`` orphaned exactly this way was left
+            # spinning a full core for 17 hours on aipanda033.
+            fut.cancel()
+            raise RuntimeError(
+                f"MCP server call timed out after {_timeout:g} seconds.\n"
+                "Is the MCP server running and responding?\n"
+                "Try increasing BAMBOO_MCP_CLIENT_TIMEOUT if fetching large tasks."
+            ) from e
         except (asyncio.CancelledError, concurrent.futures.CancelledError) as e:
             raise RuntimeError(
                 f"MCP server connection was cancelled.\n"
@@ -389,12 +458,6 @@ class MCPClientSync:
                 f"Check that the server starts correctly:\n"
                 f"  python -m bamboo.server\n"
                 f"Original error: {type(e).__name__}"
-            ) from e
-        except concurrent.futures.TimeoutError as e:
-            raise RuntimeError(
-                f"MCP server call timed out after {_timeout} seconds.\n"
-                "Is the MCP server running and responding?\n"
-                "Try increasing BAMBOO_MCP_CLIENT_TIMEOUT if fetching large tasks."
             ) from e
         except ConnectionRefusedError as e:
             raise RuntimeError(
@@ -417,6 +480,12 @@ class MCPClientSync:
                 f"Is the MCP server running?\n"
                 f"  python -m bamboo.server"
             ) from e
+        except BaseException:
+            # KeyboardInterrupt / SystemExit in the calling thread while the
+            # coroutine is still in flight.  Same orphaning hazard as the
+            # timeout path above, so cancel before unwinding.
+            fut.cancel()
+            raise
 
     def ensure_connected(self) -> None:
         """Connect to the MCP server if not already connected."""
@@ -432,10 +501,7 @@ class MCPClientSync:
                 self._run(self._client.aclose())
             self._connected = False
         finally:
-            if self._loop.is_running():
-                self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join(timeout=2.0)
-            self._loop.close()
+            self._shutdown_loop_thread()
 
     def list_tools(self) -> Any:
         """List tools (sync)."""

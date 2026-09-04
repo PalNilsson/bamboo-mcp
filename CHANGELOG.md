@@ -6,6 +6,35 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **A timed-out MCP connection orphaned its event-loop thread and spun a full
+  CPU core** (`interfaces/shared/mcp_client.py`). `MCPClientSync._run` waited on
+  `fut.result(timeout=...)` and, on expiry, raised without cancelling the
+  future — but abandoning the future does not stop the coroutine, which kept
+  running on the loop thread still holding its transport. Because the failure
+  happened inside `__init__`, the caller never received a reference to call
+  `close()` on, and the thread is a daemon, so it survived for the life of the
+  process.
+
+  On `aipanda033` this ran for 17 hours at 100% of one core. `py-spy` put the
+  time in `_deliver_cancellation` (anyio), which re-arms itself on every loop
+  iteration until the cancelled task exits; 40/40 samples of
+  `/proc/<tid>/syscall` read `running`, confirming a pure userspace loop rather
+  than a selector spin. Streamlit's `@st.cache_resource` does not memoise
+  exceptions, so each failed attempt left another orphan behind.
+
+  `_run` now cancels the future on timeout and on a non-`Exception`
+  `BaseException` unwind, and a failed connect-on-init tears the loop thread
+  down through a new shared `_shutdown_loop_thread` helper before re-raising.
+  The helper closes the loop only after the thread has exited, since closing a
+  running loop would raise and mask the original connection error; `close()`
+  now uses it too.
+
+  Also `BAMBOO_MCP_CLIENT_TIMEOUT` was parsed with a bare
+  `int(os.environ.get(...))`, so a typo such as `300s` raised `ValueError` on
+  every MCP call and a sub-second value floored to zero. Both timeouts now
+  share `_env_timeout`, which falls back on anything unusable.
+
 ### Changed
 - **The evidence budget was truncating the one field worth reading**
   (`packages/askpanda_atlas/askpanda_atlas/core_dump_analysis_impl.py`).
