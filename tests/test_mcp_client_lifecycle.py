@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
+from contextlib import AsyncExitStack
 from typing import Any
 
 import pytest
@@ -24,10 +25,12 @@ import httpx
 from interfaces.shared.mcp_client import (
     DEFAULT_CLIENT_TIMEOUT_S,
     DEFAULT_HTTP_CONNECT_TIMEOUT_S,
+    MCPAsyncClient,
     MCPClientSync,
     MCPServerConfig,
     _default_client_timeout,
     _default_http_connect_timeout,
+    _aclose_quietly,
     _env_timeout,
     _make_http_client_factory,
     _with_connect_timeout,
@@ -524,3 +527,149 @@ class TestConnectTimeoutIsSeparate:
             assert client.timeout.read == 300.0
         finally:
             asyncio.run(client.aclose())
+
+
+class TestPartialConnectIsUnwound:
+    """Tests that a failed connect leaves no transport, session or client.
+
+    Observed against mcp 1.29.1: an unreachable HTTP endpoint let the transport
+    and session establish, then surfaced as ``CancelledError`` from inside the
+    SDK's task group with both still attached. The caller saw an exception and
+    had no reference through which to close them, and the async generator was
+    later finalised by loop shutdown from a foreign task — raising
+    ``Attempted to exit cancel scope in a different task``.
+    """
+
+    def test_failed_connect_leaves_no_residue(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Everything established before the failure is detached and closed.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        closed: list[str] = []
+
+        async def _establish_then_fail(self: Any, stack: AsyncExitStack) -> None:
+            async def _record() -> None:
+                closed.append("transport")
+
+            stack.push_async_callback(_record)
+            self._transport_cm = object()
+            self._session = object()
+            self._http_client = object()
+            self.http_session_id = "abc123"
+            raise ConnectionRefusedError("nobody home")
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _establish_then_fail
+        )
+
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+        with pytest.raises(ConnectionRefusedError):
+            asyncio.run(client.connect())
+
+        assert closed == ["transport"], "the partial transport was not unwound"
+        assert client._session is None
+        assert client._transport_cm is None
+        assert client._http_client is None
+        assert client._stack is None
+        assert client.http_session_id is None
+
+    def test_aclose_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Closing twice unwinds once and does not raise.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        closed: list[str] = []
+
+        async def _establish(self: Any, stack: AsyncExitStack) -> None:
+            async def _record() -> None:
+                closed.append("transport")
+
+            stack.push_async_callback(_record)
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _establish
+        )
+
+        async def _scenario() -> None:
+            client = MCPAsyncClient(MCPServerConfig(transport="http"))
+            await client.connect()
+            await client.aclose()
+            await client.aclose()
+
+        asyncio.run(_scenario())
+
+        assert closed == ["transport"]
+
+
+class TestTeardownIsBestEffort:
+    """Tests that one failing teardown stage does not skip the others.
+
+    ``aclose`` previously ran its stages in sequence with no ``except``, so a
+    session close that raised propagated immediately and the transport and HTTP
+    client were never closed at all.
+    """
+
+    def test_every_stage_runs_when_an_earlier_one_raises(self) -> None:
+        """A raising exit does not prevent the remaining exits."""
+        ran: list[str] = []
+
+        async def _ok() -> None:
+            ran.append("transport")
+
+        async def _boom() -> None:
+            ran.append("session")
+            raise RuntimeError("session close failed")
+
+        async def _scenario() -> None:
+            stack = AsyncExitStack()
+            # LIFO: session unwinds first and raises, transport must still run.
+            stack.push_async_callback(_ok)
+            stack.push_async_callback(_boom)
+            await _aclose_quietly(stack, "test teardown")
+
+        asyncio.run(_scenario())
+
+        assert ran == ["session", "transport"], "teardown stopped at the failure"
+
+    def test_cancellation_during_teardown_is_not_propagated(self) -> None:
+        """A wedged cancel scope surfaces as CancelledError and is swallowed.
+
+        Teardown runs on failure paths and in ``finally`` blocks; re-raising
+        would replace the error the caller actually needs.
+        """
+        async def _cancelled() -> None:
+            raise asyncio.CancelledError("wedged scope")
+
+        async def _scenario() -> None:
+            stack = AsyncExitStack()
+            stack.push_async_callback(_cancelled)
+            await _aclose_quietly(stack, "test teardown")
+
+        asyncio.run(_scenario())
+
+    def test_failed_startup_closes_the_session(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The runner closes any partial session before reporting failure.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        calls = {"aclose": 0}
+
+        async def _boom(_self: Any) -> None:
+            raise ConnectionRefusedError("nobody home")
+
+        async def _aclose(_self: Any) -> None:
+            calls["aclose"] += 1
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _boom)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _aclose)
+
+        with pytest.raises(RuntimeError, match="connection refused"):
+            MCPClientSync(cfg)
+
+        assert calls["aclose"] == 1, "startup failure did not close the session"

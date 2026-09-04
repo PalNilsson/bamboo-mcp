@@ -7,6 +7,36 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **A failed connect left a fully established transport behind, and a failing
+  session close abandoned the rest of the teardown**
+  (`interfaces/shared/mcp_client.py`). Two defects on the same path, both
+  reproduced against mcp 1.29.1 with an unreachable HTTP endpoint:
+
+  `connect()` established the transport and session, then surfaced the failure
+  as `CancelledError` from inside the SDK's task group with both still
+  attached. The caller saw an exception and would reasonably assume nothing had
+  been allocated — but had no reference through which to close it. The async
+  generator was then finalised by loop shutdown from a foreign task, raising
+  `Attempted to exit cancel scope in a different task`, which is the same
+  wedge that spun a core on `aipanda033`.
+
+  `aclose()` ran its three stages in sequence with `try`/`finally` but no
+  `except`, so a session close that raised propagated out of the first stage
+  and the transport and HTTP client were never closed at all. Observed
+  directly: after `aclose()` raised, `_transport_cm` was still set.
+
+  `connect()` now registers everything it opens on an `AsyncExitStack` and
+  unwinds it in the entering task before re-raising, so a failure leaves
+  `_session`, `_transport_cm`, `_http_client` and `http_session_id` all clear.
+  `aclose()` is stack-driven, idempotent and best-effort: every stage runs even
+  if an earlier one fails, and teardown errors are logged rather than raised,
+  since teardown happens on failure paths and inside `finally` blocks where
+  re-raising would replace the error the caller needs. The session runner also
+  closes any partial session while still on the owning task.
+
+  One useful side effect: the rollback log now carries the underlying
+  `httpx.ConnectError` that anyio's cancellation had been hiding.
+
 - **A refused or unreachable MCP endpoint took the full per-call budget to
   report** (`interfaces/shared/mcp_client.py`). A single `httpx` timeout value
   applies to the connect phase as well as read, so raising `http_timeout_s` to

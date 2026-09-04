@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Coroutine
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
 
@@ -252,6 +253,29 @@ def _make_http_client_factory(connect_timeout_s: float) -> Any:
     return factory
 
 
+async def _aclose_quietly(stack: AsyncExitStack, what: str) -> None:
+    """Unwind ``stack`` without letting teardown errors escape.
+
+    ``AsyncExitStack`` already runs every registered exit even when one raises,
+    so this only decides what happens to the final exception.  It is logged
+    rather than propagated: teardown runs on failure paths and inside
+    ``finally`` blocks, where re-raising would replace the error the caller
+    actually needs to see.
+
+    Args:
+        stack: The exit stack to unwind.
+        what: Short description of the teardown, used in the log message.
+    """
+    try:
+        await stack.aclose()
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning("MCP client: error while %s.", what, exc_info=True)
+    except BaseException:  # noqa: B036 - cancellation during teardown is expected
+        # A wedged anyio cancel scope surfaces here as CancelledError.  There is
+        # nothing left to salvage and re-raising would mask the original error.
+        logger.warning("MCP client: %s was cancelled.", what)
+
+
 def _wrap_error(exc: BaseException) -> RuntimeError:
     """Map a transport or session exception onto an actionable RuntimeError.
 
@@ -343,8 +367,14 @@ class MCPAsyncClient:
         self.cfg = cfg
         self._session: ClientSession | None = None
 
-        # Underlying transport context manager (stdio_client or streamable_http_client)
+        # Underlying transport context manager (stdio_client or streamable_http_client).
+        # Retained for observability only: the exit stack below owns unwinding it.
         self._transport_cm: Any = None
+
+        # Owns every resource connect() establishes, so that a partial failure
+        # unwinds in the task that entered it.  anyio cancel scopes are
+        # task-affine and cannot be exited from elsewhere.
+        self._stack: AsyncExitStack | None = None
 
         # For HTTP: keep a configured AsyncClient if headers are needed
         self._http_client: httpx.AsyncClient | None = None
@@ -359,7 +389,39 @@ class MCPAsyncClient:
             Self.
 
         Raises:
-            RuntimeError: If initialization fails.
+            RuntimeError: If initialization fails.  Anything already
+                established is unwound before the exception propagates, so a
+                failed connect leaves no transport, session or HTTP client
+                behind.
+        """
+        stack = AsyncExitStack()
+        try:
+            await self._connect_into(stack)
+        except BaseException:
+            # Roll back here, in the task that entered these context managers.
+            # Without this the caller sees an exception yet a fully established
+            # transport is left dangling with no reference through which to
+            # close it — and the async generator is later finalised by loop
+            # shutdown from a foreign task, which raises "Attempted to exit
+            # cancel scope in a different task".
+            await _aclose_quietly(stack, "rolling back a failed connect")
+            self._session = None
+            self._transport_cm = None
+            self._http_client = None
+            self._stack = None
+            self.http_session_id = None
+            raise
+        self._stack = stack
+        return self
+
+    async def _connect_into(self, stack: AsyncExitStack) -> None:
+        """Establish the transport and session, registering both on ``stack``.
+
+        Args:
+            stack: Exit stack taking ownership of everything opened here.
+
+        Raises:
+            RuntimeError: If the transport is unavailable or fails to start.
         """
         if self.cfg.transport == "stdio":
             params = StdioServerParameters(
@@ -369,7 +431,7 @@ class MCPAsyncClient:
             )
             try:
                 self._transport_cm = stdio_client(params)
-                read_stream, write_stream = await self._transport_cm.__aenter__()  # pylint: disable=unnecessary-dunder-call
+                read_stream, write_stream = await stack.enter_async_context(self._transport_cm)
             except (BrokenPipeError, EOFError, subprocess.SubprocessError) as e:
                 raise RuntimeError(
                     f"Failed to start MCP server subprocess. Is the MCP server running?\n"
@@ -426,6 +488,7 @@ class MCPAsyncClient:
                 self._http_client = httpx.AsyncClient(
                     headers=self.cfg.http_headers, timeout=timeout
                 )
+                stack.push_async_callback(self._http_client.aclose)
                 self._transport_cm = func(
                     self.cfg.http_url,
                     http_client=self._http_client,
@@ -454,7 +517,7 @@ class MCPAsyncClient:
 
             # New SDK yields (read_stream, write_stream, get_session_id_callback);
             # older SDK yields only (read_stream, write_stream).
-            _entered = await self._transport_cm.__aenter__()  # pylint: disable=unnecessary-dunder-call
+            _entered = await stack.enter_async_context(self._transport_cm)
             if len(_entered) == 3:
                 read_stream, write_stream, get_session_id = _entered
                 try:
@@ -465,35 +528,31 @@ class MCPAsyncClient:
                 read_stream, write_stream = _entered
                 self.http_session_id = None
 
-        self._session = ClientSession(read_stream, write_stream)
-        await self._session.__aenter__()  # pylint: disable=unnecessary-dunder-call
+        self._session = await stack.enter_async_context(
+            ClientSession(read_stream, write_stream)
+        )
 
         # Initialize MCP session
         await self._session.initialize()
-        return self
 
     async def aclose(self) -> None:
-        """Close session and transport cleanly."""
-        # Close session first
-        if self._session is not None:
-            try:
-                await self._session.__aexit__(None, None, None)
-            finally:
-                self._session = None
+        """Close session, transport and HTTP client cleanly.
 
-        # Then close transport
-        if self._transport_cm is not None:
-            try:
-                await self._transport_cm.__aexit__(None, None, None)
-            finally:
-                self._transport_cm = None
+        Idempotent, and safe to call from a ``finally`` block: every stage runs
+        even if an earlier one fails, and teardown errors are logged rather than
+        raised.  Previously a failure closing the session propagated out of the
+        first stage and the transport was never exited at all.
 
-        # Then close HTTP client if used
-        if self._http_client is not None:
-            try:
-                await self._http_client.aclose()
-            finally:
-                self._http_client = None
+        Must run in the same task that ran :meth:`connect`, which is what
+        :class:`MCPClientSync` guarantees via its session runner task.
+        """
+        stack, self._stack = self._stack, None
+        self._session = None
+        self._transport_cm = None
+        self._http_client = None
+        self.http_session_id = None
+        if stack is not None:
+            await _aclose_quietly(stack, "closing the MCP session")
 
     async def list_tools(self) -> Any:
         """List tools from the MCP server."""
@@ -603,6 +662,10 @@ class MCPClientSync:
             await self._client.connect()
         except BaseException as exc:  # noqa: B036 - recorded and re-raised on the caller's thread
             self._startup_error = exc
+            # connect() rolls its own partial state back, but call this while
+            # still on the owning task in case anything survived: aclose() is
+            # idempotent and a no-op when nothing was established.
+            await self._client.aclose()
             return
         finally:
             # Set even on failure: the caller is blocked on this and must not
