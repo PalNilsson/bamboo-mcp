@@ -260,3 +260,175 @@ class TestShutdown:
 
         assert not client._thread.is_alive()
         assert client._loop.is_closed()
+
+
+class TestSingleTaskSessionLifecycle:
+    """Tests that one task owns the session from open to close.
+
+    anyio cancel scopes are task-affine.  Entering a transport in one task and
+    exiting it in another raises ``Attempted to exit cancel scope in a different
+    task`` and can leave the scope re-delivering cancellation forever, which is
+    what burned a CPU core in production.
+    """
+
+    def test_connect_and_aclose_run_in_the_same_task(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``connect()`` and ``aclose()`` must share one asyncio task.
+
+        This is the mutation target for the runner: routing ``aclose()`` back
+        through ``_run`` as a fresh coroutine must fail this test.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        tasks: dict[str, object] = {}
+
+        async def _connect(_self: Any) -> None:
+            tasks["connect"] = asyncio.current_task()
+
+        async def _aclose(_self: Any) -> None:
+            tasks["aclose"] = asyncio.current_task()
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _connect)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _aclose)
+
+        client = MCPClientSync(cfg)
+        client.close()
+
+        assert tasks["connect"] is not None
+        assert tasks["aclose"] is tasks["connect"], "session was closed by a different task"
+
+    def test_tool_calls_run_outside_the_owning_task(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tool calls stay independently cancellable, i.e. separate tasks.
+
+        The runner owns the session lifetime only.  If tool calls were serialised
+        onto the runner task they could not be cancelled without tearing the
+        session down.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        tasks: dict[str, object] = {}
+
+        async def _connect(_self: Any) -> None:
+            tasks["connect"] = asyncio.current_task()
+
+        async def _noop(_self: Any) -> None:
+            return None
+
+        async def _list_tools(_self: Any) -> str:
+            tasks["call"] = asyncio.current_task()
+            return "ok"
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _connect)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _noop)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.list_tools", _list_tools)
+
+        client = MCPClientSync(cfg)
+        try:
+            assert client.list_tools() == "ok"
+            assert tasks["call"] is not tasks["connect"]
+        finally:
+            client.close()
+
+    def test_session_is_closed_exactly_once(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Repeated ``close()`` calls close the session once.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        calls = {"aclose": 0}
+
+        async def _noop(_self: Any) -> None:
+            return None
+
+        async def _aclose(_self: Any) -> None:
+            calls["aclose"] += 1
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _noop)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _aclose)
+
+        client = MCPClientSync(cfg)
+        client.close()
+        client.close()
+
+        assert calls["aclose"] == 1
+
+    def test_lazy_connect_starts_the_runner_on_first_call(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With ``connect_on_init=False`` the session opens on first use.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        calls = {"connect": 0}
+
+        async def _connect(_self: Any) -> None:
+            calls["connect"] += 1
+
+        async def _noop(_self: Any) -> None:
+            return None
+
+        async def _list_tools(_self: Any) -> str:
+            return "ok"
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _connect)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _noop)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.list_tools", _list_tools)
+
+        client = MCPClientSync(cfg, connect_on_init=False)
+        try:
+            assert calls["connect"] == 0
+            client.list_tools()
+            client.list_tools()
+            assert calls["connect"] == 1, "session opened more than once"
+        finally:
+            client.close()
+
+    def test_reuse_after_close_is_refused(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A closed client must not silently start a second loop.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        async def _noop(_self: Any) -> None:
+            return None
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _noop)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _noop)
+
+        client = MCPClientSync(cfg)
+        client.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            client.ensure_connected()
+
+    def test_startup_failure_reports_the_original_error(
+        self, cfg: MCPServerConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A connect failure surfaces its own message, not a readiness timeout.
+
+        Args:
+            cfg: Server configuration fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        async def _refused(_self: Any) -> None:
+            raise ConnectionRefusedError("nobody home")
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _refused)
+
+        with pytest.raises(RuntimeError, match="connection refused"):
+            MCPClientSync(cfg)

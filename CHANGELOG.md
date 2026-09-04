@@ -7,6 +7,39 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **The MCP session was opened and closed by different tasks, which can wedge an
+  anyio cancel scope** (`interfaces/shared/mcp_client.py`). `MCPClientSync`
+  submitted `connect()` and `aclose()` as two separate
+  `run_coroutine_threadsafe` calls, so the transport's `__aenter__` and
+  `__aexit__` ran in different tasks. anyio cancel scopes are task-affine:
+  exiting from a foreign task raises `Attempted to exit cancel scope in a
+  different task` and can leave the scope re-delivering cancellation on every
+  loop iteration — the `_deliver_cancellation` loop that consumed a core on
+  `aipanda033`.
+
+  The session is now owned end to end by a single long-lived task
+  (`_session_runner`): it opens the session, signals readiness, waits on an
+  `asyncio.Event`, and closes the session in the same task. `close()` signals
+  that event rather than submitting a fresh `aclose()` coroutine, and waits a
+  bounded `SHUTDOWN_TIMEOUT_S` (10 s) rather than the per-call deadline, which
+  can be several minutes.
+
+  Tool calls deliberately still run as their own tasks — they use the session
+  but do not own its lifetime, so they stay independently cancellable, which the
+  timeout guard added alongside this depends on.
+
+  `MCPAsyncClient` is unchanged: `scripts/bamboo_agent.py` drives it directly
+  and `tests/test_agent.py` mocks it with `MagicMock(spec=...)`. Those call
+  sites were never affected, because they already open and close inside one
+  `asyncio.run` task.
+
+  Also replaced the `time.sleep(0.1)` startup guess with a `threading.Event`
+  signalled from inside the loop. This became load-bearing rather than
+  cosmetic: `_shutdown_loop_thread` decides whether to stop the loop based on
+  `is_running()`, so a teardown racing a not-yet-started loop could leave the
+  thread running forever. The per-exception messages in `_run` moved to a shared
+  `_wrap_error`, so the per-call and startup paths report failures identically.
+
 - **A timed-out MCP connection orphaned its event-loop thread and spun a full
   CPU core** (`interfaces/shared/mcp_client.py`). `MCPClientSync._run` waited on
   `fut.result(timeout=...)` and, on expiry, raised without cancelling the

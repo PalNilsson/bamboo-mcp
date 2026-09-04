@@ -23,10 +23,10 @@ from __future__ import annotations
 import asyncio
 import os
 import concurrent.futures
+import logging
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
@@ -35,6 +35,8 @@ import httpx
 
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+
+logger = logging.getLogger(__name__)
 
 # At runtime we import dynamically (some environments may not provide the helper).
 # For static type checkers, import the symbol under TYPE_CHECKING so pyright can see it.
@@ -139,6 +141,58 @@ def _default_client_timeout() -> float:
         :data:`DEFAULT_CLIENT_TIMEOUT_S` when it is unset or unparsable.
     """
     return _env_timeout("BAMBOO_MCP_CLIENT_TIMEOUT", DEFAULT_CLIENT_TIMEOUT_S)
+
+
+#: Seconds to wait for the session runner task to finish closing the session.
+#:
+#: Deliberately short and *not* derived from the per-call deadline: a close is
+#: usually driven by a user action (a Streamlit reconnect, an interpreter exit)
+#: and must not appear to hang for the several minutes a slow tool call is
+#: allowed.  Overrunning it is logged and the loop thread is torn down anyway.
+SHUTDOWN_TIMEOUT_S: float = 10.0
+
+
+def _wrap_error(exc: BaseException) -> RuntimeError:
+    """Map a transport or session exception onto an actionable RuntimeError.
+
+    Shared by the per-call path (:meth:`MCPClientSync._run`) and the session
+    startup path (:meth:`MCPClientSync._start_session`) so both report a
+    failure the same way.
+
+    Args:
+        exc: The exception raised on the loop thread.
+
+    Returns:
+        A ``RuntimeError`` carrying ``exc`` as its cause.
+    """
+    if isinstance(exc, (asyncio.CancelledError, concurrent.futures.CancelledError)):
+        return RuntimeError(
+            "MCP server connection was cancelled.\n"
+            "This can happen during startup if the server subprocess exits immediately.\n"
+            "Check that the server starts correctly:\n"
+            "  python -m bamboo.server\n"
+            f"Original error: {type(exc).__name__}"
+        )
+    if isinstance(exc, ConnectionRefusedError):
+        return RuntimeError(
+            "Failed to connect to MCP server (connection refused).\n"
+            "Ensure the server is running:\n"
+            "  python -m bamboo.server\n"
+            f"Original error: {exc}"
+        )
+    if isinstance(exc, OSError):
+        if "Connection refused" in str(exc) or "No such file or directory" in str(exc):
+            return RuntimeError(
+                "Cannot connect to MCP server. Make sure it's running:\n"
+                "  python -m bamboo.server\n"
+                f"Original error: {exc}"
+            )
+        return RuntimeError(str(exc))
+    return RuntimeError(
+        f"Failed to create MCP client: {type(exc).__name__}: {exc}\n"
+        "Is the MCP server running?\n"
+        "  python -m bamboo.server"
+    )
 
 
 @dataclass
@@ -347,6 +401,16 @@ class MCPClientSync:
 
     Runs a dedicated asyncio event loop in a background thread and calls into it
     using `asyncio.run_coroutine_threadsafe`.
+
+    The MCP session is owned end to end by a single long-lived task on that loop
+    (:meth:`_session_runner`).  That task opens the session, waits, and closes
+    it, so ``__aenter__`` and ``__aexit__`` on the transport always run in the
+    same task.  anyio cancel scopes are task-affine: entering in one task and
+    exiting in another raises ``Attempted to exit cancel scope in a different
+    task`` and can leave the scope stuck re-delivering cancellation, which
+    burns a CPU core indefinitely.  Individual tool calls still run as their own
+    tasks via :meth:`_run` — they only *use* the session, they do not own its
+    lifetime, so they remain independently cancellable.
     """
 
     def __init__(self, cfg: MCPServerConfig, *, connect_on_init: bool = True):
@@ -364,35 +428,65 @@ class MCPClientSync:
         self._connected = False
         self._connect_on_init = connect_on_init
 
+        # Session runner state.  ``_shutdown_event`` is an asyncio primitive and
+        # is therefore created on the loop thread, inside the runner task.
+        self._state_lock = threading.Lock()
+        self._loop_ready = threading.Event()
+        self._session_ready = threading.Event()
+        self._startup_error: BaseException | None = None
+        self._shutdown_event: asyncio.Event | None = None
+        self._runner_future: concurrent.futures.Future[None] | None = None
+
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, name="mcp-client-loop", daemon=True)
         self._thread.start()
 
-        # Give the event loop thread time to start
-        time.sleep(0.1)
+        # Wait for the loop to actually be running rather than sleeping and
+        # hoping.  ``_shutdown_loop_thread`` decides whether to stop the loop
+        # from ``is_running()``, so a not-yet-started loop could otherwise be
+        # left running forever by a teardown that raced startup.
+        if not self._loop_ready.wait(timeout=SHUTDOWN_TIMEOUT_S):
+            self._shutdown_loop_thread()
+            raise RuntimeError("MCP client event loop thread failed to start.")
 
         # Optionally connect on the loop thread (e.g., Streamlit wants immediate readiness).
         if self._connect_on_init:
-            try:
-                self._run(self._client.connect())
-            except BaseException:
-                # A failed connect must not leave the loop thread running.  The
-                # thread is a daemon and ``__init__`` is propagating, so the
-                # caller never receives a reference to call ``close()`` on:
-                # without this teardown the thread survives for the life of the
-                # process, still owning whatever half-open transport
-                # ``connect()`` had reached.  Streamlit's
-                # ``@st.cache_resource`` does not memoise exceptions, so the
-                # next rerun constructs another client and the orphans
-                # accumulate one per failed attempt.
-                self._shutdown_loop_thread()
-                raise
-            self._connected = True
+            self.ensure_connected()
 
     def _run_loop(self) -> None:
         """Event loop thread target."""
         asyncio.set_event_loop(self._loop)
+        # Scheduled rather than set directly: this fires once the loop is
+        # actually processing callbacks, which is what callers need to know.
+        self._loop.call_soon(self._loop_ready.set)
         self._loop.run_forever()
+
+    async def _session_runner(self) -> None:
+        """Own the MCP session for its entire lifetime on one task.
+
+        Opens the session, signals readiness, waits for a shutdown request, then
+        closes the session.  Both the open and the close happen here, in this
+        task, which is the invariant the anyio transports require.
+
+        A failure during startup is recorded on ``_startup_error`` and re-raised
+        by :meth:`_start_session` on the calling thread, so the caller sees the
+        original exception rather than a bare readiness timeout.
+        """
+        self._shutdown_event = asyncio.Event()
+        try:
+            await self._client.connect()
+        except BaseException as exc:  # noqa: B036 - recorded and re-raised on the caller's thread
+            self._startup_error = exc
+            return
+        finally:
+            # Set even on failure: the caller is blocked on this and must not
+            # wait out the full deadline for an error that already happened.
+            self._session_ready.set()
+
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            await self._client.aclose()
 
     def _shutdown_loop_thread(self, *, join_timeout: float = 2.0) -> None:
         """Stop the background event loop and join its thread.
@@ -452,34 +546,11 @@ class MCPClientSync:
                 "Try increasing BAMBOO_MCP_CLIENT_TIMEOUT if fetching large tasks."
             ) from e
         except (asyncio.CancelledError, concurrent.futures.CancelledError) as e:
-            raise RuntimeError(
-                f"MCP server connection was cancelled.\n"
-                f"This can happen during startup if the server subprocess exits immediately.\n"
-                f"Check that the server starts correctly:\n"
-                f"  python -m bamboo.server\n"
-                f"Original error: {type(e).__name__}"
-            ) from e
-        except ConnectionRefusedError as e:
-            raise RuntimeError(
-                f"Failed to connect to MCP server (connection refused).\n"
-                f"Ensure the server is running:\n"
-                f"  python -m bamboo.server\n"
-                f"Original error: {e}"
-            ) from e
-        except OSError as e:
-            if "Connection refused" in str(e) or "No such file or directory" in str(e):
-                raise RuntimeError(
-                    f"Cannot connect to MCP server. Make sure it's running:\n"
-                    f"  python -m bamboo.server\n"
-                    f"Original error: {e}"
-                ) from e
-            raise RuntimeError(str(e)) from e
+            # CancelledError is a BaseException, so it must be caught ahead of
+            # the bare re-raise below to keep its actionable message.
+            raise _wrap_error(e) from e
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to create MCP client: {type(e).__name__}: {e}\n"
-                f"Is the MCP server running?\n"
-                f"  python -m bamboo.server"
-            ) from e
+            raise _wrap_error(e) from e
         except BaseException:
             # KeyboardInterrupt / SystemExit in the calling thread while the
             # coroutine is still in flight.  Same orphaning hazard as the
@@ -488,17 +559,91 @@ class MCPClientSync:
             raise
 
     def ensure_connected(self) -> None:
-        """Connect to the MCP server if not already connected."""
+        """Connect to the MCP server if not already connected.
+
+        Raises:
+            RuntimeError: If the session fails to open, or if the client has
+                already been closed.
+        """
         if self._connected:
             return
-        self._run(self._client.connect())
+        with self._state_lock:
+            if self._connected:
+                return
+            self._start_session()
+
+    def _start_session(self) -> None:
+        """Launch the session runner task and wait for it to be ready.
+
+        Must be called with ``_state_lock`` held.
+
+        Raises:
+            RuntimeError: If startup fails or exceeds the client deadline.  In
+                either case the loop thread is torn down first, so a failed
+                construction cannot leave an orphan behind.
+        """
+        if self._loop.is_closed():
+            raise RuntimeError("MCP client has been closed and cannot be reused.")
+
+        self._session_ready.clear()
+        self._startup_error = None
+        self._runner_future = asyncio.run_coroutine_threadsafe(self._session_runner(), self._loop)
+
+        timeout = _default_client_timeout()
+        if not self._session_ready.wait(timeout=timeout):
+            # The runner is still inside connect().  Cancel it and tear the
+            # thread down: leaving it in place is what orphaned a spinning
+            # loop thread in production.
+            self._runner_future.cancel()
+            self._shutdown_loop_thread()
+            raise RuntimeError(
+                f"MCP server connection timed out after {timeout:g} seconds.\n"
+                "Is the MCP server running and responding?\n"
+                "Try increasing BAMBOO_MCP_CLIENT_TIMEOUT if fetching large tasks."
+            )
+
+        if self._startup_error is not None:
+            error = self._startup_error
+            self._shutdown_loop_thread()
+            raise _wrap_error(error)
+
         self._connected = True
 
+    def _request_session_shutdown(self) -> None:
+        """Ask the runner task to close the session, and wait for it.
+
+        Signalling rather than submitting ``aclose()`` as a fresh coroutine is
+        the point of the runner: the close has to happen in the task that did
+        the open.
+        """
+        event = self._shutdown_event
+        future = self._runner_future
+        if event is not None:
+            self._loop.call_soon_threadsafe(event.set)
+        if future is None:
+            return
+        try:
+            future.result(timeout=SHUTDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "MCP session did not close within %.0fs; abandoning it and stopping the loop.",
+                SHUTDOWN_TIMEOUT_S,
+            )
+            future.cancel()
+        except concurrent.futures.CancelledError:
+            pass
+        except Exception:
+            # A teardown failure must not mask whatever the caller was doing.
+            logger.warning("MCP session close raised.", exc_info=True)
+
     def close(self) -> None:
-        """Close the MCP session and stop the background loop."""
+        """Close the MCP session and stop the background loop.
+
+        Safe to call more than once.
+        """
         try:
             if self._connected:
-                self._run(self._client.aclose())
+                self._request_session_shutdown()
             self._connected = False
         finally:
             self._shutdown_loop_thread()
