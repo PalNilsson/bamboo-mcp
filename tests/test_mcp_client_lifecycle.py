@@ -28,14 +28,18 @@ from interfaces.shared.mcp_client import (
     MCPAsyncClient,
     MCPClientSync,
     MCPServerConfig,
+    _MCPSetupError,
     _default_client_timeout,
     _default_http_connect_timeout,
     _aclose_quietly,
     _connect_error,
     _env_timeout,
+    _http_status_of,
+    _is_protocol_error,
     _make_http_client_factory,
     _originating_error,
     _with_connect_timeout,
+    _wrap_error,
 )
 
 LOOP_THREAD_NAME = "mcp-client-loop"
@@ -833,11 +837,26 @@ class TestConnectRaisesTheRealError:
             self._failing_connect(raised, rollback),
         )
         client = MCPAsyncClient(MCPServerConfig(transport="http"))
-        try:
-            asyncio.run(client.connect())
-        except BaseException as exc:  # noqa: B036 - the exception is the assertion
-            return exc
-        raise AssertionError("connect() did not raise")
+
+        async def _capture() -> BaseException:
+            """Return the exception ``connect()`` raises, from inside the task.
+
+            Caught here rather than around ``asyncio.run`` deliberately. A
+            cancellation that propagates out of a Task may be replaced by a
+            fresh ``CancelledError`` with the message stripped, which is
+            interpreter-dependent; catching it in the coroutine keeps the
+            instance the code actually raised.
+
+            Returns:
+                The exception raised by ``connect()``.
+            """
+            try:
+                await client.connect()
+            except BaseException as exc:  # noqa: B036 - the exception is the assertion
+                return exc
+            raise AssertionError("connect() did not raise")
+
+        return asyncio.run(_capture())
 
     def test_a_refused_endpoint_reports_the_connect_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -883,12 +902,14 @@ class TestConnectRaisesTheRealError:
             monkeypatch: Pytest monkeypatch fixture.
         """
         cancelled = asyncio.CancelledError("Cancelled via cancel scope 0x1")
+        rollback = asyncio.CancelledError("cancelled unwind")
 
-        raised = self._connect(
-            monkeypatch, cancelled, _group(asyncio.CancelledError("cancelled unwind"))
-        )
+        raised = self._connect(monkeypatch, cancelled, _group(rollback))
 
-        assert raised is cancelled
+        # Asserted by type rather than identity: a cancellation leaving a Task
+        # can be replaced by a fresh instance, which varies by interpreter.
+        assert isinstance(raised, asyncio.CancelledError), raised
+        assert not isinstance(raised, Exception), "cancellation became an ordinary error"
 
     def test_a_clean_unwind_leaves_the_cancellation_intact(
         self, monkeypatch: pytest.MonkeyPatch
@@ -902,7 +923,9 @@ class TestConnectRaisesTheRealError:
 
         raised = self._connect(monkeypatch, cancelled, None)
 
-        assert raised is cancelled
+        # By type, not identity: see the note in the test above.
+        assert isinstance(raised, asyncio.CancelledError), raised
+        assert not isinstance(raised, Exception), "cancellation became an ordinary error"
 
     def test_an_informative_failure_is_not_replaced(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1006,3 +1029,536 @@ class TestConnectErrorDecision:
         rollback = _group(asyncio.CancelledError("cancelled unwind"))
 
         assert _connect_error(cancelled, rollback) is cancelled
+
+
+class McpError(Exception):
+    """Stand-in for the SDK's protocol error, matched by class name.
+
+    ``interfaces.shared.mcp_client`` cannot import the real
+    ``mcp.shared.exceptions.McpError``, because the stub ``mcp`` modules
+    installed by ``tests/conftest.py`` leave ``mcp`` a non-package. Matching on
+    the name is the documented contract, and this class exercises it.
+    """
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    """Build a real ``httpx.HTTPStatusError`` carrying ``status``.
+
+    Args:
+        status: HTTP status code the response should report.
+
+    Returns:
+        An ``HTTPStatusError`` with a genuine request and response attached.
+    """
+    request = httpx.Request("POST", "http://server.example/mcp")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+HTTP_CFG = MCPServerConfig(
+    transport="http", http_url="http://server.example/mcp", http_connect_timeout_s=5.0
+)
+STDIO_CFG = MCPServerConfig(
+    transport="stdio", stdio_command="/usr/bin/python3", stdio_args=["-m", "bamboo.server"]
+)
+SUBPROCESS_ADVICE = "python -m bamboo.server"
+
+
+class TestHttpErrorsDoNotGiveSubprocessAdvice:
+    """Tests that HTTP failures are reported as HTTP failures.
+
+    Every HTTP transport failure used to arrive as a bare ``CancelledError``
+    and be reported as *"This can happen during startup if the server
+    subprocess exits immediately. Check that the server starts correctly:
+    python -m bamboo.server"*. On this transport the server is a separate
+    long-running process, usually on another host behind an SSH tunnel, so
+    that advice is wrong and sends the reader to the wrong machine.
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("All connection attempts failed"),
+            ConnectionRefusedError("nobody home"),
+            httpx.ConnectTimeout("timed out"),
+            httpx.ReadTimeout("read timed out"),
+            _status_error(401),
+            _status_error(503),
+            McpError("Connection closed"),
+            asyncio.CancelledError("Cancelled via cancel scope"),
+            ValueError("something unforeseen"),
+        ],
+        ids=[
+            "connect-error",
+            "refused",
+            "connect-timeout",
+            "read-timeout",
+            "401",
+            "503",
+            "protocol-error",
+            "cancelled",
+            "unclassified",
+        ],
+    )
+    def test_no_http_failure_suggests_starting_a_subprocess(self, exc: BaseException) -> None:
+        """No HTTP diagnosis tells the user to run the server locally.
+
+        Args:
+            exc: The originating failure under test.
+        """
+        message = str(_wrap_error(exc, HTTP_CFG))
+
+        assert SUBPROCESS_ADVICE not in message, message
+        assert HTTP_CFG.http_url in message, "the diagnosis does not name the endpoint"
+
+    def test_a_refused_endpoint_is_named_as_unreachable(self) -> None:
+        """The remedy is checking the server and the tunnel, not a restart."""
+        message = str(_wrap_error(httpx.ConnectError("All connection attempts failed"), HTTP_CFG))
+
+        assert "Cannot reach the MCP server" in message
+        assert "SSH tunnel" in message
+
+    def test_a_connect_timeout_names_its_own_budget(self) -> None:
+        """The connect budget is separate from the per-call one, so name it."""
+        message = str(_wrap_error(httpx.ConnectTimeout("timed out"), HTTP_CFG))
+
+        assert "5 seconds" in message, message
+        assert "BAMBOO_MCP_HTTP_CONNECT_TIMEOUT" in message
+
+    def test_a_read_timeout_names_the_per_call_budget(self) -> None:
+        """A stalled request is the other timeout, and the other variable."""
+        message = str(_wrap_error(httpx.ReadTimeout("read timed out"), HTTP_CFG))
+
+        assert "BAMBOO_MCP_HTTP_TIMEOUT" in message
+        assert "BAMBOO_MCP_HTTP_CONNECT_TIMEOUT" not in message
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_a_rejected_request_points_at_the_token(self, status: int) -> None:
+        """Bearer-token format is the usual cause and the usual mistake.
+
+        Args:
+            status: The rejection status code.
+        """
+        message = str(_wrap_error(_status_error(status), HTTP_CFG))
+
+        assert f"HTTP {status}" in message
+        assert "raw token value" in message
+
+    def test_other_statuses_are_reported_without_guessing(self) -> None:
+        """A 503 gets the status and the endpoint, and no invented remedy."""
+        message = str(_wrap_error(_status_error(503), HTTP_CFG))
+
+        assert "returned HTTP 503" in message
+        assert "raw token value" not in message
+
+    def test_a_protocol_error_says_the_handshake_did_not_finish(self) -> None:
+        """Something answered, so reachability is not the problem."""
+        message = str(_wrap_error(McpError("Connection closed"), HTTP_CFG))
+
+        assert "did not complete the MCP handshake" in message
+
+    def test_an_unexplained_cancellation_says_so(self) -> None:
+        """With nothing recovered, the honest answer is that nothing is known.
+
+        A cancellation still reaches here when the unwind recovered no cause —
+        it must not be dressed up as a diagnosis.
+        """
+        message = str(_wrap_error(asyncio.CancelledError("Cancelled via cancel scope"), HTTP_CFG))
+
+        assert "was cancelled, with no underlying error reported" in message
+
+    def test_a_group_wrapped_failure_is_classified_through_the_group(self) -> None:
+        """This is the shape the SDK's task group actually produces."""
+        group = _group(httpx.ConnectError("All connection attempts failed"))
+
+        message = str(_wrap_error(group, HTTP_CFG))
+
+        assert "Cannot reach the MCP server" in message
+
+
+class TestStdioErrorsKeepSubprocessAdvice:
+    """Tests that stdio failures still say how to start the server.
+
+    On stdio the server *is* a subprocess this client spawns, so the advice
+    that is wrong for HTTP is right here.
+    """
+
+    def test_a_cancellation_keeps_the_startup_advice(self) -> None:
+        """An immediately exiting subprocess is the usual cause here."""
+        message = str(_wrap_error(asyncio.CancelledError("cancelled"), STDIO_CFG))
+
+        assert SUBPROCESS_ADVICE in message
+
+    def test_a_protocol_error_reports_the_command(self) -> None:
+        """Knowing which command was spawned is what makes this actionable."""
+        message = str(_wrap_error(McpError("Connection closed"), STDIO_CFG))
+
+        assert "exited before the session was established" in message
+        assert "/usr/bin/python3 -m bamboo.server" in message
+        assert SUBPROCESS_ADVICE in message
+
+    def test_a_refusal_keeps_its_wording(self) -> None:
+        """Pre-existing behaviour on this path is preserved."""
+        message = str(_wrap_error(ConnectionRefusedError("nobody home"), STDIO_CFG))
+
+        assert "connection refused" in message
+
+    def test_a_missing_executable_keeps_its_wording(self) -> None:
+        """Pre-existing behaviour on this path is preserved."""
+        message = str(_wrap_error(OSError("No such file or directory"), STDIO_CFG))
+
+        assert "Make sure it's running" in message
+
+    def test_an_unclassified_error_keeps_its_wording(self) -> None:
+        """Pre-existing behaviour on this path is preserved."""
+        message = str(_wrap_error(ValueError("something unforeseen"), STDIO_CFG))
+
+        assert "Failed to create MCP client: ValueError" in message
+
+    def test_no_config_falls_back_to_stdio_advice(self) -> None:
+        """``MCPServerConfig`` defaults to stdio, so the advice should too."""
+        message = str(_wrap_error(asyncio.CancelledError("cancelled"), None))
+
+        assert SUBPROCESS_ADVICE in message
+
+
+class TestActionableErrorsAreNotRewrapped:
+    """Tests that this module does not wrap its own advice a second time.
+
+    The stdio path builds a ``RuntimeError`` naming the command, the args and
+    how to start the server; ``_wrap_error`` could not tell it from any other
+    ``RuntimeError`` and produced ``"Failed to create MCP client: RuntimeError:
+    Failed to connect to MCP server via stdio. …"`` with two sets of advice.
+    """
+
+    def test_a_setup_error_is_returned_unchanged(self) -> None:
+        """Identity, not a copy: the message is already the right one."""
+        original = _MCPSetupError("Failed to start MCP server subprocess.")
+
+        assert _wrap_error(original, STDIO_CFG) is original
+
+    def test_a_setup_error_survives_the_http_path_too(self) -> None:
+        """"streamable_http_client is not available" needs no re-diagnosis."""
+        original = _MCPSetupError("streamable_http_client is not available")
+
+        assert _wrap_error(original, HTTP_CFG) is original
+
+    def test_a_group_wrapped_setup_error_is_returned_unchanged(self) -> None:
+        """A task group around it does not make it less actionable."""
+        original = _MCPSetupError("MCP session not connected.")
+
+        assert _wrap_error(_group(original), HTTP_CFG) is original
+
+    def test_a_setup_error_is_still_a_runtime_error(self) -> None:
+        """Existing ``except RuntimeError`` handlers must keep matching."""
+        assert issubclass(_MCPSetupError, RuntimeError)
+
+
+class TestClassificationHelpers:
+    """Unit tests for the two predicates the classifier relies on."""
+
+    def test_a_status_is_read_from_the_response(self) -> None:
+        """The ordinary case, with a real response attached."""
+        assert _http_status_of(_status_error(418)) == 418
+
+    def test_a_missing_response_yields_no_status(self) -> None:
+        """A hand-built error without a response must not raise."""
+        assert _http_status_of(ValueError("no response here")) is None
+
+    def test_a_non_integer_status_yields_no_status(self) -> None:
+        """Anything unexpected on the response is ignored rather than shown."""
+        exc = ValueError("odd")
+        exc.response = type("R", (), {"status_code": "418"})()  # type: ignore[attr-defined]
+
+        assert _http_status_of(exc) is None
+
+    def test_a_protocol_error_is_matched_by_name(self) -> None:
+        """The SDK class cannot be imported here, so the name is the contract."""
+        assert _is_protocol_error(McpError("Connection closed"))
+
+    def test_a_subclass_of_a_protocol_error_is_matched(self) -> None:
+        """The MRO is walked, so SDK subclasses match too."""
+        class Derived(McpError):
+            """A subclass of the protocol error."""
+
+        assert _is_protocol_error(Derived("Connection closed"))
+
+    def test_an_unrelated_exception_is_not_matched(self) -> None:
+        """The matcher is narrow: only that one name."""
+        assert not _is_protocol_error(ValueError("unrelated"))
+
+
+class TestTransportAwareErrorsReachTheCaller:
+    """Tests that the transport-appropriate message survives the sync wrapper."""
+
+    def test_a_failed_http_startup_reports_an_http_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``MCPClientSync`` construction over HTTP gives HTTP advice.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        async def _refused(_self: Any) -> None:
+            raise httpx.ConnectError("All connection attempts failed")
+
+        async def _aclose(_self: Any) -> None:
+            return None
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _refused)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _aclose)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            MCPClientSync(HTTP_CFG)
+
+        message = str(excinfo.value)
+        assert "Cannot reach the MCP server" in message
+        assert SUBPROCESS_ADVICE not in message, message
+
+    def test_a_failed_http_call_reports_an_http_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-call failure is classified the same way as a startup failure.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        async def _ok(_self: Any) -> None:
+            return None
+
+        async def _boom(_self: Any) -> Any:
+            raise httpx.ReadTimeout("read timed out")
+
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.connect", _ok)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.aclose", _ok)
+        monkeypatch.setattr("interfaces.shared.mcp_client.MCPAsyncClient.list_tools", _boom)
+
+        client = MCPClientSync(HTTP_CFG)
+        try:
+            with pytest.raises(RuntimeError) as excinfo:
+                client.list_tools()
+        finally:
+            client.close()
+
+        message = str(excinfo.value)
+        assert "BAMBOO_MCP_HTTP_TIMEOUT" in message
+        assert SUBPROCESS_ADVICE not in message, message
+
+
+class TestAsyncContextManager:
+    """Tests for ``async with MCPAsyncClient(cfg)``.
+
+    ``interfaces/agent/agent.py`` has documented this usage since it was
+    written, but no ``__aenter__``/``__aexit__`` existed, so copying the
+    example from the module docstring raised ``TypeError``. It is also the
+    safest way to use the class: it puts the open and the close in the same
+    task by construction, which is the invariant the anyio transports require.
+    """
+
+    @staticmethod
+    def _patch_transport(monkeypatch: pytest.MonkeyPatch, closed: list[str]) -> None:
+        """Replace ``_connect_into`` with a transport that records its close.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+            closed: List the teardown appends to.
+        """
+        async def _connect_into(self: Any, stack: AsyncExitStack) -> None:
+            async def _record() -> None:
+                closed.append("transport")
+
+            stack.push_async_callback(_record)
+            self._session = object()
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _connect_into
+        )
+
+    def test_entry_yields_the_connected_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The block receives the client itself, with a session established.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        self._patch_transport(monkeypatch, [])
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client as entered:
+                assert entered is client, "the block received something else"
+                assert client._session is not None, "the session was not established"
+
+        asyncio.run(_scenario())
+
+    def test_exit_closes_the_session_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Leaving the block tears the transport down exactly once.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        closed: list[str] = []
+        self._patch_transport(monkeypatch, closed)
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                assert closed == [], "closed before the block finished"
+
+        asyncio.run(_scenario())
+
+        assert closed == ["transport"]
+        assert client._stack is None
+
+    def test_an_exception_in_the_body_still_closes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing tool call must not leak the session.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        closed: list[str] = []
+        self._patch_transport(monkeypatch, closed)
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                raise ValueError("the tool call failed")
+
+        with pytest.raises(ValueError, match="the tool call failed"):
+            asyncio.run(_scenario())
+
+        assert closed == ["transport"], "the session was not closed"
+
+    def test_the_body_exception_is_not_suppressed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``__aexit__`` returns falsy: this manages a resource, not errors.
+
+        Suppressing here would hide a failed tool call behind a clean exit.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        self._patch_transport(monkeypatch, [])
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> str:
+            try:
+                async with client:
+                    raise ValueError("must escape")
+            except ValueError:
+                return "propagated"
+            return "suppressed"
+
+        assert asyncio.run(_scenario()) == "propagated"
+
+    def test_a_teardown_failure_does_not_replace_the_body_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The caller needs the body's error, not the one from the unwind.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        async def _connect_into(self: Any, stack: AsyncExitStack) -> None:
+            async def _boom() -> None:
+                raise RuntimeError("teardown failed")
+
+            stack.push_async_callback(_boom)
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _connect_into
+        )
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                raise ValueError("the tool call failed")
+
+        with pytest.raises(ValueError, match="the tool call failed"):
+            asyncio.run(_scenario())
+
+    def test_a_failed_entry_runs_no_body_and_leaves_no_residue(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A connect failure keeps the C4a error and the C3b rollback.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        real = httpx.ConnectError("All connection attempts failed")
+        ran: list[str] = []
+
+        async def _connect_into(_self: Any, stack: AsyncExitStack) -> None:
+            async def _unwind() -> None:
+                raise _group(real)
+
+            stack.push_async_callback(_unwind)
+            raise asyncio.CancelledError("Cancelled via cancel scope 0x1")
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _connect_into
+        )
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                ran.append("body")
+
+        with pytest.raises(httpx.ConnectError):
+            asyncio.run(_scenario())
+
+        assert ran == [], "the block body ran despite a failed entry"
+        assert client._session is None
+        assert client._stack is None
+
+    def test_entry_and_exit_run_in_the_same_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The anyio invariant: one task owns the whole session lifetime.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        tasks: dict[str, Any] = {}
+
+        async def _connect_into(_self: Any, stack: AsyncExitStack) -> None:
+            async def _record_close() -> None:
+                tasks["close"] = asyncio.current_task()
+
+            stack.push_async_callback(_record_close)
+            tasks["open"] = asyncio.current_task()
+
+        monkeypatch.setattr(
+            "interfaces.shared.mcp_client.MCPAsyncClient._connect_into", _connect_into
+        )
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                pass
+
+        asyncio.run(_scenario())
+
+        assert tasks["open"] is tasks["close"], "the session changed task between open and close"
+
+    def test_closing_inside_the_block_is_not_a_double_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``aclose`` is idempotent, so an early close is harmless.
+
+        Args:
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        closed: list[str] = []
+        self._patch_transport(monkeypatch, closed)
+        client = MCPAsyncClient(MCPServerConfig(transport="http"))
+
+        async def _scenario() -> None:
+            async with client:
+                await client.aclose()
+
+        asyncio.run(_scenario())
+
+        assert closed == ["transport"], "the transport was closed twice"

@@ -7,6 +7,56 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Every click of "Reconnect" orphaned a live MCP client**
+  (`interfaces/streamlit/chat.py`). The button called
+  `st.cache_resource.clear()` and nothing else. That drops the cache's
+  reference to the `MCPClientSync` without closing it, and the cache was the
+  only thing holding one — `close()` had no caller anywhere in the tree. Each
+  orphan keeps a running event-loop thread, an open transport and, on stdio, a
+  server subprocess. This is the mechanism behind the client that held a wedged
+  anyio cancel scope and spun a full CPU core for 17 hours on `aipanda033`;
+  `@st.cache_resource` not memoising exceptions made it worse, since a failed
+  `__init__` was retried on the next rerun and produced a second one.
+
+  The module now records each client it creates and closes them before
+  clearing the cache. Order matters: after the clear there is no reference
+  left to close. Closing is best-effort and drains the registry, so a client
+  whose `close()` raises neither aborts the reconnect nor leaves the others
+  orphaned — Reconnect is what a user reaches for when something is already
+  wrong.
+
+  A registry rather than a second lookup through `_get_mcp_client`, because
+  retrieving the cached instance requires the same five arguments it was
+  created with, and the natural way to use Reconnect is to edit the URL or
+  token first — which would have built a *new* client, closed that, and left
+  the live one orphaned regardless.
+
+- **Every HTTP connection failure was reported as a subprocess problem**
+  (`interfaces/shared/mcp_client.py`). A refused endpoint, an unresolvable
+  host, a stopped server, an expired token — all of them produced *"This can
+  happen during startup if the server subprocess exits immediately. Check that
+  the server starts correctly: `python -m bamboo.server`"*. On the HTTP
+  transport the server is a separate long-running process, usually on another
+  host and reached through an SSH tunnel, so that advice is wrong and sends
+  the reader to the wrong machine.
+
+  `_wrap_error` now takes the server config and classifies on the originating
+  error rather than on whatever reached it. HTTP failures name the endpoint and
+  say what to check: an unreachable endpoint points at the server and the
+  tunnel; a connect timeout names its own budget and
+  `BAMBOO_MCP_HTTP_CONNECT_TIMEOUT`; a stalled request names
+  `BAMBOO_MCP_HTTP_TIMEOUT`; a 401 or 403 points at the bearer token, including
+  the raw-value-not-`client_id: token` trap; a completed request that failed
+  the MCP handshake says so rather than blaming reachability. stdio failures
+  keep the subprocess advice, which is correct there, and a subprocess that
+  exits immediately is now diagnosed as exactly that instead of falling into
+  the generic branch.
+
+  Errors this module raises with advice already attached are marked and passed
+  through, so the stdio message naming the command and args is no longer
+  re-wrapped into `"Failed to create MCP client: RuntimeError: Failed to
+  connect to MCP server via stdio. …"` with two sets of instructions.
+
 - **A failed HTTP connect reported a cancellation instead of the error that
   caused it** (`interfaces/shared/mcp_client.py`). Confirmed against mcp 1.29.1
   for connection refused, DNS failure and HTTP 401, on both transport shapes:
@@ -159,6 +209,22 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **`async with MCPAsyncClient(cfg)` now works**
+  (`interfaces/shared/mcp_client.py`). The module docstring of
+  `interfaces/agent/agent.py` has documented this usage since it was written,
+  but no `__aenter__`/`__aexit__` existed, so copying the example raised
+  `TypeError: 'MCPAsyncClient' object does not support the asynchronous
+  context manager protocol`.
+
+  It is also the safest way to use the class. The anyio transports underneath
+  have task-affine cancel scopes: opening in one task and closing in another
+  raises `Attempted to exit cancel scope in a different task` and can leave
+  the scope re-delivering cancellation, which is what burned a core for 17
+  hours on `aipanda033`. `async with` puts the open and the close in the same
+  task by construction, so it cannot be got wrong the way two separate calls
+  can. `__aexit__` returns None deliberately, so an exception in the body
+  propagates rather than being hidden behind a clean-looking exit.
+
 - **Deep links into the Streamlit chat** (`interfaces/shared/deeplink.py`,
   `interfaces/streamlit/chat.py`). `?job_id=7272161793` opens the chat with
   "Analyze job 7272161793 and explain the failure" already asked.

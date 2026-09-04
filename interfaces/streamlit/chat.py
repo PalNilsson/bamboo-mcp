@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import logging
 import os
 import re
 import sys
@@ -51,6 +52,8 @@ import streamlit as st  # noqa: E402
 
 from interfaces.shared.mcp_client import MCPClientSync, MCPServerConfig  # noqa: E402
 from interfaces.shared.deeplink import question_from_params  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -861,6 +864,55 @@ def _trace_file_size(trace_file: str) -> int:
 # Cached MCP client (NO widget calls inside)
 # ---------------------------------------------------------------------------
 
+#: Every :class:`MCPClientSync` this module has created, so that they can be
+#: closed rather than orphaned.
+#:
+#: ``@st.cache_resource`` is the only other reference to a live client, and
+#: ``st.cache_resource.clear()`` drops it without closing anything.  Each
+#: orphaned client keeps a running event-loop thread, an open transport and, on
+#: stdio, a server subprocess; one such orphan held a wedged anyio cancel scope
+#: and spun a full CPU core for 17 hours on aipanda033.
+#:
+#: Deliberately a registry rather than a second lookup through
+#: ``_get_mcp_client``: retrieving the cached instance requires the same five
+#: arguments it was created with, and the natural way to use Reconnect is to
+#: edit the URL or token first — which would build a *new* client, close that,
+#: and leave the live one orphaned anyway.
+_LIVE_CLIENTS: list[MCPClientSync] = []
+
+#: Guards :data:`_LIVE_CLIENTS`.  Streamlit runs one script thread per session,
+#: and both the cache and this registry are process-wide.
+_LIVE_CLIENTS_LOCK = threading.Lock()
+
+
+def _register_client(client: MCPClientSync) -> None:
+    """Record a client so it can be closed later.
+
+    Args:
+        client: A freshly constructed client.
+    """
+    with _LIVE_CLIENTS_LOCK:
+        _LIVE_CLIENTS.append(client)
+
+
+def _close_live_clients() -> None:
+    """Close and forget every client this module has created.
+
+    Best-effort and idempotent: the registry is drained first, so a repeat
+    call closes nothing, and a client whose ``close()`` raises does not stop
+    the others from being closed.  A failure here must not abort a reconnect —
+    the user clicked Reconnect precisely because something is already wrong.
+    """
+    with _LIVE_CLIENTS_LOCK:
+        clients = list(_LIVE_CLIENTS)
+        _LIVE_CLIENTS.clear()
+    for client in clients:
+        try:
+            client.close()
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning("Reconnect: failed to close an MCP client.", exc_info=True)
+
+
 @st.cache_resource
 def _get_mcp_client(
     transport: str,
@@ -898,7 +950,9 @@ def _get_mcp_client(
             stdio_args=["-m", "bamboo.server"],
             stdio_env=env,
         )
-    return MCPClientSync(cfg)
+    client = MCPClientSync(cfg)
+    _register_client(client)
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1093,21 @@ def _connect(mcp: MCPClientSync, plugin_id: str) -> None:
 # Sidebar
 # ---------------------------------------------------------------------------
 
+def _reconnect() -> None:
+    """Drop the current MCP client and server metadata, then rerun.
+
+    Closing comes first and is not optional.  ``st.cache_resource.clear()``
+    only drops the cache's reference; whatever it was holding carries on
+    running with nothing left to close it.
+    """
+    _close_live_clients()
+    st.cache_resource.clear()
+    for key in ("server_ok", "tool_names", "display_name", "llm_info",
+                "last_spans", "last_evidence", "last_raw", "last_tool"):
+        st.session_state.pop(key, None)
+    st.rerun()
+
+
 def _render_sidebar() -> tuple[str, str, str, str, str]:
     """Render sidebar controls and return connection parameters.
 
@@ -1132,11 +1201,7 @@ def _render_sidebar() -> tuple[str, str, str, str, str]:
     # --- Actions ---
     st.sidebar.header("Actions")
     if st.sidebar.button("🔄  Reconnect", use_container_width=True):
-        st.cache_resource.clear()
-        for key in ("server_ok", "tool_names", "display_name", "llm_info",
-                    "last_spans", "last_evidence", "last_raw", "last_tool"):
-            st.session_state.pop(key, None)
-        st.rerun()
+        _reconnect()
 
     if st.sidebar.button("🗑  Clear chat", use_container_width=True):
         st.session_state["messages"] = []
