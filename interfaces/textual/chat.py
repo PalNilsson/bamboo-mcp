@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 import webbrowser
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -541,7 +541,7 @@ class BambooTui(App):
         self.tool_names: List[str] = []
         self.answer_tool: Optional[str] = None
 
-        self.banner_lines: List[str] = FALLBACK_BANNER[:]
+        self.banner_lines: Sequence[str] = FALLBACK_BANNER[:]
         self.display_name: str = f"Bamboo MCP – {plugin_id.upper()}"
         self.help_text: str = "Enter to send • /help"
 
@@ -1922,8 +1922,6 @@ class BambooTui(App):
         if not self.transcript:
             return
         self.transcript.write(Panel(renderable, title=title, border_style=border_style))
-        self.transcript.scroll_end(animate=False)
-        self.input_widget.focus()
 
         if self.transcript:
             self.transcript.scroll_end(animate=False)
@@ -2489,8 +2487,9 @@ class BambooTui(App):
         Returns:
             Integer character width for the chart bar area, at least 20.
         """
+        transcript = self.transcript
         try:
-            w = self.transcript.size.width
+            w = transcript.size.width if transcript is not None else self.size.width
         except Exception:  # pylint: disable=broad-exception-caught
             try:
                 w = self.size.width

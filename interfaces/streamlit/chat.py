@@ -1554,6 +1554,8 @@ def _build_plot_figure(
     import plotly.express as px  # type: ignore[import]
 
     if chart_type == "bar":
+        if y_col is None:
+            raise ValueError("a bar chart needs a y column")
         fig = px.bar(
             rows,
             x=y_col,
@@ -1572,6 +1574,8 @@ def _build_plot_figure(
             nbins=min(20, len(rows)),
         )
     else:  # scatter
+        if y_col is None:
+            raise ValueError("a scatter chart needs a y column")
         colour_labels = {color_col: _column_label(color_col)} if color_col else {}
         fig = px.scatter(
             rows,
@@ -1944,8 +1948,9 @@ def _render_chat(mcp: MCPClientSync, transport: str) -> None:  # noqa: C901
         _render_script_download()
 
     # Chat input — must be the last widget
-    question = st.chat_input(st.session_state.get("display_name", "Ask PanDA"))
-    if question:
+    chat_input = st.chat_input(st.session_state.get("display_name", "Ask PanDA"))
+    if chat_input:
+        question = chat_input
         expanded_q, help_md = _expand_slash_command(question)
         if help_md is not None:
             # Display help inline without submitting to the MCP server.

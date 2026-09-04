@@ -188,6 +188,63 @@ All notable changes to Bamboo are documented here.
   share `_env_timeout`, which falls back on anything unusable.
 
 ### Changed
+- **`interfaces/` was never type-checked** (`pyrightconfig.json`,
+  `interfaces/streamlit/chat.py`, `interfaces/textual/chat.py`). `include`
+  listed only `core`, `packages` and `tests`, so `pyright` skipped every
+  interface — including `interfaces/shared/mcp_client.py`, the client library
+  every interface depends on. `interfaces/shared` and `interfaces/agent` are
+  now in `include`; both are clean, verified against a virtualenv holding only
+  what CI installs, and — because the pre-commit hook runs pyright as a node
+  tool without the project's Python dependencies on its path — against a
+  virtualenv holding nothing at all.
+
+  Three sites in `interfaces/shared/mcp_client.py` only type-checked when
+  `httpx` was resolvable, so including the file made the pre-commit hook fail
+  where CI passed. `isinstance(timeout, httpx.Timeout)` narrows nothing when
+  `httpx.Timeout` is Unknown, leaving the `float | None` members of the
+  parameter's union and three errors on the phase budgets read from it; the
+  narrowed value is now bound to a local typed `Any`. The HTTP client and the
+  session were each assigned to an `Optional` attribute and then immediately
+  read back off it, which cannot be proved safe with the class unknown; both
+  now keep the object in a local and use that, which also removes the re-read.
+  No behaviour changes: verified against live stdio and streamable-HTTP
+  sessions on mcp 1.29.1.
+
+  `interfaces/streamlit` and `interfaces/textual` are deliberately left out.
+  Neither `streamlit`, `textual` nor `plotly` is in `requirements.txt` or
+  `requirements-dev.txt`, and with them absent pyright reports 211 errors for
+  those two files that are purely artifacts of the unresolved imports. Gating
+  them would mean adding UI dependencies to CI solely for type checking, and
+  would make the build fail on an unrelated `streamlit` release, since
+  streamlit assembles its public API dynamically and pyright resolves it only
+  partially even when installed.
+
+  The 11 genuine errors those two files did contain are fixed regardless:
+
+  * `_build_plot_figure` passed `y_col: str | None` to `_column_label(col:
+    str)` at four sites. `y_col` is None only for histograms, an invariant held
+    in `_detect_plot`, so the bar and scatter branches now check it — a change
+    to that invariant would otherwise reach `_column_label(None)` and raise
+    deep inside plotting.
+  * `st.chat_input()` returns `str | None` and was assigned to `question`,
+    declared `str` earlier in `_render_chat` for the pending-question branch.
+    The widget value is now bound separately and adopted only once it is known
+    to be a string.
+  * `_write_panel_old` called `self.input_widget.focus()` unguarded, on an
+    attribute that is `Optional` until the widgets mount. The guarded form of
+    that call and the `scroll_end` beside it already followed immediately
+    below, so the unguarded pair was a leftover from a partial edit and is
+    removed.
+  * `_chart_width` read `self.transcript.size.width` and relied on the
+    `AttributeError` from `None` being caught by a surrounding
+    `except Exception`. The fallback chain is unchanged, but the None case is
+    now explicit.
+  * `banner_lines` was annotated `List[str]` and assigned
+    `FALLBACK_BANNER[:]`, which infers `list[LiteralString]`; `list` is
+    invariant, so all four assignments were errors. It is now `Sequence[str]`,
+    which is covariant and is what the attribute actually needs — it is only
+    ever assigned whole and read through `len()` and `join()`.
+
 - **Removed dead parameters and symbols from the MCP client**
   (`interfaces/shared/mcp_client.py`). `MCPAsyncClient.__init__` accepted a
   `connect_on_init` keyword documented as "connect immediately, or lazily on

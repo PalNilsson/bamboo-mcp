@@ -2,7 +2,9 @@
   "include": [
     "core",
     "packages",
-    "tests"
+    "tests",
+    "interfaces/shared",
+    "interfaces/agent"
   ],
   "extraPaths": [
     "core",

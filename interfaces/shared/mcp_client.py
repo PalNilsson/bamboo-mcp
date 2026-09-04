@@ -190,11 +190,16 @@ def _with_connect_timeout(
         A timeout whose connect phase is ``connect_timeout_s``.
     """
     if isinstance(timeout, httpx.Timeout):
+        # Bound as Any deliberately.  The pre-commit hook runs pyright with no
+        # project dependencies on its path, where ``httpx.Timeout`` is Unknown
+        # and this isinstance narrows nothing — leaving the ``float | None``
+        # members of the parameter's union, neither of which has these fields.
+        phases: Any = timeout
         return httpx.Timeout(
             connect=connect_timeout_s,
-            read=timeout.read,
-            write=timeout.write,
-            pool=timeout.pool,
+            read=phases.read,
+            write=phases.write,
+            pool=phases.pool,
         )
     return httpx.Timeout(timeout, connect=connect_timeout_s)
 
@@ -745,13 +750,14 @@ class MCPAsyncClient:
             )
             if "http_client" in _params:
                 # We build the client, so the split timeout applies directly.
-                self._http_client = httpx.AsyncClient(
+                http_client = httpx.AsyncClient(
                     headers=self.cfg.http_headers, timeout=timeout
                 )
-                stack.push_async_callback(self._http_client.aclose)
+                self._http_client = http_client
+                stack.push_async_callback(http_client.aclose)
                 self._transport_cm = func(
                     self.cfg.http_url,
-                    http_client=self._http_client,
+                    http_client=http_client,
                     terminate_on_close=self.cfg.terminate_on_close,
                 )
             else:
@@ -788,12 +794,13 @@ class MCPAsyncClient:
                 read_stream, write_stream = _entered
                 self.http_session_id = None
 
-        self._session = await stack.enter_async_context(
+        session = await stack.enter_async_context(
             ClientSession(read_stream, write_stream)
         )
+        self._session = session
 
         # Initialize MCP session
-        await self._session.initialize()
+        await session.initialize()
 
     async def aclose(self) -> None:
         """Close session, transport and HTTP client cleanly.
