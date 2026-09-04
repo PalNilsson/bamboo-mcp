@@ -152,6 +152,106 @@ def _default_client_timeout() -> float:
 SHUTDOWN_TIMEOUT_S: float = 10.0
 
 
+#: Default TCP connect timeout, in seconds, overridable with
+#: ``BAMBOO_MCP_HTTP_CONNECT_TIMEOUT``.
+#:
+#: Kept small and independent of :data:`DEFAULT_HTTP_TIMEOUT_S`.  A single
+#: ``httpx`` timeout value applies to connect as well as read, so raising the
+#: read budget for slow tools also made "nothing is listening on this port"
+#: take the full read budget to report.  Establishing a TCP connection to a
+#: live server is a sub-second operation on any network this client runs on, so
+#: a refusal or a black hole should surface in seconds.
+DEFAULT_HTTP_CONNECT_TIMEOUT_S: float = 5.0
+
+
+def _default_http_connect_timeout() -> float:
+    """Resolve the HTTP connect timeout from the environment.
+
+    Returns:
+        ``BAMBOO_MCP_HTTP_CONNECT_TIMEOUT`` as a float, or
+        :data:`DEFAULT_HTTP_CONNECT_TIMEOUT_S` when unset or unparsable.
+    """
+    return _env_timeout("BAMBOO_MCP_HTTP_CONNECT_TIMEOUT", DEFAULT_HTTP_CONNECT_TIMEOUT_S)
+
+
+def _with_connect_timeout(
+    timeout: httpx.Timeout | float | None, connect_timeout_s: float
+) -> httpx.Timeout:
+    """Return ``timeout`` with only its connect budget replaced.
+
+    The read, write and pool budgets are preserved deliberately: the MCP SDK
+    derives read from ``sse_read_timeout`` and shortening it would break
+    long-lived streams.
+
+    Args:
+        timeout: An existing ``httpx`` timeout, a scalar applied to every
+            phase, or None for no limit.
+        connect_timeout_s: Connect budget to apply, in seconds.
+
+    Returns:
+        A timeout whose connect phase is ``connect_timeout_s``.
+    """
+    if isinstance(timeout, httpx.Timeout):
+        return httpx.Timeout(
+            connect=connect_timeout_s,
+            read=timeout.read,
+            write=timeout.write,
+            pool=timeout.pool,
+        )
+    return httpx.Timeout(timeout, connect=connect_timeout_s)
+
+
+def _make_http_client_factory(connect_timeout_s: float) -> Any:
+    """Build an ``httpx_client_factory`` that caps the connect timeout.
+
+    The MCP streamable-HTTP helper constructs its own client from a factory it
+    calls with ``headers``, ``timeout`` and ``auth`` keywords, passing
+    ``httpx.Timeout(timeout, read=sse_read_timeout)`` — which leaves connect
+    equal to the per-call budget.  This wrapper overrides connect and delegates
+    to the SDK's own factory where available, so any other client options it
+    sets are preserved.
+
+    Args:
+        connect_timeout_s: Connect budget to apply, in seconds.
+
+    Returns:
+        A callable suitable for the SDK's ``httpx_client_factory`` parameter.
+    """
+    def factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | float | None = None,
+        auth: Any = None,
+    ) -> httpx.AsyncClient:
+        """Create an ``httpx.AsyncClient`` with a bounded connect timeout.
+
+        Args:
+            headers: Headers supplied by the SDK.
+            timeout: Timeout computed by the SDK.
+            auth: Auth object supplied by the SDK.
+
+        Returns:
+            A configured async HTTP client.
+        """
+        resolved = _with_connect_timeout(timeout, connect_timeout_s)
+        try:
+            import importlib  # pylint: disable=import-outside-toplevel
+
+            base = getattr(
+                importlib.import_module("mcp.shared._httpx_utils"),
+                "create_mcp_http_client",
+                None,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            base = None
+        if base is not None:
+            return base(headers=headers, timeout=resolved, auth=auth)
+        return httpx.AsyncClient(
+            headers=headers, timeout=resolved, auth=auth, follow_redirects=True
+        )
+
+    return factory
+
+
 def _wrap_error(exc: BaseException) -> RuntimeError:
     """Map a transport or session exception onto an actionable RuntimeError.
 
@@ -209,6 +309,10 @@ class MCPServerConfig:
         terminate_on_close: If True, sends DELETE to terminate session on close.
         http_timeout_s: Per-call HTTP client timeout (seconds).  Defaults from
             ``BAMBOO_MCP_HTTP_TIMEOUT``; see :data:`DEFAULT_HTTP_TIMEOUT_S`.
+        http_connect_timeout_s: TCP connect timeout (seconds), kept separate so
+            that a refused or unreachable endpoint fails fast even when the
+            per-call read budget is minutes.  Defaults from
+            ``BAMBOO_MCP_HTTP_CONNECT_TIMEOUT``.
     """
 
     transport: TransportType = "stdio"
@@ -223,6 +327,7 @@ class MCPServerConfig:
     http_headers: dict[str, str] | None = None
     terminate_on_close: bool = True
     http_timeout_s: float = field(default_factory=_default_http_timeout)
+    http_connect_timeout_s: float = field(default_factory=_default_http_connect_timeout)
 
 
 class MCPAsyncClient:
@@ -285,11 +390,18 @@ class MCPAsyncClient:
                 ) from e
 
         else:
-            # Dynamically import the helper — the function was renamed and its
-            # signature changed between mcp SDK versions:
-            #   < 1.x:  streamable_http_client(url, *, http_client, terminate_on_close)
-            #   >= 1.x: streamablehttp_client(url, *, headers, timeout, terminate_on_close)
-            # We detect which version is present and call accordingly.
+            # Dynamically import the helper — which function exists, and its
+            # signature, varies across mcp SDK releases.  Verified against
+            # installed wheels:
+            #   mcp 1.x: streamablehttp_client(url, headers, timeout,
+            #            sse_read_timeout, terminate_on_close,
+            #            httpx_client_factory, auth)
+            #            and also streamable_http_client(url, http_client,
+            #            terminate_on_close)
+            #   mcp 2.x: streamable_http_client(url, http_client,
+            #            terminate_on_close) only
+            # Preferring the hyphen-free name therefore selects the
+            # header/timeout form on 1.x and the http_client form on 2.x.
             import importlib  # pylint: disable=import-outside-toplevel
             import inspect  # pylint: disable=import-outside-toplevel
             try:
@@ -304,11 +416,13 @@ class MCPAsyncClient:
             if func is None:
                 raise RuntimeError("streamable_http_client is not available in this environment")
 
-            # Detect signature to handle both old and new mcp SDK versions.
+            # Detect signature to handle both mcp SDK shapes.
             _params = inspect.signature(func).parameters
-            timeout = httpx.Timeout(self.cfg.http_timeout_s)
+            timeout = _with_connect_timeout(
+                httpx.Timeout(self.cfg.http_timeout_s), self.cfg.http_connect_timeout_s
+            )
             if "http_client" in _params:
-                # Old signature: pass a pre-built httpx.AsyncClient.
+                # We build the client, so the split timeout applies directly.
                 self._http_client = httpx.AsyncClient(
                     headers=self.cfg.http_headers, timeout=timeout
                 )
@@ -318,13 +432,25 @@ class MCPAsyncClient:
                     terminate_on_close=self.cfg.terminate_on_close,
                 )
             else:
-                # New signature (mcp >= 1.x): pass headers and timeout directly.
-                self._transport_cm = func(
-                    self.cfg.http_url,
-                    headers=self.cfg.http_headers,
-                    timeout=self.cfg.http_timeout_s,
-                    terminate_on_close=self.cfg.terminate_on_close,
-                )
+                # The SDK builds its own client here, from
+                # httpx.Timeout(timeout, read=sse_read_timeout) — which leaves
+                # connect equal to the per-call budget.  Where it accepts a
+                # factory we supply one that overrides connect only.
+                kwargs: dict[str, Any] = {
+                    "headers": self.cfg.http_headers,
+                    "timeout": self.cfg.http_timeout_s,
+                    "terminate_on_close": self.cfg.terminate_on_close,
+                }
+                if "httpx_client_factory" in _params:
+                    kwargs["httpx_client_factory"] = _make_http_client_factory(
+                        self.cfg.http_connect_timeout_s
+                    )
+                else:
+                    logger.debug(
+                        "MCP transport does not accept httpx_client_factory; "
+                        "connect timeout will follow the per-call budget."
+                    )
+                self._transport_cm = func(self.cfg.http_url, **kwargs)
 
             # New SDK yields (read_stream, write_stream, get_session_id_callback);
             # older SDK yields only (read_stream, write_stream).

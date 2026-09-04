@@ -7,6 +7,27 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **A refused or unreachable MCP endpoint took the full per-call budget to
+  report** (`interfaces/shared/mcp_client.py`). A single `httpx` timeout value
+  applies to the connect phase as well as read, so raising `http_timeout_s` to
+  300 s for long-running tools also meant an endpoint that never answers a SYN
+  held the caller for five minutes. Confirmed against mcp 1.29.1, which builds
+  `httpx.Timeout(timeout, read=sse_read_timeout)` — leaving connect equal to
+  the per-call budget.
+
+  `http_connect_timeout_s` is now a separate config field defaulting to 5 s
+  (`BAMBOO_MCP_HTTP_CONNECT_TIMEOUT`). Where the SDK builds its own client we
+  pass an `httpx_client_factory` that overrides the connect phase and delegates
+  to the SDK's own factory, so its other client options survive; where we build
+  the client we apply the split timeout directly. The read, write and pool
+  budgets are deliberately preserved, since the SDK derives read from
+  `sse_read_timeout` and shortening it would break long-lived streams.
+
+  The version comment on the transport-selection branch was also inverted:
+  `streamablehttp_client` (headers/timeout) is the mcp 1.x form, and
+  `streamable_http_client` (`http_client`) is what mcp 2.x exposes — not the
+  reverse. Corrected against both installed wheels.
+
 - **The MCP session was opened and closed by different tasks, which can wedge an
   anyio cancel scope** (`interfaces/shared/mcp_client.py`). `MCPClientSync`
   submitted `connect()` and `aclose()` as two separate
