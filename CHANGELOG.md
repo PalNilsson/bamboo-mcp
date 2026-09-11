@@ -188,6 +188,49 @@ All notable changes to Bamboo are documented here.
   share `_env_timeout`, which falls back on anything unusable.
 
 ### Changed
+- **Every `tools/list` published Bamboo's internal tool metadata**
+  (`core/bamboo/core.py`, `tests/test_tool_definition_projection.py`).
+  `list_tools` passed each `get_definition()` dict straight into `Tool(**d)`,
+  and `mcp.types.Tool` sets `model_config = ConfigDict(extra="allow")` — so the
+  `tags` key every definition carries and the `examples` key nine of them carry
+  were accepted, retained and serialised to the client on every listing.
+  Nothing reads either back: `tags` has no consumer anywhere in the tree, and
+  `examples` is documentation for whoever writes the next tool. The planner
+  never saw them either, because `planner._tool_def_from_obj` already projects
+  definitions onto name/description/inputSchema — the wire was the only place
+  they escaped, inflating both the payload and the tool-description context an
+  LLM client pays for.
+
+  Definitions are now projected through `_to_wire_definition`, which keeps only
+  the fields `mcp.types.Tool` declares. The allowlist is deliberately the full
+  `Tool` field set rather than the three Bamboo populates today, so this stays
+  a "drop non-MCP keys" rule: the `profiles` key introduced by the forthcoming
+  tool-profile work is excluded without a further edit. `outputSchema` is in
+  the allowlist and covered by its own test, because the SDK reads it from the
+  definition cached at `tools/list` time to decide whether a result must carry
+  `structuredContent` — stripping it would leave the server accepting
+  unstructured results from a tool that promised structured ones, with no error
+  raised on either side.
+
+- **`mcp` floor raised from 0.9.0 to 1.10.0** (`requirements.txt`,
+  `requirements-ui.txt`, `pyproject.toml`, `tests/test_mcp_server_api_compat.py`).
+  Structured tool output arrived in mcp 1.10.0: `CombinationContent` — the
+  `tuple[content, structured]` return shape a `@app.call_tool()` handler uses to
+  populate `structuredContent` — is absent from 1.9.0's
+  `mcp/server/lowlevel/server.py` and present in 1.10.0's, as is the
+  `outputSchema` validation that consumes it. 1.10.0 is also the release that
+  added `validate_input`. The pin had no meaningful floor, and an SDK below
+  1.10.0 does not reject an `outputSchema` declaration — `Tool` allows extra
+  fields, so the schema is advertised and never enforced, and the mismatch
+  surfaces as a malformed result at the client rather than an error at the
+  server.
+
+  `test_mcp_server_api_compat.py` previously guarded only the upper bound. It
+  now guards both, via `_version_tuple` (tolerant of PEP 440 pre-release and
+  post suffixes) and a `_MINIMUM_VERSION` constant. Verified load-bearing by
+  installing mcp 1.9.0 and confirming the new assertion fails, then 1.12.0 and
+  confirming it passes.
+
 - **`interfaces/` was never type-checked** (`pyrightconfig.json`,
   `interfaces/streamlit/chat.py`, `interfaces/textual/chat.py`). `include`
   listed only `core`, `packages` and `tests`, so `pyright` skipped every

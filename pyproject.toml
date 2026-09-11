@@ -9,7 +9,7 @@ description = "Bamboo — lightweight MCP-based runtime with a plugin architectu
 requires-python = ">=3.10"
 # mcp upper bound: 2.0.0 removed the low-level Server decorator API used by
 # core.build_server(). See requirements.txt for detail.
-dependencies = ["mcp>=0.9.0,<2.0.0", "python-dotenv>=1.0.0"]
+dependencies = ["mcp>=1.10.0,<2.0.0", "python-dotenv>=1.0.0"]
 
 [tool.setuptools]
 package-dir = {"" = "."}

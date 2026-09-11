@@ -142,6 +142,54 @@ def _load_entrypoint_tool_definitions() -> list[dict[str, Any]]:
     return wire_tool_definitions()
 
 
+#: Field names ``mcp.types.Tool`` declares, as of the pinned SDK range.
+#:
+#: ``Tool`` sets ``model_config = ConfigDict(extra="allow")``, so ``Tool(**d)``
+#: accepts and then *serialises* any key the definition happens to carry.  Every
+#: Bamboo definition carries ``tags`` and several carry ``examples``; both were
+#: therefore being published to clients on every ``tools/list``, inflating the
+#: payload and the tool-description context an LLM client pays for, with nothing
+#: on either side reading them back.  They are internal metadata: ``tags`` has no
+#: consumer at all, and ``examples`` is documentation for whoever writes the next
+#: tool.  The planner never saw them either — ``planner._tool_def_from_obj``
+#: already projects definitions onto name/description/inputSchema — so the wire
+#: was the only place they leaked.
+#:
+#: Deliberately the *full* set of ``Tool`` fields rather than only the ones
+#: Bamboo populates today, so this stays a "drop non-MCP keys" rule rather than a
+#: hard-coded four.  ``outputSchema`` in particular must survive the projection:
+#: the SDK reads it from the cached ``tools/list`` definition to decide whether a
+#: tool's result requires ``structuredContent``, so stripping it would silently
+#: disable output validation.  If the SDK adds a field, add it here.
+_MCP_TOOL_FIELDS: frozenset[str] = frozenset({
+    "name",
+    "title",
+    "description",
+    "inputSchema",
+    "outputSchema",
+    "annotations",
+    "_meta",
+})
+
+
+def _to_wire_definition(defn: dict[str, Any]) -> dict[str, Any]:
+    """Project a tool definition onto the fields MCP actually defines.
+
+    Args:
+        defn: A tool definition as returned by a tool's ``get_definition()``,
+            which may carry Bamboo-internal keys such as ``tags``, ``examples``
+            or ``profiles`` alongside the MCP ones.
+
+    Returns:
+        A new dict containing only the keys present in :data:`_MCP_TOOL_FIELDS`.
+        A non-dict input yields an empty dict rather than raising, matching the
+        tolerance the rest of tool discovery shows towards a malformed plugin.
+    """
+    if not isinstance(defn, dict):
+        return {}
+    return {k: v for k, v in defn.items() if k in _MCP_TOOL_FIELDS}
+
+
 def _validate_arguments(
     tool_def: dict[str, Any], arguments: dict[str, Any]
 ) -> str | None:
@@ -244,20 +292,29 @@ def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
         This keeps the tool list sent to the LLM minimal — an ATLAS user does
         not pay token cost for CGSim tool descriptions, and vice versa.
 
+        Every definition is projected through :func:`_to_wire_definition` before
+        it leaves, so Bamboo-internal keys (``tags``, ``examples``) are dropped
+        rather than being passed through by ``Tool``'s ``extra="allow"`` config
+        and published to clients.
+
         Returns:
             Union[List[Tool], ListToolsResult, List[Dict[str, Any]]]: The tool
             list in the appropriate shape for the MCP server/client contract.
         """
         active_plugin: str = os.getenv("ASKPANDA_PLUGIN", "atlas").strip().lower()
 
-        defs: list[dict[str, Any]] = [tool.get_definition() for tool in TOOLS.values()]
+        defs: list[dict[str, Any]] = [
+            _to_wire_definition(tool.get_definition()) for tool in TOOLS.values()
+        ]
 
         # Include only plugin tools whose namespace matches the active plugin.
+        # The namespace is read from the definition *before* projection, since
+        # it is derived from ``name``, which the projection keeps.
         for ep_def in _load_entrypoint_tool_definitions():
             tool_name: str = ep_def.get("name", "")
             namespace: str = tool_name.split(".", 1)[0] if "." in tool_name else ""
             if namespace == active_plugin:
-                defs.append(ep_def)
+                defs.append(_to_wire_definition(ep_def))
 
         # If Tool is a real class/model, return Tool objects.
         if inspect.isclass(Tool):
