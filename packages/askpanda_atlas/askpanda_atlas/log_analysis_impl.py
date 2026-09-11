@@ -68,13 +68,18 @@ import json
 import logging
 import re
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from askpanda_atlas._fallback_http import get_base_url
 from askpanda_atlas._traceback_parse import (
     ExceptionInfo,
     TracebackBlock,
+    coerce_bool,
+    coerce_int,
+    coerce_optional_str,
+    coerce_str,
     find_primary_exception,
     parse_pilot_version,
     parse_pilot_version_from_pilotid,
@@ -831,6 +836,56 @@ class FailureContext:
     exception: ExceptionInfo | None = None
     traceback_count: int = 0
 
+    def to_state(self) -> dict[str, Any]:
+        """Return a round-trippable representation of the context.
+
+        See :meth:`ExceptionInfo.to_state` for why this exists alongside the
+        ``as_dict`` evidence projections rather than replacing them.
+
+        Returns:
+            Dict keyed by the dataclass field names, accepted by
+            :meth:`from_state`.  ``exception`` is a nested state dict, or
+            ``None`` when no traceback was found — a distinction the reader
+            must preserve, since ``None`` means "no traceback in this log"
+            while an empty dict would mean "a traceback with no detail".
+        """
+        return {
+            "excerpt": self.excerpt,
+            "exception": self.exception.to_state() if self.exception else None,
+            "traceback_count": self.traceback_count,
+        }
+
+    @classmethod
+    def from_state(cls, state: Any) -> FailureContext:
+        """Rebuild a context from :meth:`to_state` output.
+
+        Args:
+            state: Mapping as produced by :meth:`to_state`; see
+                ``Frame.from_state`` for why this is typed ``Any``.
+                Unknown keys are
+                ignored and missing keys fall back to the field defaults.
+
+        Returns:
+            The reconstructed :class:`FailureContext`.  ``exception`` is
+            ``None`` unless the state carries a mapping for it, so both a
+            missing key and an explicit ``null`` restore the no-traceback case.
+        """
+        if not isinstance(state, Mapping):
+            return cls()
+
+        raw_exception: Any = state.get("exception")
+        exception: ExceptionInfo | None = None
+        if isinstance(raw_exception, Mapping):
+            exception = ExceptionInfo.from_state(
+                cast("Mapping[str, Any]", raw_exception)
+            )
+
+        return cls(
+            excerpt=coerce_str(state.get("excerpt")),
+            exception=exception,
+            traceback_count=coerce_int(state.get("traceback_count")),
+        )
+
 
 def extract_failure_context(
     log_text: str,
@@ -1151,6 +1206,65 @@ class _LogFetchResult:
     exception: ExceptionInfo | None = None
     traceback_count: int = 0
     pilot_version: str = ""
+
+    def to_state(self) -> dict[str, Any]:
+        """Return a round-trippable representation of the fetch result.
+
+        The four URL fields and ``setup_log_excerpt`` are optional strings
+        where ``None`` and ``""`` differ: ``None`` means the file was never
+        fetched, ``""`` would claim it was fetched and found empty.  The codec
+        preserves that distinction rather than normalising it away.
+
+        Returns:
+            Dict keyed by the dataclass field names, accepted by
+            :meth:`from_state`.
+        """
+        return {
+            "log_excerpt": self.log_excerpt,
+            "log_url": self.log_url,
+            "log_available": self.log_available,
+            "stderr_url": self.stderr_url,
+            "setup_log_url": self.setup_log_url,
+            "setup_log_excerpt": self.setup_log_excerpt,
+            "exception": self.exception.to_state() if self.exception else None,
+            "traceback_count": self.traceback_count,
+            "pilot_version": self.pilot_version,
+        }
+
+    @classmethod
+    def from_state(cls, state: Any) -> _LogFetchResult:
+        """Rebuild a fetch result from :meth:`to_state` output.
+
+        Args:
+            state: Mapping as produced by :meth:`to_state`; see
+                ``Frame.from_state`` for why this is typed ``Any``.
+                Unknown keys are
+                ignored and missing keys fall back to the field defaults.
+
+        Returns:
+            The reconstructed :class:`_LogFetchResult`.
+        """
+        if not isinstance(state, Mapping):
+            return cls()
+
+        raw_exception: Any = state.get("exception")
+        exception: ExceptionInfo | None = None
+        if isinstance(raw_exception, Mapping):
+            exception = ExceptionInfo.from_state(
+                cast("Mapping[str, Any]", raw_exception)
+            )
+
+        return cls(
+            log_excerpt=coerce_str(state.get("log_excerpt")),
+            log_url=coerce_optional_str(state.get("log_url")),
+            log_available=coerce_bool(state.get("log_available")),
+            stderr_url=coerce_optional_str(state.get("stderr_url")),
+            setup_log_url=coerce_optional_str(state.get("setup_log_url")),
+            setup_log_excerpt=coerce_optional_str(state.get("setup_log_excerpt")),
+            exception=exception,
+            traceback_count=coerce_int(state.get("traceback_count")),
+            pilot_version=coerce_str(state.get("pilot_version")),
+        )
 
 
 def _fetch_logs_payload(

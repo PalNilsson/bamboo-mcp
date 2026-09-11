@@ -29,7 +29,24 @@ from bamboo.llm.runtime import get_llm_manager, get_llm_selector
 from bamboo.llm.types import GenerateParams, Message
 from bamboo.tools.base import MCPContent, text_content
 from bamboo.tools._tool_names import wire_tool_definitions
+from bamboo.tools._tool_profiles import PROFILE_ORCHESTRATED, is_advertised
 from bamboo.tracing import EVENT_LLM_CALL, span
+
+
+#: Tool profiles the planner catalog draws from.
+#:
+#: Pinned to the orchestrated surface rather than following
+#: ``BAMBOO_TOOL_PROFILE``, because the planner serves that surface by
+#: construction: it proposes compound tools and ``bamboo_executor`` runs them
+#: in-process.  Were this to follow the environment, a server started with
+#: ``BAMBOO_TOOL_PROFILE=primitive`` would drop ``panda_log_analysis`` from the
+#: catalog while ``bamboo_answer`` remained advertised and callable, so every
+#: question routed through the planner would lose log analysis.
+#:
+#: It is also what keeps primitives out of the tool-retrieval index planned for
+#: Track A unconditionally, rather than only when the server happens to be in
+#: orchestrated mode.
+_PLANNER_PROFILES: frozenset[str] = frozenset({PROFILE_ORCHESTRATED})
 
 
 class PlanRoute(str, Enum):
@@ -356,16 +373,27 @@ def build_planner_user_prompt(
     )
 
 
-def _tool_def_from_obj(obj: Any, fallback_name: str = "") -> dict[str, Any] | None:
+def _tool_def_from_obj(
+    obj: Any,
+    fallback_name: str = "",
+    profiles: frozenset[str] | None = None,
+) -> dict[str, Any] | None:
     """Return a compact tool definition dict from a tool object, or None.
 
     Args:
         obj: Tool object expected to have a ``get_definition`` method.
         fallback_name: Name to use if the definition doesn't include one.
+        profiles: Optional tool profiles to filter by.  When given, a
+            definition advertised under none of them yields ``None``.  The
+            check happens here rather than in the caller because the raw
+            definition is already in hand, and the returned dict drops the
+            ``profiles`` key along with everything else outside the three
+            fields below.
 
     Returns:
         Dict with ``name``, ``description``, and ``inputSchema`` keys, or None
-        if the object has no usable definition.
+        if the object has no usable definition or is filtered out by
+        *profiles*.
     """
     get_def = getattr(obj, "get_definition", None)
     if not callable(get_def):
@@ -376,6 +404,8 @@ def _tool_def_from_obj(obj: Any, fallback_name: str = "") -> dict[str, Any] | No
             return None
         d: dict[str, Any] = cast(dict[str, Any], raw)
     except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if profiles is not None and not is_advertised(d, profiles):
         return None
     name: str = str(d.get("name") or fallback_name)
     if not name:
@@ -395,6 +425,10 @@ def _collect_tool_catalog(namespaces: list[str] | None = None) -> list[dict[str,
     included regardless of the ``namespaces`` filter so the LLM is aware of
     the full built-in toolset.
 
+    Tools restricted to a profile outside :data:`_PLANNER_PROFILES` are
+    excluded from both sources.  This does not follow ``BAMBOO_TOOL_PROFILE``;
+    see that constant for why.
+
     Args:
         namespaces: Optional list of namespaces to include for *entry-point*
             tools (e.g. ['atlas']). Core tools are always included.
@@ -406,7 +440,7 @@ def _collect_tool_catalog(namespaces: list[str] | None = None) -> list[dict[str,
     out: list[dict[str, Any]] = []
 
     def _add(obj: Any, fallback_name: str = "") -> None:
-        entry = _tool_def_from_obj(obj, fallback_name)
+        entry = _tool_def_from_obj(obj, fallback_name, profiles=_PLANNER_PROFILES)
         if entry and entry["name"] not in seen:
             seen.add(entry["name"])
             out.append(entry)
@@ -475,6 +509,8 @@ def _collect_tool_catalog(namespaces: list[str] | None = None) -> list[dict[str,
     for defn in wire_tool_definitions():
         name = str(defn.get("name") or "")
         if not name:
+            continue
+        if not is_advertised(defn, _PLANNER_PROFILES):
             continue
         if namespaces:
             ns = name.split(".", 1)[0] if "." in name else ""

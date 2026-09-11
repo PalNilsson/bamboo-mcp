@@ -336,6 +336,84 @@ All notable changes to Bamboo are documented here.
   than shrinking the evidence to nothing.
 
 ### Added
+- **Round-trippable `to_state`/`from_state` codecs on the log-analysis
+  dataclasses** (`packages/askpanda_atlas/askpanda_atlas/_traceback_parse.py`,
+  `packages/askpanda_atlas/askpanda_atlas/log_analysis_impl.py`, mirrored into
+  `askpanda_epic`). `Frame`, `ExceptionInfo`, `FailureContext` and
+  `_LogFetchResult` can now survive a round trip out of the process and back —
+  through a recorded fixture, or through a caller that composes tool calls
+  itself and carries intermediate results between them. That is what the
+  forthcoming primitive tool surface needs in order to declare an
+  `outputSchema` and return structured content.
+
+  These do **not** replace the existing `as_dict` methods, and the distinction
+  matters. `as_dict` is an evidence projection for the LLM: it renames
+  `exc_type` to `type`, drops `raw` entirely, and injects a derived
+  `deepest_pilot_frame` that is not a field. Nothing can be reconstructed from
+  it. `to_state` uses the attribute names verbatim and carries every field,
+  including `raw`, so `from_state(x.to_state()) == x` holds and a JSON Schema
+  can be written against it. Capping `raw` belongs at the tool boundary that
+  emits the state, where the budget is known, not in the codec.
+
+  They were named `to_state`/`from_state` rather than `to_dict`/`from_dict`
+  precisely because of that: the tree already uses `as_dict` and `to_dict`
+  interchangeably for one-way serialisation (`cost_guard`, `analysis_store`
+  versus `panda_task_schema`, `_core_dump_analyzer`), so a `to_dict` sitting
+  next to `as_dict` on the same class would have offered a reader nothing to
+  disambiguate on, and picking wrong would fail silently — you get a dict
+  either way, just with the wrong keys or missing `raw`.
+
+  Reading is tolerant: unknown keys are ignored, missing keys fall back to
+  field defaults, a non-mapping yields defaults rather than raising, and one
+  malformed frame does not discard the rest of a traceback. State reaches these
+  methods as an unvalidated MCP tool argument, so `from_state` is typed `Any`
+  and the guard on its first line is the validation. Two coercions are
+  load-bearing beyond convenience: `coerce_bool` matches `"false"` as false
+  rather than as a non-empty string, and `coerce_int` truncates a `float`
+  because JSON draws no int/float distinction and a producer may legitimately
+  encode line 412 as `412.0`.
+
+- **`BAMBOO_TOOL_PROFILE` selects which tool surface the server advertises**
+  (`core/bamboo/tools/_tool_profiles.py`, `core/bamboo/core.py`,
+  `core/bamboo/tools/planner.py`). `panda_log_analysis` is a compound tool: one
+  call runs metadata fetch → file listing → log download → excerpt → classify →
+  evidence bundle. Agentic frameworks built around *code mode*, where the model
+  writes code composing small primitives rather than selecting one compound
+  tool per turn, need a fine-grained surface instead.
+
+  Rather than splitting the monolith — which would degrade selection accuracy,
+  compound per-step error, and put five near-identical *log / error / job /
+  fetch* embeddings into the tool-retrieval index planned for Track A — Bamboo
+  will expose a second advertised surface over the same implementation
+  functions. This commit is the switch that selects between them; it adds no
+  tools and no definition opts in yet, so the published surface is byte-for-byte
+  what it was under every value of the variable.
+
+  The variable takes `orchestrated` (default), `primitive` or `both`. A tool
+  definition may carry a `profiles` key naming the single-profile values it is
+  advertised under; `both` is the union and never appears in a definition. A
+  definition naming no usable profile is advertised under all of them, which is
+  the right default beyond the log-analysis pair — `panda_job_status`,
+  `cric_query` and `bamboo_health` serve a code-mode agent as well as they
+  serve the planner.
+
+  Two properties are deliberate. The switch gates **advertising only**:
+  `call_tool`, `bamboo_executor`'s in-process resolution and `_tool_names`'
+  alias map are untouched, because the profile exists to control catalog size
+  and selection accuracy rather than access, and a primitive still needs a
+  canonical name to key its evidence under. And an unreadable `profiles` value
+  **fails open** — under the opposite rule a typo such as `["primitve"]` would
+  make a tool silently vanish from `tools/list`, which is far harder to
+  diagnose than one extra tool being advertised.
+
+  The planner catalog is pinned to `orchestrated` rather than following the
+  variable. Were it to follow, a server started with
+  `BAMBOO_TOOL_PROFILE=primitive` would drop `panda_log_analysis` from the
+  catalog while `bamboo_answer` remained advertised and callable, so every
+  planner-routed question would lose log analysis. Pinning is also what keeps
+  primitives out of the Track A retrieval index unconditionally, rather than
+  only when the server happens to be in orchestrated mode.
+
 - **`async with MCPAsyncClient(cfg)` now works**
   (`interfaces/shared/mcp_client.py`). The module docstring of
   `interfaces/agent/agent.py` has documented this usage since it was written,

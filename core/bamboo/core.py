@@ -87,6 +87,7 @@ from bamboo.tools.opensearch_query import opensearch_query_tool
 from bamboo.tools.opensearch_promptlog_query import opensearch_promptlog_query_tool
 from bamboo.tools.loader import find_tool_by_name
 from bamboo.tools._tool_names import wire_tool_definitions
+from bamboo.tools._tool_profiles import active_profiles, is_advertised
 from bamboo.tracing import EVENT_TOOL_CALL, span
 from bamboo.prompts.templates import (
     get_bamboo_system_prompt,
@@ -292,10 +293,17 @@ def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
         This keeps the tool list sent to the LLM minimal — an ATLAS user does
         not pay token cost for CGSim tool descriptions, and vice versa.
 
+        A second filter applies the tool profile named by
+        ``BAMBOO_TOOL_PROFILE``: a definition restricting itself to profiles
+        none of which is active is withheld.  Definitions that name no profile
+        are advertised under every one, so this is inert for a tool that does
+        not opt in.  See :mod:`bamboo.tools._tool_profiles`.  Note it gates
+        *advertising* only — ``call_tool`` below serves any registered tool.
+
         Every definition is projected through :func:`_to_wire_definition` before
-        it leaves, so Bamboo-internal keys (``tags``, ``examples``) are dropped
-        rather than being passed through by ``Tool``'s ``extra="allow"`` config
-        and published to clients.
+        it leaves, so Bamboo-internal keys (``tags``, ``examples``, ``profiles``)
+        are dropped rather than being passed through by ``Tool``'s
+        ``extra="allow"`` config and published to clients.
 
         Returns:
             Union[List[Tool], ListToolsResult, List[Dict[str, Any]]]: The tool
@@ -303,18 +311,29 @@ def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
         """
         active_plugin: str = os.getenv("ASKPANDA_PLUGIN", "atlas").strip().lower()
 
-        defs: list[dict[str, Any]] = [
-            _to_wire_definition(tool.get_definition()) for tool in TOOLS.values()
-        ]
+        # Read once, not per tool: the profile cannot change mid-listing, and
+        # ``active_profiles`` reads the environment on every call.
+        profiles: frozenset[str] = active_profiles()
+
+        defs: list[dict[str, Any]] = []
+        for tool in TOOLS.values():
+            raw_def: dict[str, Any] = tool.get_definition()
+            if not is_advertised(raw_def, profiles):
+                continue
+            defs.append(_to_wire_definition(raw_def))
 
         # Include only plugin tools whose namespace matches the active plugin.
-        # The namespace is read from the definition *before* projection, since
-        # it is derived from ``name``, which the projection keeps.
+        # Both filters read the definition *before* projection: the namespace
+        # comes from ``name``, which the projection keeps, but ``profiles`` is
+        # internal metadata that the projection drops.
         for ep_def in _load_entrypoint_tool_definitions():
             tool_name: str = ep_def.get("name", "")
             namespace: str = tool_name.split(".", 1)[0] if "." in tool_name else ""
-            if namespace == active_plugin:
-                defs.append(_to_wire_definition(ep_def))
+            if namespace != active_plugin:
+                continue
+            if not is_advertised(ep_def, profiles):
+                continue
+            defs.append(_to_wire_definition(ep_def))
 
         # If Tool is a real class/model, return Tool objects.
         if inspect.isclass(Tool):

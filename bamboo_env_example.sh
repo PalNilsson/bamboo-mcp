@@ -178,6 +178,28 @@ export OPENAI_COMPAT_API_KEY=""
 export ASKPANDA_PLUGIN="atlas"
 
 ########################################
+# TOOL PROFILE
+########################################
+
+# Which advertised tool surface the MCP server publishes.
+# Options: orchestrated | primitive | both   (default: orchestrated)
+#
+#   orchestrated  Compound tools, driven by Bamboo's own planner. Today's
+#                 behaviour, and what the Textual/Streamlit interfaces expect.
+#   primitive     Fine-grained primitives for an external code-mode agent that
+#                 composes them itself.
+#   both          Publish both surfaces and let the client choose.
+#
+# Only tools that opt in via their definition are affected; everything else is
+# advertised under every profile. Affects advertising (tools/list and the
+# planner catalog) only — any registered tool remains callable. An unrecognised
+# value logs a warning and falls back to orchestrated.
+#
+# Left commented out: the default is the correct setting for every interface
+# shipped in this repo.
+# export BAMBOO_TOOL_PROFILE="orchestrated"
+
+########################################
 # RAG / CHROMADB (doc_search / doc_bm25 tools)
 ########################################
 

@@ -39,9 +39,9 @@ be mirrored in ``askpanda_epic/_traceback_parse.py``.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 # ---------------------------------------------------------------------------
 # Log record structure
@@ -128,6 +128,131 @@ _BARE_EXCEPTION_LINE_RE: re.Pattern[str] = re.compile(
 _PILOT_PATH_RE: re.Pattern[str] = re.compile(r"(?P<pilot_path>pilot/[^\"]+\.py)$")
 
 
+# ---------------------------------------------------------------------------
+# State codec helpers
+# ---------------------------------------------------------------------------
+#
+# ``to_state``/``from_state`` on the dataclasses below are a *round-trippable*
+# serialisation, deliberately distinct from the existing ``as_dict`` methods.
+# ``as_dict`` is an evidence projection for the LLM: it renames ``exc_type`` to
+# ``type``, drops ``raw`` entirely and injects a derived ``deepest_pilot_frame``
+# that is not a field.  Nothing can be reconstructed from it.  ``to_state`` uses
+# the attribute names verbatim and carries every field, so that
+# ``from_state(x.to_state()) == x`` and a JSON Schema can be written against it.
+# Both exist; neither replaces the other.  Reach for ``as_dict`` when building
+# tool evidence and ``to_state`` when state has to survive a round trip through
+# a caller.
+#
+# The coercions below are tolerant rather than strict.  State may arrive from a
+# trusted round trip (a recorded fixture) or from a caller that composed it
+# itself, and in the latter case a JSON number that arrived as ``"42"`` should
+# not take down the analysis.  Values that cannot be coerced fall back to the
+# field's zero value, matching the fail-open posture the rest of the tree takes
+# toward malformed input.
+
+
+def coerce_str(value: Any) -> str:
+    """Coerce a state value to a string.
+
+    Args:
+        value: Value read from a state mapping.
+
+    Returns:
+        The value as a string, or ``""`` when it is ``None``.  A non-string is
+        rendered with :func:`str` rather than rejected, so a caller that sent a
+        number where text was expected still produces usable state.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def coerce_optional_str(value: Any) -> str | None:
+    """Coerce a state value to a string, preserving ``None``.
+
+    Distinct from :func:`coerce_str` because several fields use ``None`` and
+    ``""`` to mean different things — a log URL of ``None`` means the file was
+    never fetched, whereas ``""`` would claim it was fetched from nowhere.
+
+    Args:
+        value: Value read from a state mapping.
+
+    Returns:
+        ``None`` when *value* is ``None``, otherwise the coerced string.
+    """
+    if value is None:
+        return None
+    return coerce_str(value)
+
+
+def coerce_int(value: Any) -> int:
+    """Coerce a state value to an integer.
+
+    Args:
+        value: Value read from a state mapping.
+
+    Returns:
+        The value as an ``int``, or ``0`` when it cannot be converted.  A
+        ``bool`` is rejected rather than silently becoming 0/1: ``True`` as a
+        line number is a caller error worth zeroing, not worth honouring.
+
+        A ``float`` is truncated rather than rejected.  JSON draws no
+        int/float distinction, so a producer is entitled to encode line 412 as
+        ``412.0``; routing that through ``int(str(...))`` would raise on the
+        ``"412.0"`` text and silently zero a perfectly good line number.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except (OverflowError, ValueError):  # inf, nan
+            return 0
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def coerce_bool(value: Any) -> bool:
+    """Coerce a state value to a boolean.
+
+    Args:
+        value: Value read from a state mapping.
+
+    Returns:
+        The value as a ``bool``.  Strings are matched case-insensitively
+        against a small true-set, so the ``"true"`` that a caller hand-writing
+        JSON is likely to produce does not become ``True`` merely by being a
+        non-empty string — and ``"false"`` emphatically does not.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def coerce_mapping(value: Any) -> dict[str, Any]:
+    """Coerce a state value to a string-keyed mapping.
+
+    Args:
+        value: Value read from a state mapping.
+
+    Returns:
+        A dict with string keys, or an empty dict when *value* is not a
+        mapping.  Keys are stringified so a caller that used integer keys does
+        not produce lookups that silently miss.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in cast("dict[Any, Any]", value).items()}
+
+
 @dataclass(frozen=True)
 class Frame:
     """One frame of a Python traceback.
@@ -169,6 +294,55 @@ class Frame:
             "pilot_path": self.pilot_path,
             "is_pilot": self.is_pilot,
         }
+
+    def to_state(self) -> dict[str, Any]:
+        """Return a round-trippable representation of the frame.
+
+        Distinct from :meth:`as_dict`, which additionally carries the derived
+        ``is_pilot`` flag.  ``is_pilot`` is omitted here precisely because it is
+        derived: round-tripping it would let a caller hand back a frame whose
+        flag contradicted its ``pilot_path``, and the property would then
+        disagree with the field it was restored from.
+
+        Returns:
+            Dict keyed by the dataclass field names, accepted by
+            :meth:`from_state`.
+        """
+        return {
+            "file": self.file,
+            "lineno": self.lineno,
+            "func": self.func,
+            "pilot_path": self.pilot_path,
+        }
+
+    @classmethod
+    def from_state(cls, state: Any) -> Frame:
+        """Rebuild a frame from :meth:`to_state` output.
+
+        Args:
+            state: Mapping as produced by :meth:`to_state`.  Typed ``Any``
+                rather than ``Mapping`` because this value routinely arrives
+                as an unvalidated MCP tool argument, where the static type is
+                whatever JSON decoded to; the guard below is the validation,
+                and declaring a narrower type would only move the lie.
+                Unknown keys are
+                ignored and missing keys fall back to the field defaults, so
+                state written by an older or newer version of this module still
+                loads.
+
+        Returns:
+            The reconstructed :class:`Frame`.  A non-mapping yields a frame of
+            defaults rather than raising, since this is reachable from
+            caller-supplied input.
+        """
+        if not isinstance(state, Mapping):
+            return cls(file="", lineno=0, func="")
+        return cls(
+            file=coerce_str(state.get("file")),
+            lineno=coerce_int(state.get("lineno")),
+            func=coerce_str(state.get("func")),
+            pilot_path=coerce_str(state.get("pilot_path")),
+        )
 
 
 @dataclass(frozen=True)
@@ -427,6 +601,67 @@ class ExceptionInfo:
             "deepest_pilot_frame": deepest.as_dict() if deepest else None,
         }
 
+    def to_state(self) -> dict[str, Any]:
+        """Return a round-trippable representation of the exception.
+
+        Three differences from :meth:`as_dict` make this the one to serialise
+        with.  The keys are the field names (``exc_type``, not ``type``), the
+        derived ``deepest_pilot_frame`` is omitted, and ``raw`` — the verbatim
+        traceback text, which :meth:`as_dict` drops — is carried.
+
+        ``raw`` can be large.  It is included because excluding it would make
+        the round trip lossy for the one field most likely to be wanted
+        downstream; capping belongs at the tool boundary that emits the state,
+        where the budget is known, not in the codec.
+
+        Returns:
+            Dict keyed by the dataclass field names, accepted by
+            :meth:`from_state`.
+        """
+        return {
+            "exc_type": self.exc_type,
+            "exc_type_full": self.exc_type_full,
+            "message": self.message,
+            "frames": [f.to_state() for f in self.frames],
+            "level": self.level,
+            "raw": self.raw,
+        }
+
+    @classmethod
+    def from_state(cls, state: Any) -> ExceptionInfo:
+        """Rebuild an exception from :meth:`to_state` output.
+
+        Args:
+            state: Mapping as produced by :meth:`to_state`; see
+                :meth:`Frame.from_state` for why this is typed ``Any``.
+                Unknown keys are
+                ignored and missing keys fall back to the field defaults.
+
+        Returns:
+            The reconstructed :class:`ExceptionInfo`.  A ``frames`` value that
+            is not a list yields no frames rather than raising, and individual
+            frame entries that are not mappings are skipped, so one malformed
+            frame does not discard the rest of the traceback.
+        """
+        if not isinstance(state, Mapping):
+            return cls()
+
+        raw_frames: Any = state.get("frames")
+        frames: list[Frame] = []
+        if isinstance(raw_frames, (list, tuple)):
+            for entry in cast("list[Any]", list(raw_frames)):
+                if isinstance(entry, Mapping):
+                    frames.append(Frame.from_state(cast("Mapping[str, Any]", entry)))
+
+        return cls(
+            exc_type=coerce_str(state.get("exc_type")),
+            exc_type_full=coerce_str(state.get("exc_type_full")),
+            message=coerce_str(state.get("message")),
+            frames=frames,
+            level=coerce_str(state.get("level")),
+            raw=coerce_str(state.get("raw")),
+        )
+
 
 def parse_frames(traceback_text: str) -> list[Frame]:
     """Extract every frame from traceback text, in call order.
@@ -677,6 +912,11 @@ __all__ = [
     "ExceptionInfo",
     "Frame",
     "TracebackBlock",
+    "coerce_bool",
+    "coerce_int",
+    "coerce_mapping",
+    "coerce_optional_str",
+    "coerce_str",
     "find_primary_exception",
     "find_traceback_blocks",
     "iter_record_starts",
