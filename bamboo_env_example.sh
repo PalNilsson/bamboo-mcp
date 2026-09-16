@@ -195,6 +195,17 @@ export ASKPANDA_PLUGIN="atlas"
 # planner catalog) only — any registered tool remains callable. An unrecognised
 # value logs a warning and falls back to orchestrated.
 #
+# Tools currently opting in to "primitive":
+#   atlas.log.plan_fetch   Decides which of a failed job's logs to download
+#                          next. Re-entrant: fetch what "next" names, pass the
+#                          signals back as "observed", repeat until "done".
+#
+# Primitives declare an outputSchema and return structured content, so they
+# require mcp >= 1.10.0 at runtime — below that floor the SDK ignores the
+# schema and the structured half of the result is silently dropped rather than
+# failing loudly. The pin in requirements.txt enforces this; check the
+# deployment venv after upgrading.
+#
 # Left commented out: the default is the correct setting for every interface
 # shipped in this repo.
 # export BAMBOO_TOOL_PROFILE="orchestrated"

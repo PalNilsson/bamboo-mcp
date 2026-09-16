@@ -6,6 +6,92 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`atlas.log.plan_fetch` — the first code-mode primitive**
+  (`packages/askpanda_atlas/askpanda_atlas/log_primitives_impl.py`,
+  `log_primitives.py`). `panda_log_analysis` is a compound tool: one call runs
+  metadata fetch, file listing, log download, excerpt, classify and evidence
+  bundling. An agentic framework built around *code mode* composes small
+  primitives instead, so Bamboo needs a primitive surface to contribute to one.
+  The monolith is untouched; this is a second advertised surface over the same
+  implementation functions, gated by `BAMBOO_TOOL_PROFILE=primitive`.
+
+  Planning is a tool rather than a static rule because `_fetch_logs_payload`
+  does not follow a static plan. For pilot error 1305 it reads `setup.stdout`
+  first and only skips `payload.stdout`/`payload.stderr` if that file turns out
+  to contain a setup error — a decision on file *content*, taken mid-flight. A
+  one-shot `plan_fetch(job_id) -> [ordered files]` could only express that by
+  exporting the predicate into a tool description, where it would drift from
+  the implementation. So `plan_fetch` is re-entrant: the agent fetches what
+  `next` names and hands back the opaque `signals` mapping it received as
+  `observed`. It never evaluates a domain predicate; it carries a dict between
+  two calls. At most three calls, and the bound is asserted.
+
+  `done` means *no further* `plan_fetch` call is required, and may be true
+  alongside a non-empty `next` — that is the terminal plan. A caller that
+  re-plans anyway is answered `{"next": [], "done": true}`, so the naive
+  `while not done` loop terminates too.
+
+  `role` (`setup`/`primary`/`secondary`) maps one-to-one onto
+  `_LogFetchResult.setup_log_url`/`log_url`/`stderr_url`, so the B7 equivalence
+  walkthrough is a field comparison rather than an interpretation. A test
+  already pins that agreement against the real `_fetch_logs_payload`.
+
+  The tool declares `outputSchema` and returns structured content. That schema
+  carries **no top-level `required`** and always declares `error`: the SDK
+  answers a result with no structured content from a tool advertising an
+  `outputSchema` with *"Output validation error: outputSchema defined but no
+  structured output returned"*, so a schema demanding the success keys would
+  make every error path an opaque protocol error. Every `call()` return path
+  accordingly yields the `(content, structured)` tuple — mutation-tested, since
+  a single plain `text_content(...)` return would reintroduce exactly that.
+
+  Registered as an entry point but deliberately **not** planner-visible: it
+  declares `profiles: ["primitive"]` and `_collect_tool_catalog` is pinned to
+  `orchestrated`, so it never enters the catalog and cannot dilute Bamboo's own
+  tool-selection accuracy, nor the RAG tool-retrieval index planned for Track
+  A. That is also why it needs no `bamboo_answer.py`/`planner.py`/
+  `bamboo_executor.py` edit — the usual three-file cost of a new tool does not
+  apply to a tool the planner never sees.
+
+### Changed
+- **The argument-error path now carries structured content when the tool
+  declares an `outputSchema`** (`core/bamboo/core.py`). `_validate_arguments`
+  failures returned `text_content(...)` — unstructured. For a tool advertising
+  an `outputSchema` the SDK rejects that after the handler returns, replacing a
+  precise, actionable argument error with an opaque protocol one. Extracted as
+  `_argument_error_result` so it is unit-testable without driving the
+  `create_server` closure.
+
+  Scoped by a guard rather than applied unconditionally: tools without an
+  `outputSchema` — the entire orchestrated surface — keep the previous list
+  return byte for byte, because the SDK performs no output validation for them
+  and `bamboo_executor` unpacks in-process results as `result[0]["text"]`. A
+  guard test asserts no built-in tool declares an `outputSchema` yet, so the
+  day one does, that unpacker gets looked at rather than silently returning an
+  empty dict.
+
+  Note the hazard is currently latent rather than live: `_validate_arguments`
+  runs only in `call_tool`'s built-in `TOOLS` branch, and `atlas.log.plan_fetch`
+  resolves through the entry-point branch, which never reaches it. The fix
+  lands now because B5 adds four more `outputSchema` tools and the cost of
+  getting this wrong is paid by whoever debugs the resulting protocol error.
+
+- **`bamboo_env_example.sh`** documents the first tool opting in to the
+  `primitive` profile, and records that primitives require mcp >= 1.10.0 at
+  runtime — below that floor the SDK ignores `outputSchema` and drops the
+  structured half of the result silently rather than failing loudly.
+
+- **`_log_file_url()` replaces five inline copies of the filebrowser URL**
+  (`packages/askpanda_atlas/askpanda_atlas/log_analysis_impl.py`, mirrored to
+  `askpanda_epic`). The `?pandaid=…&json&filename=…` query string is
+  load-bearing — the `&json` form is served unauthenticated while the bare form
+  redirects to CERN SSO — and it was written out at five call sites. One of
+  them downloads the file; the other four only record a URL for the evidence
+  bundle, so a divergence would have produced links that do not point at the
+  file that was read. The primitive builds its URLs through the same helper, so
+  it cannot drift from the monolith across a module boundary.
+
 ### Fixed
 - **Every click of "Reconnect" orphaned a live MCP client**
   (`interfaces/streamlit/chat.py`). The button called

@@ -474,30 +474,53 @@ class TestListToolsAppliesTheProfile:
         assert all(tp.DEFINITION_KEY not in d for d in result)
 
     @pytest.mark.asyncio
-    async def test_current_tree_is_unaffected_by_the_profile(
+    async def test_the_profile_adds_only_primitives_to_the_real_surface(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """B2 is inert: no definition in the tree opts into a profile yet.
+        """The profile widens the surface; it never narrows it.
 
-        Asserted against the real ``TOOLS`` registry and real entry points, so
-        it fails the moment a definition gains a ``profiles`` key without the
-        corresponding surface work — which is exactly when this test should be
-        updated rather than silently satisfied.
+        Asserted against the real ``TOOLS`` registry and real entry points.
+        Until B4 this test read that *no* definition opted into a profile, and
+        it was written to fail the moment one did rather than be silently
+        satisfied — which is what ``atlas.log.plan_fetch`` made it do.  The
+        invariant it now pins is the one that matters going forward: the
+        orchestrated surface is a subset of the other two, and everything the
+        other two add is a primitive.
+
+        The orchestrated surface must stay *exactly* what it was, because it
+        is what Bamboo's own planner and every existing client see.  It would
+        narrow if ``panda_log_analysis`` were given ``profiles:
+        ["orchestrated"]`` — harmless — but also if a typo gave it
+        ``["primitve"]``, which fails open to profile-agnostic by design
+        (D-7), so this test would not catch that.  ``both`` is the union and
+        must therefore equal ``primitive`` here, since nothing declares
+        ``orchestrated``.
 
         Args:
             monkeypatch: Pytest environment patcher.
         """
         monkeypatch.setenv("ASKPANDA_PLUGIN", "atlas")
-        surfaces: list[list[str]] = []
+        surfaces: dict[str, list[str]] = {}
         for profile in ("orchestrated", "primitive", "both"):
             monkeypatch.setenv(tp.ENV_VAR, profile)
-            surfaces.append(
-                await _wire_names(
-                    dict(core.TOOLS), core._load_entrypoint_tool_definitions()
-                )
+            surfaces[profile] = await _wire_names(
+                dict(core.TOOLS), core._load_entrypoint_tool_definitions()
             )
-        assert surfaces[0] == surfaces[1] == surfaces[2]
-        assert surfaces[0], "expected a non-empty tool surface"
+
+        assert surfaces["orchestrated"], "expected a non-empty tool surface"
+        orchestrated = set(surfaces["orchestrated"])
+        primitive = set(surfaces["primitive"])
+
+        assert orchestrated <= primitive
+        assert primitive == set(surfaces["both"])
+
+        # Everything the primitive profile adds is a log primitive, and the
+        # compound tool remains available under every profile until B6 gives
+        # it a profile of its own.
+        added = primitive - orchestrated
+        assert all(name.startswith("atlas.log.") for name in added), added
+        for profile in ("orchestrated", "primitive", "both"):
+            assert "panda_log_analysis" in surfaces[profile]
 
 
 # --------------------------------------------------------------------------
@@ -565,3 +588,56 @@ class TestPlannerCatalogExcludesPrimitives:
     def test_real_catalog_is_unchanged(self) -> None:
         """B2 is inert on the planner side as well as the wire."""
         assert planner_mod._collect_tool_catalog(namespaces=["atlas"])
+
+
+class TestRealPrimitiveIsGated:
+    """Guards against the *installed* ``atlas.log.plan_fetch`` entry point.
+
+    The rest of this module drives the rule with synthetic definitions, which
+    proves the mechanism but not the wiring.  These two tests read the real
+    registry, so a definition that lost its ``profiles`` key, or an entry point
+    whose dotted name stopped resolving, fails here rather than silently
+    widening the planner catalog.
+
+    Both skip when the plugin is not installed: entry points are unavailable
+    in a source-only checkout, which is the pre-existing container caveat that
+    also affects ``tests/test_tool_name_canon.py``.
+    """
+
+    _NAME = "atlas.log.plan_fetch"
+
+    def _real_definition(self) -> dict[str, Any]:
+        """Return the installed primitive's wire definition.
+
+        Returns:
+            The definition dict.
+        """
+        from bamboo.tools._tool_names import wire_tool_definitions
+
+        for defn in wire_tool_definitions():
+            if defn.get("name") == self._NAME:
+                return defn
+        pytest.skip(f"{self._NAME} entry point is not installed")
+        raise AssertionError("unreachable")
+
+    def test_the_real_primitive_declares_the_primitive_profile(self) -> None:
+        """The definition must restrict itself, or the gate does nothing."""
+        defn = self._real_definition()
+        assert tp.definition_profiles(defn) == frozenset({tp.PROFILE_PRIMITIVE})
+
+    def test_the_real_primitive_is_gated_by_profile(self) -> None:
+        """Advertised under ``primitive`` and ``both``, withheld under ``orchestrated``."""
+        defn = self._real_definition()
+        assert not tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_ORCHESTRATED))
+        assert tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_PRIMITIVE))
+        assert tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_BOTH))
+
+    def test_the_real_primitive_never_reaches_the_planner_catalog(self) -> None:
+        """The catalog is pinned to ``orchestrated``, so the primitive is absent."""
+        self._real_definition()  # skip early when not installed
+        names = [
+            entry["name"]
+            for entry in planner_mod._collect_tool_catalog(namespaces=["atlas"])
+        ]
+        assert self._NAME not in names
+        assert "panda_log_analysis" in names

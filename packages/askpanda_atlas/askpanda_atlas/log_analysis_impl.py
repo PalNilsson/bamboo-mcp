@@ -279,6 +279,29 @@ def _fetch_metadata(job_id: int, base_url: str, timeout: int) -> dict[str, Any] 
     return payload
 
 
+def _log_file_url(job_id: int, filename: str, base_url: str) -> str:
+    """Build the filebrowser URL for one of a job's log files.
+
+    The query string is load-bearing and must not be reordered or extended:
+    the ``&json`` form is served unauthenticated, while the bare form
+    redirects to the CERN SSO login page.  This was written out inline at
+    five call sites, one of which (:func:`_fetch_log_text`) actually
+    *downloads* while the other four only record a URL for the evidence
+    bundle, so a divergence between them would have produced links that do
+    not point at the file that was read.
+
+    Args:
+        job_id: PanDA job ID.
+        filename: Log filename, relative to the job directory (e.g.
+            ``setup.stdout``).
+        base_url: BigPanDA base URL.
+
+    Returns:
+        Fully-qualified filebrowser URL for the named file.
+    """
+    return f"{base_url}/filebrowser/?pandaid={job_id}&json&filename={filename}"
+
+
 def _fetch_log_text(job_id: int, filename: str, base_url: str, timeout: int) -> str | None:
     """Download a pilot or payload log file, using the in-process cache.
 
@@ -299,7 +322,7 @@ def _fetch_log_text(job_id: int, filename: str, base_url: str, timeout: int) -> 
     """
     from askpanda_atlas._cache import cached_fetch_log  # type: ignore[import]
 
-    url = f"{base_url}/filebrowser/?pandaid={job_id}&json&filename={filename}"
+    url = _log_file_url(job_id, filename, base_url)
     logger.info("Fetching log (cache-aware): %s", url)
     return cached_fetch_log(url, timeout)
 
@@ -1303,9 +1326,7 @@ def _fetch_logs_payload(
     # --- setup.stdout first ---
     setup_fetched = False
     if _file_is_nonempty(file_index, "setup.stdout"):
-        result.setup_log_url = (
-            f"{base_url}/filebrowser/?pandaid={job_id}&json&filename=setup.stdout"
-        )
+        result.setup_log_url = _log_file_url(job_id, "setup.stdout", base_url)
         setup_text = _fetch_log_text(job_id, "setup.stdout", base_url, timeout)
         if setup_text:
             setup_fetched = True
@@ -1336,9 +1357,7 @@ def _fetch_logs_payload(
 
     # --- Fall through to payload logs ---
     log_filename = "payload.stdout"
-    result.log_url = (
-        f"{base_url}/filebrowser/?pandaid={job_id}&json&filename={log_filename}"
-    )
+    result.log_url = _log_file_url(job_id, log_filename, base_url)
     log_text: str | None = None
     if _file_is_nonempty(file_index, log_filename):
         log_text = _fetch_log_text(job_id, log_filename, base_url, timeout)
@@ -1347,9 +1366,7 @@ def _fetch_logs_payload(
 
     stderr_text: str | None = None
     if _file_is_nonempty(file_index, "payload.stderr"):
-        result.stderr_url = (
-            f"{base_url}/filebrowser/?pandaid={job_id}&json&filename=payload.stderr"
-        )
+        result.stderr_url = _log_file_url(job_id, "payload.stderr", base_url)
         stderr_text = _fetch_log_text(job_id, "payload.stderr", base_url, timeout)
     else:
         logger.info("payload.stderr is zero-length for job %d; skipping.", job_id)
@@ -1427,9 +1444,7 @@ def _fetch_logs_pilotlog(
     """
     result = _LogFetchResult()
     log_filename = _select_log_filename(job)
-    result.log_url = (
-        f"{base_url}/filebrowser/?pandaid={job_id}&json&filename={log_filename}"
-    )
+    result.log_url = _log_file_url(job_id, log_filename, base_url)
 
     log_text: str | None = None
     if _file_is_nonempty(file_index, log_filename):
@@ -2041,5 +2056,8 @@ __all__ = [
     "_classify_from_exception",
     "_fetch_file_index",
     "_file_is_nonempty",
+    "_log_file_url",
+    "_select_log_filename",
     "_setup_log_has_error",
+    "_top_level_file_index",
 ]

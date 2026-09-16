@@ -22,6 +22,7 @@ dependencies = [
 "atlas.job_stats" = "askpanda_atlas.job_stats:panda_job_stats_tool"
 "atlas.pilot_source_analysis" = "askpanda_atlas.pilot_source_analysis:pilot_source_analysis_tool"
 "atlas.core_dump_analysis" = "askpanda_atlas.core_dump_analysis:core_dump_analysis_tool"
+"atlas.log.plan_fetch" = "askpanda_atlas.log_primitives:plan_fetch_tool"
 
 [build-system]
 requires = ["setuptools>=69"]

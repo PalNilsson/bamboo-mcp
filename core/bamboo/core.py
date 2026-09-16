@@ -239,6 +239,47 @@ def _validate_arguments(
     return None
 
 
+def _argument_error_result(
+    name: str, err: str, tool_def: dict[str, Any]
+) -> Any:
+    """Build the result returned when :func:`_validate_arguments` rejects a call.
+
+    A tool that advertises an ``outputSchema`` must return structured content.
+    The MCP SDK checks this after the handler returns, and answers a result
+    that carries none with *"Output validation error: outputSchema defined but
+    no structured output returned"* — replacing a precise, actionable argument
+    error with an opaque protocol one, which is the worst possible trade for a
+    caller trying to work out what it got wrong.
+
+    So for those tools the message is returned twice: once as text, once as
+    ``{"error": message}``.  That shape is why Bamboo's primitive
+    ``outputSchema``s declare no top-level ``required`` and always declare
+    ``error`` — a schema demanding the success keys would make this failure
+    path unrepresentable.
+
+    Tools without an ``outputSchema`` — which is every tool in the tree outside
+    the primitive profile — keep the plain list return unchanged.  The SDK
+    performs no output validation for them, so wrapping them in a tuple would
+    alter the result shape of the entire orchestrated surface for no gain.
+
+    Args:
+        name: Tool name as the caller spelled it.
+        err: Message from :func:`_validate_arguments`.
+        tool_def: The tool's definition dict.
+
+    Returns:
+        A one-element MCP content list, or a ``(content, structured)`` tuple
+        when the tool declares an ``outputSchema``.
+    """
+    from bamboo.tools.base import text_content as _tc  # local import avoids cycle
+
+    message: str = f"Invalid arguments for tool '{name}': {err}"
+    content = _tc(message)
+    if tool_def.get("outputSchema") is not None:
+        return content, {"error": message}
+    return content
+
+
 def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
     """Create and configure the MCP Server instance.
 
@@ -370,8 +411,7 @@ def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
                     tool_def: dict[str, Any] = raw_def if isinstance(raw_def, dict) else {}
                     err = _validate_arguments(tool_def, arguments or {})
                     if err:
-                        from bamboo.tools.base import text_content as _tc  # local import avoids cycle
-                        return _tc(f"Invalid arguments for tool '{name}': {err}")
+                        return _argument_error_result(name, err, tool_def)
                 return await tool.call(arguments or {})
 
             # Fallback: resolve tool from plugin entry points.
