@@ -106,6 +106,86 @@ _LOG_ANALYSIS_SUBS: tuple[tuple[str, str], ...] = (
         "populated.  A large job log makes BigPanDA report a warning such as",
         "populated.  A large job log makes the PanDA monitor report a warning such as",
     ),
+    # Code-mode note and the profile it is gated on.  The log primitives are
+    # ATLAS-only (D-18: ePIC registers no primitive entry points, so a mirrored
+    # copy would be dead code plus parity-test surface).  There is therefore no
+    # ePIC alternative for the note to point at, and the whole block collapses
+    # to a constant here.  This is a recorded intentional divergence; do not
+    # hand-edit the mirrored copy.
+    (
+        "#: Appended only when the primitive surface is advertised alongside this tool.\n"
+        "_PRIMITIVE_NOTE: str = (\n"
+        '    " This runs the whole sequence in one call and returns bundled evidence; "\n'
+        '    "the atlas.log.* primitives expose the same steps individually for an "\n'
+        '    "agent that composes them itself. Prefer this one unless you need "\n'
+        '    "per-step control."\n'
+        ")\n"
+        "\n"
+        "\n"
+        "def _primitive_surface_is_advertised() -> bool:",
+        "#: Unreachable in this mirrored copy; see _primitive_surface_is_advertised.\n"
+        '_PRIMITIVE_NOTE: str = ""\n'
+        "\n"
+        "\n"
+        "def _primitive_surface_is_advertised() -> bool:",
+    ),
+    (
+        '    """Report whether the log primitives are advertised alongside this tool.\n'
+        "\n"
+        "    Read at call time rather than baked in, and the reason is the planner\n"
+        "    rather than tidiness: under the default ``orchestrated`` profile the\n"
+        "    primitives are withheld, and ``_collect_tool_catalog`` — which is pinned\n"
+        "    to that profile — would otherwise put four tool names into the planner\n"
+        "    prompt that the planner cannot select.  Naming an unselectable tool there\n"
+        "    is the known failure mode where a plan reaches for it and falls through to\n"
+        '    RAG, answering "the documentation doesn\'t cover this" to a question that\n'
+        "    had a perfectly good answer.\n"
+        "\n"
+        "    ``bamboo.tools._tool_profiles`` is imported here (deferred) so this module\n"
+        "    stays importable when bamboo core is absent, which is the isolated-exercise\n"
+        "    case ``_fallback_log_analysis`` serves.  The profile vocabulary is read\n"
+        "    from that module rather than from the environment directly: two spellings\n"
+        "    of ``primitive`` would be one too many.\n"
+        "\n"
+        "    Returns:\n"
+        "        ``True`` when the primitive profile is active.  ``False`` when bamboo\n"
+        "        core is unavailable — the conservative answer, since without it no\n"
+        "        primitive is registered to compose either.\n"
+        '    """\n'
+        "    try:\n"
+        "        from bamboo.tools._tool_profiles import (  # deferred — see docstring\n"
+        "            PROFILE_PRIMITIVE,\n"
+        "            active_profiles,\n"
+        "        )\n"
+        "    except Exception:  # pylint: disable=broad-exception-caught\n"
+        "        return False\n"
+        "    return PROFILE_PRIMITIVE in active_profiles()",
+        '    """Report whether log primitives are advertised alongside this tool.\n'
+        "\n"
+        "    Returns:\n"
+        "        Always ``False`` in this mirrored copy: the log primitives are\n"
+        "        ATLAS-only, so there is no ePIC code-mode alternative to point at.\n"
+        "        See tests/plugin_mirror_spec.py; do not hand-edit.\n"
+        '    """\n'
+        "    return False",
+    ),
+    # Profile restriction.  The ATLAS monolith withdraws from the primitive
+    # surface because atlas.log.* replaces it there.  Nothing replaces the ePIC
+    # copy, so withholding it under the primitive profile would leave an ePIC
+    # code-mode agent with no log analysis at all; the mirrored copy therefore
+    # stays profile-agnostic and is advertised under every profile.
+    (
+        "        # The compound surface only.  Under the primitive profile this tool is\n"
+        "        # withheld and atlas.log.* replaces it; under ``both`` the description\n"
+        "        # above says which to reach for.  Advertising only — call_tool serves\n"
+        "        # it under every profile, so the TUI, the REST facade and\n"
+        "        # bamboo_executor are unaffected.\n"
+        '        "profiles": ["orchestrated"],\n',
+        "        # Deliberately profile-agnostic: no ePIC primitive replaces this tool,\n"
+        "        # so restricting it to the orchestrated surface would leave an ePIC\n"
+        "        # code-mode agent with no log analysis at all.  See\n"
+        "        # tests/plugin_mirror_spec.py; do not hand-edit.\n",
+    ),
     ("askpanda_atlas", "askpanda_epic"),
 )
 

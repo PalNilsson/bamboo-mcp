@@ -1897,23 +1897,74 @@ def fetch_and_analyse(job_id: int, base_url: str, timeout: int) -> dict[str, Any
 # Tool definition
 # ---------------------------------------------------------------------------
 
+#: Base description, correct under every profile.
+_DESCRIPTION: str = (
+    "Diagnose why a specific PanDA job failed. Downloads the job's "
+    "pilot log and error metadata from BigPanDA, extracts the "
+    "relevant failure context, and classifies the error "
+    "(e.g. stage-in timeout, segfault, memory error, network issue, "
+    "payload failure, JEDI reassignment). Use when the question asks "
+    "why a job failed, what the error was, or what action to take."
+)
+
+#: Appended only when the primitive surface is advertised alongside this tool.
+_PRIMITIVE_NOTE: str = (
+    " This runs the whole sequence in one call and returns bundled evidence; "
+    "the atlas.log.* primitives expose the same steps individually for an "
+    "agent that composes them itself. Prefer this one unless you need "
+    "per-step control."
+)
+
+
+def _primitive_surface_is_advertised() -> bool:
+    """Report whether the log primitives are advertised alongside this tool.
+
+    Read at call time rather than baked in, and the reason is the planner
+    rather than tidiness: under the default ``orchestrated`` profile the
+    primitives are withheld, and ``_collect_tool_catalog`` — which is pinned
+    to that profile — would otherwise put four tool names into the planner
+    prompt that the planner cannot select.  Naming an unselectable tool there
+    is the known failure mode where a plan reaches for it and falls through to
+    RAG, answering "the documentation doesn't cover this" to a question that
+    had a perfectly good answer.
+
+    ``bamboo.tools._tool_profiles`` is imported here (deferred) so this module
+    stays importable when bamboo core is absent, which is the isolated-exercise
+    case ``_fallback_log_analysis`` serves.  The profile vocabulary is read
+    from that module rather than from the environment directly: two spellings
+    of ``primitive`` would be one too many.
+
+    Returns:
+        ``True`` when the primitive profile is active.  ``False`` when bamboo
+        core is unavailable — the conservative answer, since without it no
+        primitive is registered to compose either.
+    """
+    try:
+        from bamboo.tools._tool_profiles import (  # deferred — see docstring
+            PROFILE_PRIMITIVE,
+            active_profiles,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return PROFILE_PRIMITIVE in active_profiles()
+
+
 def get_definition() -> dict[str, Any]:
     """Return the MCP tool definition for panda_log_analysis.
 
     Returns:
-        Dict with ``name``, ``description``, ``inputSchema``,
-        ``examples``, and ``tags`` keys.
+        Dict with ``name``, ``description``, ``inputSchema``, ``examples``,
+        ``profiles`` and ``tags`` keys.  The description gains a pointer to
+        the primitive surface when that surface is advertised; see
+        :func:`_primitive_surface_is_advertised`.
     """
+    description: str = _DESCRIPTION
+    if _primitive_surface_is_advertised():
+        description += _PRIMITIVE_NOTE
+
     return {
         "name": "panda_log_analysis",
-        "description": (
-            "Diagnose why a specific PanDA job failed. Downloads the job's "
-            "pilot log and error metadata from BigPanDA, extracts the "
-            "relevant failure context, and classifies the error "
-            "(e.g. stage-in timeout, segfault, memory error, network issue, "
-            "payload failure, JEDI reassignment). Use when the question asks "
-            "why a job failed, what the error was, or what action to take."
-        ),
+        "description": description,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1936,6 +1987,12 @@ def get_definition() -> dict[str, Any]:
         "examples": [
             {"job_id": 6799893074, "query": "Why did job 6799893074 fail?"},
         ],
+        # The compound surface only.  Under the primitive profile this tool is
+        # withheld and atlas.log.* replaces it; under ``both`` the description
+        # above says which to reach for.  Advertising only — call_tool serves
+        # it under every profile, so the TUI, the REST facade and
+        # bamboo_executor are unaffected.
+        "profiles": ["orchestrated"],
         "tags": ["atlas", "panda", "bigpanda", "job", "log", "failure", "diagnosis"],
     }
 
@@ -1954,16 +2011,22 @@ class PandaLogAnalysisTool:
     """
 
     def __init__(self) -> None:
-        """Initialise with the tool definition."""
-        self._def: dict[str, Any] = get_definition()
+        """Initialise the tool."""
 
     def get_definition(self) -> dict[str, Any]:
         """Return the MCP tool definition.
 
+        Rebuilt per call rather than cached at construction: the description
+        depends on the active tool profile, which is read from the environment
+        at listing time.  A snapshot taken at import would be whatever the
+        environment said when the module was first imported and would then stay
+        wrong for the life of the process.  Building a dict is cheap; a
+        definition that lies is not.
+
         Returns:
             Tool definition dictionary.
         """
-        return self._def
+        return get_definition()
 
     async def call(self, arguments: dict[str, Any]) -> list[Any]:
         """Fetch logs and return structured failure analysis.

@@ -23,7 +23,7 @@ observable.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -474,53 +474,81 @@ class TestListToolsAppliesTheProfile:
         assert all(tp.DEFINITION_KEY not in d for d in result)
 
     @pytest.mark.asyncio
-    async def test_the_profile_adds_only_primitives_to_the_real_surface(
+    async def test_the_profiles_partition_the_log_analysis_surface(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The profile widens the surface; it never narrows it.
+        """Each profile advertises one log surface, and ``both`` is the union.
 
         Asserted against the real ``TOOLS`` registry and real entry points.
-        Until B4 this test read that *no* definition opted into a profile, and
-        it was written to fail the moment one did rather than be silently
-        satisfied — which is what ``atlas.log.plan_fetch`` made it do.  The
-        invariant it now pins is the one that matters going forward: the
-        orchestrated surface is a subset of the other two, and everything the
-        other two add is a primitive.
+        This test has now been rewritten twice on purpose.  Until B4 it read
+        that *no* definition opted into a profile; B4 replaced that with "the
+        orchestrated surface is a subset of the other two", which held only
+        while the monolith was profile-agnostic.  B6 gives it
+        ``profiles: ["orchestrated"]``, so the surfaces now genuinely
+        partition: exactly ``panda_log_analysis`` leaves the primitive
+        surface, exactly the ``atlas.log.*`` primitives join it, and
+        everything else is advertised under all three.
 
-        The orchestrated surface must stay *exactly* what it was, because it
-        is what Bamboo's own planner and every existing client see.  It would
-        narrow if ``panda_log_analysis`` were given ``profiles:
-        ["orchestrated"]`` — harmless — but also if a typo gave it
-        ``["primitve"]``, which fails open to profile-agnostic by design
-        (D-7), so this test would not catch that.  ``both`` is the union and
-        must therefore equal ``primitive`` here, since nothing declares
-        ``orchestrated``.
+        The subset relation is gone deliberately.  Weakening the assertions to
+        keep it — by dropping ``panda_log_analysis`` from the comparison, say —
+        would stop this test noticing if a second tool silently withdrew from
+        the primitive surface.
 
         Args:
             monkeypatch: Pytest environment patcher.
         """
         monkeypatch.setenv("ASKPANDA_PLUGIN", "atlas")
-        surfaces: dict[str, list[str]] = {}
+        surfaces: dict[str, set[str]] = {}
         for profile in ("orchestrated", "primitive", "both"):
             monkeypatch.setenv(tp.ENV_VAR, profile)
-            surfaces[profile] = await _wire_names(
-                dict(core.TOOLS), core._load_entrypoint_tool_definitions()
+            surfaces[profile] = set(
+                await _wire_names(
+                    dict(core.TOOLS), core._load_entrypoint_tool_definitions()
+                )
             )
 
-        assert surfaces["orchestrated"], "expected a non-empty tool surface"
-        orchestrated = set(surfaces["orchestrated"])
-        primitive = set(surfaces["primitive"])
+        orchestrated = surfaces["orchestrated"]
+        primitive = surfaces["primitive"]
+        assert orchestrated, "expected a non-empty tool surface"
 
-        assert orchestrated <= primitive
-        assert primitive == set(surfaces["both"])
+        # ``both`` is the union, and neither single profile is the whole of it.
+        assert surfaces["both"] == orchestrated | primitive
+        assert orchestrated != surfaces["both"]
+        assert primitive != surfaces["both"]
 
-        # Everything the primitive profile adds is a log primitive, and the
-        # compound tool remains available under every profile until B6 gives
-        # it a profile of its own.
-        added = primitive - orchestrated
-        assert all(name.startswith("atlas.log.") for name in added), added
+        # The monolith is the only tool that leaves the primitive surface, and
+        # everything that joins it is a log primitive.
+        assert orchestrated - primitive == {"panda_log_analysis"}
+        assert all(name.startswith("atlas.log.") for name in primitive - orchestrated)
+
+        # Everything else is profile-agnostic and advertised under all three.
+        assert (orchestrated & primitive) == orchestrated - {"panda_log_analysis"}
+
+    @pytest.mark.asyncio
+    async def test_the_monolith_and_its_primitives_are_never_both_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every profile offers *some* route to a log diagnosis.
+
+        The partition above is only safe because nothing falls through it.  A
+        profile advertising neither the compound tool nor the primitives would
+        leave a client with no way to analyse a failed job at all, which is the
+        one outcome the split must not produce.
+
+        Args:
+            monkeypatch: Pytest environment patcher.
+        """
+        monkeypatch.setenv("ASKPANDA_PLUGIN", "atlas")
         for profile in ("orchestrated", "primitive", "both"):
-            assert "panda_log_analysis" in surfaces[profile]
+            monkeypatch.setenv(tp.ENV_VAR, profile)
+            names = set(
+                await _wire_names(
+                    dict(core.TOOLS), core._load_entrypoint_tool_definitions()
+                )
+            )
+            has_compound = "panda_log_analysis" in names
+            has_primitives = any(n.startswith("atlas.log.") for n in names)
+            assert has_compound or has_primitives, profile
 
 
 # --------------------------------------------------------------------------
@@ -641,3 +669,66 @@ class TestRealPrimitiveIsGated:
         ]
         assert self._NAME not in names
         assert "panda_log_analysis" in names
+
+
+class TestRealMonolithIsOrchestratedOnly:
+    """Guards the B6 half of the split: the compound tool's own restriction.
+
+    Read from the real registry rather than a synthetic definition, so a lost
+    ``profiles`` key or a description that stopped tracking the profile fails
+    here rather than silently widening a surface.
+    """
+
+    def _definition(self) -> dict[str, Any]:
+        """Return the registered monolith's definition.
+
+        Returns:
+            The definition dict.
+        """
+        tool = core.TOOLS.get("panda_log_analysis")
+        if tool is None:
+            pytest.skip("panda_log_analysis is not registered")
+            raise AssertionError("unreachable")
+        return cast(dict[str, Any], tool.get_definition())
+
+    def test_the_monolith_declares_the_orchestrated_profile(self) -> None:
+        """Without this the primitive surface would carry both routes."""
+        assert tp.definition_profiles(self._definition()) == frozenset(
+            {tp.PROFILE_ORCHESTRATED}
+        )
+
+    def test_the_monolith_is_withheld_from_the_primitive_surface(self) -> None:
+        """Advertised under ``orchestrated`` and ``both``, withheld under ``primitive``."""
+        defn = self._definition()
+        assert tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_ORCHESTRATED))
+        assert not tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_PRIMITIVE))
+        assert tp.is_advertised(defn, tp.expand_profile(tp.PROFILE_BOTH))
+
+    def test_the_description_names_the_primitives_only_when_they_are_advertised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unselectable tool name in the planner prompt is a routing hazard.
+
+        ``_collect_tool_catalog`` is pinned to ``orchestrated``, where the
+        primitives are withheld.  A static mention of ``atlas.log.*`` there
+        would offer the planner four names it cannot select; a plan that
+        reached for one would fall through to RAG and answer "the
+        documentation doesn't cover this" to a question that had an answer.
+
+        Args:
+            monkeypatch: Pytest environment patcher.
+        """
+        monkeypatch.setenv(tp.ENV_VAR, "orchestrated")
+        assert "atlas.log." not in self._definition()["description"]
+
+        monkeypatch.setenv(tp.ENV_VAR, "both")
+        assert "atlas.log." in self._definition()["description"]
+
+    def test_the_definition_is_not_cached_across_a_profile_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A snapshot taken at import would be wrong for the process lifetime."""
+        monkeypatch.setenv(tp.ENV_VAR, "primitive")
+        first = self._definition()["description"]
+        monkeypatch.setenv(tp.ENV_VAR, "orchestrated")
+        assert self._definition()["description"] != first

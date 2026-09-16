@@ -1898,23 +1898,47 @@ def fetch_and_analyse(job_id: int, base_url: str, timeout: int) -> dict[str, Any
 # Tool definition
 # ---------------------------------------------------------------------------
 
+#: Base description, correct under every profile.
+_DESCRIPTION: str = (
+    "Diagnose why a specific PanDA job failed. Downloads the job's "
+    "pilot log and error metadata from the PanDA monitor, extracts the "
+    "relevant failure context, and classifies the error "
+    "(e.g. stage-in timeout, segfault, memory error, network issue, "
+    "payload failure, JEDI reassignment). Use when the question asks "
+    "why a job failed, what the error was, or what action to take."
+)
+
+#: Unreachable in this mirrored copy; see _primitive_surface_is_advertised.
+_PRIMITIVE_NOTE: str = ""
+
+
+def _primitive_surface_is_advertised() -> bool:
+    """Report whether log primitives are advertised alongside this tool.
+
+    Returns:
+        Always ``False`` in this mirrored copy: the log primitives are
+        ATLAS-only, so there is no ePIC code-mode alternative to point at.
+        See tests/plugin_mirror_spec.py; do not hand-edit.
+    """
+    return False
+
+
 def get_definition() -> dict[str, Any]:
     """Return the MCP tool definition for panda_log_analysis.
 
     Returns:
-        Dict with ``name``, ``description``, ``inputSchema``,
-        ``examples``, and ``tags`` keys.
+        Dict with ``name``, ``description``, ``inputSchema``, ``examples``,
+        ``profiles`` and ``tags`` keys.  The description gains a pointer to
+        the primitive surface when that surface is advertised; see
+        :func:`_primitive_surface_is_advertised`.
     """
+    description: str = _DESCRIPTION
+    if _primitive_surface_is_advertised():
+        description += _PRIMITIVE_NOTE
+
     return {
         "name": "panda_log_analysis",
-        "description": (
-            "Diagnose why a specific PanDA job failed. Downloads the job's "
-            "pilot log and error metadata from the PanDA monitor, extracts the "
-            "relevant failure context, and classifies the error "
-            "(e.g. stage-in timeout, segfault, memory error, network issue, "
-            "payload failure, JEDI reassignment). Use when the question asks "
-            "why a job failed, what the error was, or what action to take."
-        ),
+        "description": description,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1937,6 +1961,10 @@ def get_definition() -> dict[str, Any]:
         "examples": [
             {"job_id": 6799893074, "query": "Why did job 6799893074 fail?"},
         ],
+        # Deliberately profile-agnostic: no ePIC primitive replaces this tool,
+        # so restricting it to the orchestrated surface would leave an ePIC
+        # code-mode agent with no log analysis at all.  See
+        # tests/plugin_mirror_spec.py; do not hand-edit.
         "tags": ["epic", "eic", "panda", "job", "log", "failure", "diagnosis"],
     }
 
@@ -1955,16 +1983,22 @@ class PandaLogAnalysisTool:
     """
 
     def __init__(self) -> None:
-        """Initialise with the tool definition."""
-        self._def: dict[str, Any] = get_definition()
+        """Initialise the tool."""
 
     def get_definition(self) -> dict[str, Any]:
         """Return the MCP tool definition.
 
+        Rebuilt per call rather than cached at construction: the description
+        depends on the active tool profile, which is read from the environment
+        at listing time.  A snapshot taken at import would be whatever the
+        environment said when the module was first imported and would then stay
+        wrong for the life of the process.  Building a dict is cheap; a
+        definition that lies is not.
+
         Returns:
             Tool definition dictionary.
         """
-        return self._def
+        return get_definition()
 
     async def call(self, arguments: dict[str, Any]) -> list[Any]:
         """Fetch logs and return structured failure analysis.

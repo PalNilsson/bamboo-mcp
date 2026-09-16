@@ -591,6 +591,35 @@ def test_get_definition() -> None:
     assert d["inputSchema"]["additionalProperties"] is False
 
 
+def test_the_definition_stays_profile_agnostic() -> None:
+    """The ePIC copy must be advertised under every tool profile.
+
+    The ATLAS monolith withdraws from the primitive surface because
+    ``atlas.log.*`` replaces it there.  Nothing replaces this one — the
+    primitives are ATLAS-only — so restricting it the same way would leave an
+    ePIC server running under ``BAMBOO_TOOL_PROFILE=primitive`` with no log
+    analysis at all.  The divergence lives in ``tests/plugin_mirror_spec.py``
+    and is regenerated mechanically; this asserts the outcome.
+    """
+    assert "profiles" not in panda_log_analysis_tool.get_definition()
+
+
+@pytest.mark.parametrize("profile", ["orchestrated", "primitive", "both"])
+def test_the_description_never_names_atlas_primitives(
+    profile: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ePIC alternative exists, so none may be advertised under any profile.
+
+    Args:
+        profile: Server profile to set before reading the definition.
+        monkeypatch: Pytest environment patcher.
+    """
+    monkeypatch.setenv("BAMBOO_TOOL_PROFILE", profile)
+    description = panda_log_analysis_tool.get_definition()["description"]
+    assert "atlas.log." not in description
+    assert "BigPanDA" not in description
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: new helpers (_setup_log_has_error, _file_is_nonempty,
 #             _fetch_file_index, classify_failure setup pattern)

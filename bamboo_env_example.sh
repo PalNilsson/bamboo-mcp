@@ -195,6 +195,14 @@ export ASKPANDA_PLUGIN="atlas"
 # planner catalog) only — any registered tool remains callable. An unrecognised
 # value logs a warning and falls back to orchestrated.
 #
+# Tools currently opting in to "orchestrated":
+#   panda_log_analysis        The compound diagnosis. Withheld under
+#                             "primitive", where the five tools below replace
+#                             it. Its description gains a pointer to them when
+#                             they are advertised, and not otherwise — naming
+#                             a tool the planner cannot select is a routing
+#                             hazard, not a helpful hint.
+#
 # Tools currently opting in to "primitive":
 #   atlas.log.plan_fetch      Decides which of a failed job's logs to download
 #                             next. Re-entrant: fetch what "next" names, pass
@@ -211,6 +219,10 @@ export ASKPANDA_PLUGIN="atlas"
 #
 # The five compose into the loop panda_log_analysis runs internally:
 #   fetch_metadata -> plan_fetch <-> fetch_text -> classify
+#
+# The primitives are ATLAS-only. The ePIC copy of panda_log_analysis is
+# deliberately profile-agnostic and stays advertised under every profile, since
+# no ePIC primitive replaces it.
 #
 # Primitives declare an outputSchema and return structured content, so they
 # require mcp >= 1.10.0 at runtime — below that floor the SDK ignores the

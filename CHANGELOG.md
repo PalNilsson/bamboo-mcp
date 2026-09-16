@@ -6,6 +6,57 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **`panda_log_analysis` now declares `profiles: ["orchestrated"]`**
+  (`packages/askpanda_atlas/askpanda_atlas/log_analysis_impl.py`). The two
+  surfaces now partition rather than overlap: `orchestrated` advertises the
+  compound tool, `primitive` advertises `atlas.log.*` in its place, and `both`
+  is the union. Until now `primitive` advertised the monolith too — harmless,
+  but surprising, and it meant a code-mode agent could sidestep the primitives
+  it was given.
+
+  Advertising only. `call_tool` serves the tool under every profile, so the
+  TUI, the Streamlit interface, the REST facade and `bamboo_executor` are
+  unaffected, and the planner catalog is pinned to `orchestrated` regardless.
+  The default profile is `orchestrated`, so nothing changes in production.
+
+- **The monolith's description points at the primitives only when they are
+  advertised.** `_collect_tool_catalog` is pinned to `orchestrated`, where the
+  primitives are withheld, so a static mention of `atlas.log.*` would put four
+  names into the planner prompt that the planner cannot select — and a plan
+  that reached for one would fall through to RAG and answer "the documentation
+  doesn't cover this" to a question that had a perfectly good answer. The note
+  is therefore appended by `get_definition()` when the primitive profile is
+  active and omitted otherwise.
+
+  That required `PandaLogAnalysisTool.get_definition()` to stop returning a
+  definition snapshotted in `__init__`. The profile is read from the
+  environment at listing time; a snapshot taken at import would be whatever the
+  environment said then and would stay wrong for the life of the process.
+  `_fallback_log_analysis.PandaLogAnalysisTool` still caches, correctly: it is
+  the no-bamboo-core path, where the predicate is constant.
+
+- **The ePIC mirror diverges twice, mechanically** (`tests/plugin_mirror_spec.py`,
+  `packages/askpanda_epic/askpanda_epic/log_analysis_impl.py`). The primitives
+  are ATLAS-only (D-18), so the ePIC copy has no code-mode alternative to point
+  at — its `_primitive_surface_is_advertised` collapses to `return False` and
+  `_PRIMITIVE_NOTE` is unreachable, in the same style as the existing
+  `_CORE_DUMP_ANALYSIS_AVAILABLE` divergence. And the ePIC copy stays
+  **profile-agnostic**: nothing replaces it, so restricting it to the
+  orchestrated surface would leave an ePIC server running under
+  `BAMBOO_TOOL_PROFILE=primitive` with no log analysis at all. Both
+  divergences are substitutions in the mirror spec, regenerated rather than
+  hand-edited, and asserted from the ePIC side.
+
+- **`test_the_profile_adds_only_primitives_to_the_real_surface` is now
+  `test_the_profiles_partition_the_log_analysis_surface`**
+  (`tests/test_tool_profiles.py`). B4's "orchestrated is a subset of the other
+  two" held only while the monolith was profile-agnostic. The subset relation
+  is dropped rather than worked around: weakening the assertions to keep it —
+  by excluding `panda_log_analysis` from the comparison — would stop the test
+  noticing a second tool silently withdrawing. A companion test asserts that no
+  profile leaves a client with neither the compound tool nor the primitives.
+
 ### Added
 - **Four more code-mode primitives: `atlas.log.fetch_metadata`,
   `atlas.log.list_files`, `atlas.log.fetch_text`, `atlas.log.classify`**
