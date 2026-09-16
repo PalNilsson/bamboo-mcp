@@ -23,6 +23,10 @@ dependencies = [
 "atlas.pilot_source_analysis" = "askpanda_atlas.pilot_source_analysis:pilot_source_analysis_tool"
 "atlas.core_dump_analysis" = "askpanda_atlas.core_dump_analysis:core_dump_analysis_tool"
 "atlas.log.plan_fetch" = "askpanda_atlas.log_primitives:plan_fetch_tool"
+"atlas.log.fetch_metadata" = "askpanda_atlas.log_primitives:fetch_metadata_tool"
+"atlas.log.list_files" = "askpanda_atlas.log_primitives:list_files_tool"
+"atlas.log.fetch_text" = "askpanda_atlas.log_primitives:fetch_text_tool"
+"atlas.log.classify" = "askpanda_atlas.log_primitives:classify_tool"
 
 [build-system]
 requires = ["setuptools>=69"]

@@ -7,6 +7,86 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Added
+- **Four more code-mode primitives: `atlas.log.fetch_metadata`,
+  `atlas.log.list_files`, `atlas.log.fetch_text`, `atlas.log.classify`**
+  (`packages/askpanda_atlas/askpanda_atlas/log_primitives_impl.py`). With
+  `plan_fetch` they decompose `fetch_and_analyse` up to evidence bundling:
+
+  ```
+  meta = fetch_metadata(job_id)
+  plan = plan_fetch(job_id)
+  while True:
+      for entry in plan["next"]:
+          got = fetch_text(job_id, entry["filename"], entry["role"])
+          observed.update(got["signals"])
+      if plan["done"]: break
+      plan = plan_fetch(job_id, observed)
+  verdict = classify(meta, fetched)
+  ```
+
+  Every decision on that path stays server-side. `plan_fetch` chooses the
+  files, `fetch_text` derives the character budget from the `role` `plan_fetch`
+  assigned and computes `setup_has_error`, and `classify` joins the excerpts
+  and picks which traceback to trust. The agent carries opaque dicts between
+  calls; it never evaluates a domain predicate. A test runs both paths over one
+  fixture and compares excerpt, exception and verdict — a small preview of the
+  B7 walkthrough, kept in-tree so a change that breaks equivalence fails in the
+  commit that makes it.
+
+  `fetch_text` returns an excerpt computed over the **full** downloaded text
+  rather than the raw text capped. Traceback anchoring searches the whole file
+  in the monolith, so excerpting at the tool boundary is what keeps the two
+  comparable — and it means no uncapped log is ever serialised across the wire.
+  ExceptionInfo's verbatim `raw` is capped here too, through
+  `truncate_traceback` rather than a slice, since a slice discards the terminal
+  exception line.
+
+  `classify` is pure: no network, no job ID. Everything it needs has already
+  been fetched, so it is cheap to call, trivial to test and safe to call twice.
+  It answers the open question of whether it should take raw text or a handle —
+  neither; it takes the `FailureContext` state dicts the B3 codecs exist to
+  carry.
+
+  Two fields that `fetch_and_analyse` consumes without promoting to evidence
+  are in the metadata subset because their absence would be silent:
+  `commandtopilot`, which `classify_failure` searches for the JEDI-reassignment
+  signal, and `pilotid`, which carries the pilot version when no pilot log was
+  read. A subset modelled on the evidence keys alone would have misclassified
+  exactly the jobs that never really failed.
+
+  ATLAS-only, no ePIC mirror (D-18). Each declares `profiles: ["primitive"]`,
+  so none reaches Bamboo's planner catalog and none needs the usual
+  `bamboo_answer.py`/`planner.py`/`bamboo_executor.py` edit.
+
+- **`BAMBOO_PRIMITIVE_MAX_CHARS`** (`bamboo_env_example.sh`) caps what a
+  primitive returns. Default 8000 — numerically equal to the monolith's
+  `_MAX_EXCERPT_CHARS`, read independently, so raising it for a large-context
+  code-mode agent cannot change the orchestrated path. Unparseable or
+  non-positive values warn and fall back rather than failing every call, as an
+  unrecognised tool profile does.
+
+### Changed
+- **`_tool_result` replaces the per-tool result closure**
+  (`log_primitives_impl.py`). Every return path of every primitive now goes
+  through one function, so "did we forget the structured half?" has a single
+  answer rather than one per `return` statement. The SDK answers a result with
+  no structured content from a tool advertising an `outputSchema` with an
+  opaque *"Output validation error"*, and B5 multiplies the number of paths
+  that could make that mistake by five. Mutation-tested: dropping the
+  structured half of the tuple fails 30 tests.
+
+### Fixed
+- **`atlas.log.list_files` could emit a payload its own schema rejects.**
+  Entries were projected with a bare `record.get(...)`, so an entry missing
+  `dirname` or `modification` produced `null` against a declared string type
+  and the SDK rejected the entire listing. `_normalise_listing_entry` always
+  supplies all five keys, so this never fired against BigPanDA — it would have
+  fired the first time anything else fed the function. Now coerced at the
+  boundary via `coerce_str`/`coerce_int`: a tool owns the shape it advertises.
+  Found by the end-to-end run against the real SDK, not by a unit test, which
+  is why the regression test validates the payload with real `jsonschema`.
+
+### Added
 - **`atlas.log.plan_fetch` — the first code-mode primitive**
   (`packages/askpanda_atlas/askpanda_atlas/log_primitives_impl.py`,
   `log_primitives.py`). `panda_log_analysis` is a compound tool: one call runs

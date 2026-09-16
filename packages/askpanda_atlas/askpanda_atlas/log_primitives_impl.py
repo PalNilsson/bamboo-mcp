@@ -11,6 +11,53 @@ The primitives are advertised only under the ``primitive`` tool profile (see
 :mod:`bamboo.tools._tool_profiles`), so they never enter Bamboo's own planner
 catalog and cannot dilute its tool-selection accuracy.
 
+The primitive set
+-----------------
+Five tools decompose ``fetch_and_analyse`` up to evidence bundling::
+
+    meta = atlas.log.fetch_metadata(job_id)
+    plan = atlas.log.plan_fetch(job_id)
+    while True:
+        for entry in plan["next"]:
+            got = atlas.log.fetch_text(job_id, entry["filename"], entry["role"])
+            fetched.append(got)
+            observed["fetched"].append(entry["filename"])
+            observed.update(got["signals"])
+        if plan["done"]:
+            break
+        plan = atlas.log.plan_fetch(job_id, observed)
+    verdict = atlas.log.classify(meta, fetched)
+
+:func:`list_files` is not on that path; it answers "what is in this job's
+tarball" for callers that want the listing itself rather than the plan derived
+from it.
+
+Every decision on that path is taken server-side.  ``plan_fetch`` chooses the
+files, ``fetch_text`` chooses the character budget from the ``role``
+``plan_fetch`` assigned and computes the ``setup_has_error`` signal, and
+``classify`` joins the excerpts and picks which exception to trust.  The agent
+carries opaque dicts between calls; it never evaluates a domain predicate.
+
+``fetch_text`` returns an excerpt computed over the **full** downloaded text
+rather than the raw text capped.  Traceback anchoring searches the whole file
+in the monolith, so excerpting at the tool boundary is what keeps the two
+paths comparable — and it means no uncapped log is ever serialised across the
+wire.  The budget comes from :data:`ENV_MAX_CHARS`, read independently of the
+monolith's ``_MAX_EXCERPT_CHARS`` so that raising it for a large-context
+code-mode agent cannot change the orchestrated path.
+
+Known divergence from the monolith
+----------------------------------
+When ``setup.stdout`` is fetched, reports *no* setup error, and the payload
+logs then yield nothing, ``_fetch_logs_payload`` produces an empty excerpt: it
+only ever assigns ``setup_log_excerpt`` inside its has-error branch, so the
+``elif setup_fetched`` fallback resolves ``None or ""``.  :func:`classify`
+falls back to the setup context in that case and returns its excerpt.  The
+divergence is deliberate and one-directional — the primitive path returns
+content where the monolith returns none — and is recorded here rather than
+fixed, because fixing it means changing the monolith and the Track B
+regression gate requires ``test_log_analysis.py`` to pass unmodified.
+
 Why planning is a tool rather than a static rule
 ------------------------------------------------
 ``_fetch_logs_payload`` is not a static plan.  For pilot error code 1305 it
@@ -67,18 +114,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any, cast
 
 from askpanda_atlas._fallback_http import get_base_url
-from askpanda_atlas._traceback_parse import coerce_bool
+from askpanda_atlas._traceback_parse import (
+    coerce_bool,
+    coerce_int,
+    coerce_str,
+    parse_pilot_version,
+    parse_pilot_version_from_pilotid,
+    truncate_traceback,
+)
 from askpanda_atlas.log_analysis_impl import (
+    _STDERR_RESERVED_CHARS,
+    _TRACEBACK_RESERVED_CHARS,
+    FailureContext,
     _fetch_file_listing,
+    _fetch_log_text,
     _fetch_metadata,
     _file_is_nonempty,
     _log_file_url,
     _select_log_filename,
+    _setup_log_has_error,
     _top_level_file_index,
+    classify_failure,
+    extract_failure_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +200,233 @@ _NOTE_SETUP_CLEAN: str = (
     "setup.stdout reported no setup error, so the payload logs are the "
     "primary evidence."
 )
+
+#: Environment variable capping the characters any primitive returns.
+#: Deliberately separate from ``log_analysis_impl._MAX_EXCERPT_CHARS``: a
+#: code-mode agent may have a much larger context than Bamboo's own synthesis
+#: step, and raising the budget for one must not move the other.
+ENV_MAX_CHARS: str = "BAMBOO_PRIMITIVE_MAX_CHARS"
+
+#: Default for :data:`ENV_MAX_CHARS`.  Numerically equal to
+#: ``_MAX_EXCERPT_CHARS`` so that, unconfigured, the primitive path and the
+#: monolith excerpt identically.
+DEFAULT_MAX_CHARS: int = 8000
+
+#: Most listing entries :func:`list_files` will return.  A job log tarball is
+#: routinely thousands of files; returning all of them would swamp the agent's
+#: context for no diagnostic gain.
+MAX_LISTING_ENTRIES: int = 500
+
+#: Separator ``_fetch_logs_payload`` puts between the two payload excerpts.
+#: Transcribed rather than imported because it is written inline there; the
+#: agreement is pinned by a test.
+STDERR_SEPARATOR: str = "\n\n--- payload.stderr ---\n"
+
+#: Job metadata fields the primitives project out of the BigPanDA ``job`` dict.
+#: This is the set ``fetch_and_analyse`` promotes into evidence, plus two that
+#: it consumes without promoting: ``commandtopilot``, which
+#: :func:`~askpanda_atlas.log_analysis_impl.classify_failure` searches for the
+#: JEDI-reassignment signal, and ``pilotid``, which carries the pilot version
+#: when no pilot log was downloaded.  Omitting either would make a
+#: classification taken over this subset disagree with one taken over the full
+#: job dict.
+_METADATA_FIELDS: tuple[str, ...] = (
+    "jobstatus",
+    "jobsubstatus",
+    "computingsite",
+    "cloud",
+    "atlasrelease",
+    "jeditaskid",
+    "attemptnr",
+    "maxattempt",
+    "transformation",
+    "exeerrorcode",
+    "exeerrordiag",
+    "taskbuffererrorcode",
+    "taskbuffererrordiag",
+    "ddmerrorcode",
+    "ddmerrordiag",
+    "starttime",
+    "endtime",
+    "duration",
+    "commandtopilot",
+)
+
+#: Keys of one normalised listing entry, as
+#: :func:`~askpanda_atlas.log_analysis_impl._normalise_listing_entry` builds it.
+_LISTING_FIELDS: tuple[str, ...] = (
+    "relative_path",
+    "name",
+    "dirname",
+    "size_bytes",
+    "modification",
+)
+
+_ERROR_METADATA: str = "Failed to fetch job metadata from BigPanDA"
+
+
+# ---------------------------------------------------------------------------
+# Shared tool-boundary helpers
+# ---------------------------------------------------------------------------
+
+def _tool_result(payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    """Return the ``(content, structured)`` tuple every primitive must yield.
+
+    The MCP SDK answers a result carrying no structured content from a tool
+    that advertises an ``outputSchema`` with *"Output validation error:
+    outputSchema defined but no structured output returned"* — an opaque
+    protocol error in place of whatever precise message the tool meant to
+    send.  Routing every return path of every primitive through this one
+    function is what makes "did we forget the structured half?" a question
+    with a single answer rather than one per ``return`` statement.
+
+    ``bamboo.tools.base`` is imported here rather than at module scope so the
+    rest of this module stays importable when bamboo core is absent.
+
+    Args:
+        payload: The structured payload, conforming to the calling tool's
+            declared ``outputSchema``.
+
+    Returns:
+        Two-element tuple of the JSON-serialised payload as MCP content and
+        the payload itself.
+    """
+    from bamboo.tools.base import text_content  # deferred — see docstring
+
+    return text_content(json.dumps(payload)), payload
+
+
+def _coerce_job_id(arguments: dict[str, Any]) -> tuple[int | None, str]:
+    """Read and validate the ``job_id`` argument.
+
+    Args:
+        arguments: The tool's argument dict.
+
+    Returns:
+        Tuple of the parsed job ID and an error message.  Exactly one is
+        meaningful: on success the message is empty, on failure the ID is
+        ``None``.
+    """
+    raw: Any = arguments.get("job_id")
+    if raw is None:
+        return None, "missing job_id"
+    try:
+        return int(raw), ""
+    except (ValueError, TypeError):
+        return None, "job_id must be an integer"
+
+
+def _coerce_timeout(arguments: dict[str, Any]) -> int:
+    """Read the optional ``timeout`` argument.
+
+    Args:
+        arguments: The tool's argument dict.
+
+    Returns:
+        The requested timeout in seconds, or 60 when absent, zero or
+        unparseable.  A bad timeout degrades rather than failing the call:
+        it is an optimisation, not part of the question being asked.
+    """
+    try:
+        return int(arguments.get("timeout") or 60)
+    except (ValueError, TypeError):
+        return 60
+
+
+def _max_chars() -> int:
+    """Return the character budget primitives cap their output at.
+
+    Read at call time rather than at import so the variable is testable
+    without reimporting the module, matching how
+    :func:`bamboo.tools._tool_profiles.active_profile` reads its own.
+
+    Returns:
+        The value of :data:`ENV_MAX_CHARS`, or :data:`DEFAULT_MAX_CHARS` when
+        it is unset, unparseable or not positive.  A misconfigured budget
+        falls back rather than raising, for the same reason an unrecognised
+        tool profile does: a configuration typo must not make every call fail.
+    """
+    raw: str = os.getenv(ENV_MAX_CHARS, "").strip()
+    if not raw:
+        return DEFAULT_MAX_CHARS
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "%s=%r is not an integer; using %d", ENV_MAX_CHARS, raw, DEFAULT_MAX_CHARS
+        )
+        return DEFAULT_MAX_CHARS
+    if value <= 0:
+        logger.warning(
+            "%s=%d is not positive; using %d", ENV_MAX_CHARS, value, DEFAULT_MAX_CHARS
+        )
+        return DEFAULT_MAX_CHARS
+    return value
+
+
+def _role_budget(role: str, pilot_error_code: int, budget: int) -> int:
+    """Return the character budget for one file, given the role it plays.
+
+    Transcribes the allocation in
+    :func:`~askpanda_atlas.log_analysis_impl._fetch_logs_payload`: on the
+    payload path ``payload.stdout`` is excerpted against
+    ``_MAX_EXCERPT_CHARS - _STDERR_RESERVED_CHARS`` so that appending
+    ``payload.stderr`` afterwards cannot push the combined text over budget,
+    and ``payload.stderr`` itself gets the reservation.  The reduction is
+    unconditional there — taken before it is known whether ``payload.stderr``
+    has any content — so it is unconditional here too.
+
+    ``setup.stdout`` and the pilot log are excerpted against the whole budget,
+    since neither is ever joined to a second file.
+
+    Args:
+        role: One of the ``ROLE_*`` constants.
+        pilot_error_code: The job's pilot error code, which decides whether
+            the primary file is a payload log sharing budget with stderr.
+        budget: Total budget from :func:`_max_chars`.
+
+    Returns:
+        The budget for this file, always at least one character.  A budget at
+        or below the stderr reservation is not reduced further: halving an
+        already-tiny budget would leave nothing of the traceback, and an
+        operator who set the budget that low did not mean to disable
+        excerpting.
+    """
+    if role == ROLE_SECONDARY:
+        return min(_STDERR_RESERVED_CHARS, budget)
+    if role == ROLE_PRIMARY and pilot_error_code == _PAYLOAD_FAILURE_CODE:
+        if budget > _STDERR_RESERVED_CHARS:
+            return budget - _STDERR_RESERVED_CHARS
+    return budget
+
+
+def _capped_context_state(context: FailureContext, budget: int) -> dict[str, Any]:
+    """Serialise a failure context, capping the verbatim traceback.
+
+    ``ExceptionInfo.to_state`` carries ``raw`` — the traceback exactly as
+    printed — uncapped, deliberately: excluding it would make the round trip
+    lossy for the field most likely to be wanted downstream, and the codec
+    does not know the budget.  The tool boundary does, so the cap is applied
+    here.  :func:`~askpanda_atlas._traceback_parse.truncate_traceback` is used
+    rather than a slice because it elides the middle frames and keeps the
+    terminal exception line, which is the part a slice would discard.
+
+    Args:
+        context: The context to serialise.
+        budget: Character budget for this file.
+
+    Returns:
+        State dict accepted by :meth:`FailureContext.from_state`.
+    """
+    state: dict[str, Any] = context.to_state()
+    exception: Any = state.get("exception")
+    if isinstance(exception, dict):
+        raw: str = cast("dict[str, Any]", exception).get("raw") or ""
+        if raw:
+            cast("dict[str, Any]", exception)["raw"] = truncate_traceback(
+                raw, min(_TRACEBACK_RESERVED_CHARS, budget)
+            )
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -643,9 +932,7 @@ class AtlasLogPlanFetchTool:
     async def call(self, arguments: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
         """Plan the next log fetch for a job.
 
-        ``bamboo.tools.base`` is imported here (deferred) so the rest of this
-        module stays importable when bamboo core is not installed.  The
-        blocking HTTP calls are offloaded via ``asyncio.to_thread``.
+        The blocking HTTP calls are offloaded via ``asyncio.to_thread``.
 
         Args:
             arguments: Dict with required ``job_id`` (int) and optional
@@ -657,28 +944,14 @@ class AtlasLogPlanFetchTool:
             is the same payload as a dict, validated by the SDK against the
             declared ``outputSchema``.
         """
-        from bamboo.tools.base import text_content  # deferred — see class docstring
-
-        def _result(payload: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
-            return text_content(json.dumps(payload)), payload
-
         if not isinstance(arguments, dict):
-            return _result({"error": "arguments must be a dict"})
+            return _tool_result({"error": "arguments must be a dict"})
 
-        raw_job_id: Any = arguments.get("job_id")
-        if raw_job_id is None:
-            return _result({"error": "missing job_id"})
-        try:
-            job_id: int = int(raw_job_id)
-        except (ValueError, TypeError):
-            return _result({"error": "job_id must be an integer"})
+        job_id, error = _coerce_job_id(arguments)
+        if job_id is None:
+            return _tool_result({"error": error})
 
-        timeout: int = 60
-        try:
-            timeout = int(arguments.get("timeout") or 60)
-        except (ValueError, TypeError):
-            pass
-
+        timeout: int = _coerce_timeout(arguments)
         base_url: str = get_base_url()
 
         try:
@@ -687,15 +960,1137 @@ class AtlasLogPlanFetchTool:
             )
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.exception("Unexpected error planning log fetch for job %d", job_id)
-            return _result({"job_id": job_id, "error": repr(exc)})
+            return _tool_result({"job_id": job_id, "error": repr(exc)})
 
-        return _result(plan)
+        return _tool_result(plan)
 
 
 plan_fetch_tool = AtlasLogPlanFetchTool()
 
+
+# ---------------------------------------------------------------------------
+# atlas.log.fetch_metadata
+# ---------------------------------------------------------------------------
+
+def fetch_metadata(job_id: int, base_url: str, timeout: int) -> dict[str, Any]:
+    """Fetch the job-metadata subset the other primitives consume.
+
+    Facts only.  Which log file to read and whether this job has logs at all
+    are decisions, and decisions belong to :func:`plan_fetch`; a second place
+    to learn "which file" is a second place for that rule to drift.
+
+    A metadata fetch that fails and a job that does not exist both report via
+    ``error``, with distinguishable messages.  Neither is expressible as a
+    partial success — every field would be ``null`` — and the alternative of
+    a ``found`` flag would make a caller that forgot to check it proceed with
+    a job dict full of nulls.
+
+    Intentionally synchronous, for ``asyncio.to_thread``.
+
+    Args:
+        job_id: PanDA job ID.
+        base_url: BigPanDA base URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        The metadata subset, or ``{"job_id": ..., "error": ...}``.
+    """
+    payload: dict[str, Any] | None = _fetch_metadata(job_id, base_url, timeout)
+    if payload is None:
+        return {"job_id": job_id, "error": _ERROR_METADATA}
+
+    job: dict[str, Any] = payload.get("job") or {}
+    if not job:
+        return {"job_id": job_id, "error": f"Job {job_id} was not found in BigPanDA."}
+
+    pilotid: str = str(job.get("pilotid") or "")
+    result: dict[str, Any] = {
+        "job_id": job_id,
+        "monitor_url": f"{base_url}/job?pandaid={job_id}",
+        # Coerced exactly as ``fetch_and_analyse`` coerces them, so a strategy
+        # or a classification taken over this subset matches one taken over
+        # the full job dict.
+        "piloterrorcode": _pilot_error_code(job),
+        "piloterrordiag": str(job.get("piloterrordiag") or ""),
+        "pilotid": pilotid,
+        "pilot_version_from_pilotid": parse_pilot_version_from_pilotid(pilotid),
+    }
+    # Pass-through, uncoerced: these are BigPanDA's values and inventing a
+    # type for them here would be a second opinion that could disagree with
+    # the monolith's evidence.  Absent fields are present as ``null`` rather
+    # than omitted, so a consumer can rely on the shape instead of probing
+    # with ``in`` — the same contract ``_build_exception_evidence`` keeps.
+    for field_name in _METADATA_FIELDS:
+        result[field_name] = job.get(field_name)
+    return result
+
+
+_METADATA_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "job_id": {"type": "integer", "description": "The job described."},
+        "monitor_url": {
+            "type": "string",
+            "description": "BigPanDA monitor page for the job.",
+        },
+        "piloterrorcode": {
+            "type": "integer",
+            "description": "Pilot error code; 0 when absent or unparseable.",
+        },
+        "piloterrordiag": {
+            "type": "string",
+            "description": "Pilot error diagnosis text; empty when absent.",
+        },
+        "pilotid": {
+            "type": "string",
+            "description": "Raw pilotid field; empty when absent.",
+        },
+        "pilot_version_from_pilotid": {
+            "type": "string",
+            "description": (
+                "Pilot version parsed from pilotid.  Use the version "
+                "fetch_text reports from the pilot log in preference to this "
+                "one; this is the fallback when no pilot log was read."
+            ),
+        },
+        # Deliberately untyped: BigPanDA decides these types, and declaring
+        # one here would reject a job whose field came back as a string where
+        # another job's came back as an integer.
+        **{
+            field_name: {
+                "description": f"BigPanDA job field {field_name!r}, verbatim.",
+            }
+            for field_name in _METADATA_FIELDS
+        },
+        "error": {
+            "type": "string",
+            "description": "Present instead of metadata when the fetch failed.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def get_metadata_definition() -> dict[str, Any]:
+    """Return the MCP tool definition for ``atlas.log.fetch_metadata``.
+
+    Returns:
+        Definition dict carrying ``outputSchema`` and restricting itself to
+        the ``primitive`` profile.
+    """
+    return {
+        "name": "atlas.log.fetch_metadata",
+        "description": (
+            "Fetch a PanDA job's metadata: status, site, error codes and "
+            "diagnoses, timing, and the pilot version implied by its pilot "
+            "ID. Returns facts, not decisions — call atlas.log.plan_fetch to "
+            "learn which log files to read. Pass the result to "
+            "atlas.log.classify as 'job'. This is a primitive for code-mode "
+            "composition; for a single-call diagnosis of a failed job use "
+            "panda_log_analysis instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "integer",
+                    "description": "PanDA job ID (pandaid).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "HTTP timeout in seconds.  Default: 60.",
+                },
+            },
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+        "outputSchema": _METADATA_OUTPUT_SCHEMA,
+        "profiles": ["primitive"],
+        "tags": ["atlas", "panda", "log", "primitive", "code-mode"],
+    }
+
+
+class AtlasLogFetchMetadataTool:
+    """MCP tool wrapping :func:`fetch_metadata`.
+
+    Like every primitive here, each ``call()`` return path goes through
+    :func:`_tool_result`; see that function for why.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with the tool definition."""
+        self._def: dict[str, Any] = get_metadata_definition()
+
+    def get_definition(self) -> dict[str, Any]:
+        """Return the MCP tool definition.
+
+        Returns:
+            Tool definition dictionary.
+        """
+        return self._def
+
+    async def call(self, arguments: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+        """Fetch one job's metadata subset.
+
+        Args:
+            arguments: Dict with required ``job_id`` (int) and optional
+                ``timeout`` (int).
+
+        Returns:
+            A ``(content, structured)`` tuple.
+        """
+        if not isinstance(arguments, dict):
+            return _tool_result({"error": "arguments must be a dict"})
+
+        job_id, error = _coerce_job_id(arguments)
+        if job_id is None:
+            return _tool_result({"error": error})
+
+        try:
+            payload: dict[str, Any] = await asyncio.to_thread(
+                fetch_metadata, job_id, get_base_url(), _coerce_timeout(arguments)
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception("Unexpected error fetching metadata for job %d", job_id)
+            return _tool_result({"job_id": job_id, "error": repr(exc)})
+
+        return _tool_result(payload)
+
+
+fetch_metadata_tool = AtlasLogFetchMetadataTool()
+
+
+# ---------------------------------------------------------------------------
+# atlas.log.list_files
+# ---------------------------------------------------------------------------
+
+def _ordered_listing(listing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order a listing so job-root entries come first.
+
+    The diagnostic files are all at the job-directory root, while the bulk of
+    a tarball is nested under ``workDir``.  A job with several thousand nested
+    files would otherwise push ``setup.stdout`` past
+    :data:`MAX_LISTING_ENTRIES` and out of the result.  The partition is
+    applied unconditionally rather than only when truncating, so the order
+    does not change shape at the cap.
+
+    Args:
+        listing: Normalised entries from ``_fetch_file_listing``.
+
+    Returns:
+        The same entries, root-level ones first, each group in listing order.
+    """
+    root: list[dict[str, Any]] = []
+    nested: list[dict[str, Any]] = []
+    for record in listing:
+        path = str(record.get("relative_path") or "")
+        (nested if "/" in path else root).append(record)
+    return root + nested
+
+
+def _listing_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one listing entry onto the shape the ``outputSchema`` declares.
+
+    Coerced rather than passed through.  ``_normalise_listing_entry`` always
+    supplies all five keys, but the schema declares ``dirname`` and
+    ``modification`` as strings with ``additionalProperties: false``, so a
+    sparse entry reaching here would emit ``null`` against a string type and
+    the SDK would reject the whole result — replacing a usable listing with
+    *"Output validation error"*.  A tool owns the shape it advertises; the
+    boundary is where that is guaranteed, not where it is assumed.
+
+    Args:
+        record: One normalised entry from ``_fetch_file_listing``.
+
+    Returns:
+        Dict with the five declared keys, each of the declared type.
+    """
+    return {
+        "relative_path": coerce_str(record.get("relative_path")),
+        "name": coerce_str(record.get("name")),
+        "dirname": coerce_str(record.get("dirname")),
+        "size_bytes": coerce_int(record.get("size_bytes")),
+        "modification": coerce_str(record.get("modification")),
+    }
+
+
+def list_files(job_id: int, base_url: str, timeout: int) -> dict[str, Any]:
+    """List the files in a job's log tarball, with sizes.
+
+    An unavailable listing is reported as ``listing_available: false`` with an
+    empty ``files``, not as an ``error``.  ``_fetch_file_listing`` returning
+    ``None`` means "unknown", and every consumer in the monolith treats that
+    as fail-open — it attempts the download anyway.  A primitive that called
+    the same condition fatal would disagree with :func:`plan_fetch` about the
+    same job in the same session.
+
+    Intentionally synchronous, for ``asyncio.to_thread``.
+
+    Args:
+        job_id: PanDA job ID.
+        base_url: BigPanDA base URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        Dict with ``files``, ``total``, ``truncated``, ``listing_available``
+        and ``notes``.
+    """
+    listing: list[dict[str, Any]] | None = _fetch_file_listing(
+        job_id, base_url, timeout
+    )
+    if listing is None:
+        return {
+            "job_id": job_id,
+            "listing_available": False,
+            "files": [],
+            "total": 0,
+            "truncated": False,
+            "notes": [
+                "The file listing could not be fetched, so it is unknown which "
+                "files exist.  Treat this as unknown rather than as an empty "
+                "job: fetching a log may still succeed.",
+            ],
+        }
+
+    notes: list[str] = []
+    ordered: list[dict[str, Any]] = _ordered_listing(listing)
+    total: int = len(ordered)
+    if total > MAX_LISTING_ENTRIES:
+        notes.append(
+            f"{total} files listed; showing the first {MAX_LISTING_ENTRIES} "
+            f"with job-root files first."
+        )
+        ordered = ordered[:MAX_LISTING_ENTRIES]
+
+    files: list[dict[str, Any]] = [_listing_record(record) for record in ordered]
+    return {
+        "job_id": job_id,
+        "listing_available": True,
+        "files": files,
+        "total": total,
+        "truncated": total > MAX_LISTING_ENTRIES,
+        "notes": notes,
+    }
+
+
+_LIST_FILES_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "job_id": {"type": "integer", "description": "The job listed."},
+        "listing_available": {
+            "type": "boolean",
+            "description": (
+                "False when the listing could not be fetched.  That means "
+                "'unknown', not 'no files': a log fetch may still succeed."
+            ),
+        },
+        "files": {
+            "type": "array",
+            "description": "Listing entries, job-root files first.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "relative_path": {
+                        "type": "string",
+                        "description": "Path relative to the job directory.",
+                    },
+                    "name": {"type": "string", "description": "Basename."},
+                    "dirname": {
+                        "type": "string",
+                        "description": "Directory, empty for job-root files.",
+                    },
+                    "size_bytes": {
+                        "type": "integer",
+                        "description": "Size in bytes; 0 means the file is empty.",
+                    },
+                    "modification": {
+                        "type": "string",
+                        "description": "Modification timestamp as reported.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        "total": {
+            "type": "integer",
+            "description": "Entries in the full listing, before truncation.",
+        },
+        "truncated": {
+            "type": "boolean",
+            "description": "True when 'files' holds fewer entries than 'total'.",
+        },
+        "notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Remarks, typically recording truncation.",
+        },
+        "error": {
+            "type": "string",
+            "description": "Present instead of a listing when the call failed.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def get_list_files_definition() -> dict[str, Any]:
+    """Return the MCP tool definition for ``atlas.log.list_files``.
+
+    Returns:
+        Definition dict carrying ``outputSchema`` and restricting itself to
+        the ``primitive`` profile.
+    """
+    return {
+        "name": "atlas.log.list_files",
+        "description": (
+            "List the files in a PanDA job's log tarball with their sizes, "
+            "job-root files first. Use this to see what a job produced — a "
+            "zero size means the file is empty and not worth fetching. You "
+            "do not need this to diagnose a failure: atlas.log.plan_fetch "
+            "already consults the listing and names the files worth reading. "
+            "'listing_available': false means the listing could not be "
+            "fetched, which is not the same as the job having no files."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "integer",
+                    "description": "PanDA job ID (pandaid).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "HTTP timeout in seconds.  Default: 60.",
+                },
+            },
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+        "outputSchema": _LIST_FILES_OUTPUT_SCHEMA,
+        "profiles": ["primitive"],
+        "tags": ["atlas", "panda", "log", "primitive", "code-mode"],
+    }
+
+
+class AtlasLogListFilesTool:
+    """MCP tool wrapping :func:`list_files`.
+
+    Like every primitive here, each ``call()`` return path goes through
+    :func:`_tool_result`; see that function for why.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with the tool definition."""
+        self._def: dict[str, Any] = get_list_files_definition()
+
+    def get_definition(self) -> dict[str, Any]:
+        """Return the MCP tool definition.
+
+        Returns:
+            Tool definition dictionary.
+        """
+        return self._def
+
+    async def call(self, arguments: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+        """List one job's files.
+
+        Args:
+            arguments: Dict with required ``job_id`` (int) and optional
+                ``timeout`` (int).
+
+        Returns:
+            A ``(content, structured)`` tuple.
+        """
+        if not isinstance(arguments, dict):
+            return _tool_result({"error": "arguments must be a dict"})
+
+        job_id, error = _coerce_job_id(arguments)
+        if job_id is None:
+            return _tool_result({"error": error})
+
+        try:
+            payload: dict[str, Any] = await asyncio.to_thread(
+                list_files, job_id, get_base_url(), _coerce_timeout(arguments)
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception("Unexpected error listing files for job %d", job_id)
+            return _tool_result({"job_id": job_id, "error": repr(exc)})
+
+        return _tool_result(payload)
+
+
+list_files_tool = AtlasLogListFilesTool()
+
+
+# ---------------------------------------------------------------------------
+# atlas.log.fetch_text
+# ---------------------------------------------------------------------------
+
+#: Roles :func:`fetch_text` recognises, as :func:`plan_fetch` assigns them.
+_ROLES: frozenset[str] = frozenset({ROLE_SETUP, ROLE_PRIMARY, ROLE_SECONDARY})
+
+#: Shared shape of a ``FailureContext`` state dict, as both :func:`fetch_text`
+#: and :func:`classify` emit it.  ``exception`` is declared loosely on purpose:
+#: pinning the frame shape here would duplicate ``Frame.to_state`` into a
+#: schema, where it could disagree with the codec after a change to either.
+_CONTEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Excerpt and parsed exception, as produced by the same extractor "
+        "panda_log_analysis uses.  Pass these through to atlas.log.classify "
+        "unchanged."
+    ),
+    "properties": {
+        "excerpt": {
+            "type": "string",
+            "description": "The diagnostic section of the log, within budget.",
+        },
+        "exception": {
+            "type": ["object", "null"],
+            "description": (
+                "Parsed Python exception, or null when the log had no "
+                "traceback.  Carries 'exc_type', 'message', 'frames', "
+                "'level' and a truncated 'raw'."
+            ),
+            "additionalProperties": True,
+        },
+        "traceback_count": {
+            "type": "integer",
+            "description": "Distinct tracebacks found; above 1 means others were discarded.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def _file_context(
+    text: str,
+    filename: str,
+    pilot_error_code: int,
+    pilot_error_diag: str,
+    budget: int,
+    setup_has_error: bool,
+) -> FailureContext:
+    """Excerpt one downloaded file, applying the monolith's setup-log rule.
+
+    Extraction runs over the **full** text, not over a pre-capped slice: the
+    traceback scan in
+    :func:`~askpanda_atlas.log_analysis_impl.extract_failure_context` searches
+    the whole file, and anchoring it on a slice would find a different
+    traceback — or none — than ``fetch_and_analyse`` finds for the same job.
+
+    The one deviation from plain extraction is the rule
+    ``_fetch_logs_payload`` applies to an erroring ``setup.stdout``: setup
+    failures are shell output rather than tracebacks, so when no traceback is
+    present the whole capped file is kept instead of an anchored window, which
+    would crop the asetup/release diagnostics.  That rule keys on the
+    *filename*, as it does in the monolith, not on the caller-supplied role.
+
+    Args:
+        text: Full downloaded file content.
+        filename: Name of the file, relative to the job directory.
+        pilot_error_code: The job's pilot error code.
+        pilot_error_diag: The job's pilot error diagnosis text.
+        budget: Character budget for this file, from :func:`_role_budget`.
+        setup_has_error: Whether this file is an erroring ``setup.stdout``.
+
+    Returns:
+        The populated :class:`FailureContext`.
+    """
+    context: FailureContext = extract_failure_context(
+        text, filename, pilot_error_code, pilot_error_diag, budget
+    )
+    if filename == SETUP_LOG and setup_has_error and context.exception is None:
+        return FailureContext(
+            excerpt=text[:budget],
+            exception=None,
+            traceback_count=context.traceback_count,
+        )
+    return context
+
+
+def fetch_text(
+    job_id: int,
+    filename: str,
+    role: str,
+    base_url: str,
+    timeout: int,
+) -> dict[str, Any]:
+    """Download one of a job's log files and return its diagnostic excerpt.
+
+    Returns an excerpt rather than the raw file.  A pilot log is routinely
+    tens of megabytes, and the useful part of it is chosen by a rule
+    (traceback-first, then a pilot-code anchor, then the tail) that the agent
+    must not have to reimplement.
+
+    The character budget is derived server-side from *role* — the value
+    :func:`plan_fetch` assigned to this file — so the agent never picks one.
+    Metadata is refetched here to learn the pilot error code the excerpt rule
+    and the budget depend on; it comes from the same 60-second TTL cache
+    :func:`plan_fetch` populated, so in a composed loop it costs no request.
+
+    ``signals`` carries :data:`SETUP_SIGNAL` only when the file *is*
+    ``setup.stdout``.  Emitting it for any other file would be actively
+    harmful: :func:`_observed_setup_seen` counts the key's presence as "setup
+    has been read", so a ``setup_has_error: false`` picked up from
+    ``payload.stdout`` and merged into ``observed`` would make the next
+    :func:`plan_fetch` skip the setup log entirely.
+
+    Intentionally synchronous, for ``asyncio.to_thread``.
+
+    Args:
+        job_id: PanDA job ID.
+        filename: Log filename relative to the job directory.
+        role: One of the ``ROLE_*`` constants.  An unrecognised role degrades
+            to :data:`ROLE_PRIMARY` with a note rather than failing the call,
+            matching the fail-open rule the tool-profile switch uses: a typo
+            should cost accuracy, not the answer.
+        base_url: BigPanDA base URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        Dict with ``context``, ``signals``, ``bytes``, ``truncated``,
+        ``available`` and ``pilot_version``, or
+        ``{"job_id": ..., "filename": ..., "error": ...}``.
+    """
+    notes: list[str] = []
+    if role not in _ROLES:
+        notes.append(f"Unrecognised role {role!r}; treated as {ROLE_PRIMARY!r}.")
+        role = ROLE_PRIMARY
+
+    payload: dict[str, Any] | None = _fetch_metadata(job_id, base_url, timeout)
+    if payload is None:
+        return {"job_id": job_id, "filename": filename, "error": _ERROR_METADATA}
+
+    job: dict[str, Any] = payload.get("job") or {}
+    if not job:
+        return {
+            "job_id": job_id,
+            "filename": filename,
+            "error": f"Job {job_id} was not found in BigPanDA.",
+        }
+
+    pilot_error_code: int = _pilot_error_code(job)
+    budget: int = _role_budget(role, pilot_error_code, _max_chars())
+    url: str = _log_file_url(job_id, filename, base_url)
+
+    text: str | None = _fetch_log_text(job_id, filename, base_url, timeout)
+    setup_has_error: bool = _setup_log_has_error(text or "")
+    signals: dict[str, Any] = (
+        {SETUP_SIGNAL: setup_has_error} if filename == SETUP_LOG else {}
+    )
+
+    result: dict[str, Any] = {
+        "job_id": job_id,
+        "filename": filename,
+        "role": role,
+        "url": url,
+        "signals": signals,
+    }
+
+    if not text:
+        notes.append(
+            f"{filename} is empty." if text == ""
+            else f"{filename} could not be downloaded; it may not exist."
+        )
+        result.update({
+            "available": False,
+            "bytes": 0,
+            "truncated": False,
+            "context": FailureContext().to_state(),
+            "pilot_version": "",
+            "notes": notes,
+        })
+        return result
+
+    context: FailureContext = _file_context(
+        text,
+        filename,
+        pilot_error_code,
+        str(job.get("piloterrordiag") or ""),
+        budget,
+        setup_has_error,
+    )
+    result.update({
+        "available": True,
+        # The file's true size, comparable with list_files' ``size_bytes``;
+        # ``len(text)`` would count characters and disagree for any log
+        # carrying non-ASCII output.
+        "bytes": len(text.encode("utf-8")),
+        "truncated": len(context.excerpt) < len(text),
+        "context": _capped_context_state(context, budget),
+        # Parsed from the full text: the pilot reports its version at
+        # start-up, so an excerpt taken at the failure point will not have it.
+        "pilot_version": parse_pilot_version(text),
+        "notes": notes,
+    })
+    return result
+
+
+_FETCH_TEXT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "job_id": {"type": "integer", "description": "The job the file belongs to."},
+        "filename": {"type": "string", "description": "The file that was read."},
+        "role": {
+            "type": "string",
+            "description": "The role the file was read under, after validation.",
+        },
+        "url": {"type": "string", "description": "Filebrowser URL of the file."},
+        "available": {
+            "type": "boolean",
+            "description": "False when the file was empty or could not be downloaded.",
+        },
+        "bytes": {
+            "type": "integer",
+            "description": "Size of the whole file in bytes, not of the excerpt.",
+        },
+        "truncated": {
+            "type": "boolean",
+            "description": "True when the excerpt is shorter than the whole file.",
+        },
+        "context": _CONTEXT_SCHEMA,
+        "signals": {
+            "type": "object",
+            "description": (
+                "Domain predicates computed server-side.  Merge into the "
+                "'observed' argument of atlas.log.plan_fetch; do not derive "
+                "them yourself."
+            ),
+            "properties": {
+                SETUP_SIGNAL: {
+                    "type": "boolean",
+                    "description": (
+                        "Whether setup.stdout reported a fatal setup error.  "
+                        "Present only when the file read was setup.stdout."
+                    ),
+                },
+            },
+            "additionalProperties": True,
+        },
+        "pilot_version": {
+            "type": "string",
+            "description": "Pilot version parsed from this file; empty when absent.",
+        },
+        "notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Remarks, typically recording an unreadable file.",
+        },
+        "error": {
+            "type": "string",
+            "description": "Present instead of content when the call failed.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def get_fetch_text_definition() -> dict[str, Any]:
+    """Return the MCP tool definition for ``atlas.log.fetch_text``.
+
+    Returns:
+        Definition dict carrying ``outputSchema`` and restricting itself to
+        the ``primitive`` profile.
+    """
+    return {
+        "name": "atlas.log.fetch_text",
+        "description": (
+            "Download one of a PanDA job's log files and return its "
+            "diagnostic excerpt, not the raw file — a pilot log is routinely "
+            "tens of megabytes and the useful part is selected server-side. "
+            "Pass the 'filename' and 'role' exactly as atlas.log.plan_fetch "
+            "gave them: the role sets the character budget. Merge the "
+            "returned 'signals' into 'observed' on your next plan_fetch call, "
+            "and collect the whole result for atlas.log.classify."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "integer",
+                    "description": "PanDA job ID (pandaid).",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Log filename relative to the job directory, as named "
+                        "in a plan_fetch 'next' entry (e.g. setup.stdout)."
+                    ),
+                },
+                "role": {
+                    "type": "string",
+                    "enum": [ROLE_SETUP, ROLE_PRIMARY, ROLE_SECONDARY],
+                    "description": (
+                        "The role plan_fetch assigned this file.  Default: "
+                        "primary."
+                    ),
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "HTTP timeout in seconds.  Default: 60.",
+                },
+            },
+            "required": ["job_id", "filename"],
+            "additionalProperties": False,
+        },
+        "outputSchema": _FETCH_TEXT_OUTPUT_SCHEMA,
+        "profiles": ["primitive"],
+        "tags": ["atlas", "panda", "log", "primitive", "code-mode"],
+    }
+
+
+class AtlasLogFetchTextTool:
+    """MCP tool wrapping :func:`fetch_text`.
+
+    Like every primitive here, each ``call()`` return path goes through
+    :func:`_tool_result`; see that function for why.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with the tool definition."""
+        self._def: dict[str, Any] = get_fetch_text_definition()
+
+    def get_definition(self) -> dict[str, Any]:
+        """Return the MCP tool definition.
+
+        Returns:
+            Tool definition dictionary.
+        """
+        return self._def
+
+    async def call(self, arguments: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+        """Download and excerpt one log file.
+
+        Args:
+            arguments: Dict with required ``job_id`` (int) and ``filename``
+                (str), and optional ``role`` (str) and ``timeout`` (int).
+
+        Returns:
+            A ``(content, structured)`` tuple.
+        """
+        if not isinstance(arguments, dict):
+            return _tool_result({"error": "arguments must be a dict"})
+
+        job_id, error = _coerce_job_id(arguments)
+        if job_id is None:
+            return _tool_result({"error": error})
+
+        raw_filename: Any = arguments.get("filename")
+        if not isinstance(raw_filename, str) or not raw_filename.strip():
+            return _tool_result({
+                "job_id": job_id,
+                "error": "filename must be a non-empty string",
+            })
+        filename: str = raw_filename.strip()
+
+        raw_role: Any = arguments.get("role")
+        role: str = raw_role if isinstance(raw_role, str) else ROLE_PRIMARY
+
+        try:
+            payload: dict[str, Any] = await asyncio.to_thread(
+                fetch_text,
+                job_id,
+                filename,
+                role,
+                get_base_url(),
+                _coerce_timeout(arguments),
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception(
+                "Unexpected error fetching %s for job %d", filename, job_id
+            )
+            return _tool_result({
+                "job_id": job_id, "filename": filename, "error": repr(exc),
+            })
+
+        return _tool_result(payload)
+
+
+fetch_text_tool = AtlasLogFetchTextTool()
+
+
+# ---------------------------------------------------------------------------
+# atlas.log.classify
+# ---------------------------------------------------------------------------
+
+def _has_content(context: FailureContext) -> bool:
+    """Report whether a context carries anything worth classifying.
+
+    Args:
+        context: A rebuilt failure context.
+
+    Returns:
+        ``True`` when it has an excerpt or a parsed exception.  A context with
+        neither came from a file that was empty or absent, which the monolith
+        treats as "no log" rather than as an empty log.
+    """
+    return bool(context.excerpt) or context.exception is not None
+
+
+def _fetched_entries(fetched: Any) -> list[tuple[str, FailureContext]]:
+    """Read the caller's ``fetch_text`` results into role/context pairs.
+
+    Read tolerantly, in the ``from_state`` style: ``fetched`` arrives as an
+    unvalidated tool argument, so a non-list, a non-mapping member or a
+    missing ``context`` degrades rather than raising.  One malformed entry
+    costs its own content, not the whole classification.
+
+    A missing or unrecognised ``role`` reads as :data:`ROLE_PRIMARY` rather
+    than being dropped, matching :func:`fetch_text`: content the caller
+    actually fetched should be classified even when it is mislabelled.
+
+    Args:
+        fetched: The ``fetched`` argument as supplied by the caller — a list
+            of ``fetch_text`` results, or of ``{"role", "context"}`` pairs.
+
+    Returns:
+        List of ``(role, context)`` pairs in the order supplied.
+    """
+    if not isinstance(fetched, (list, tuple)):
+        return []
+
+    entries: list[tuple[str, FailureContext]] = []
+    for item in cast("list[Any]", list(fetched)):
+        if not isinstance(item, Mapping):
+            continue
+        entry: Mapping[str, Any] = cast("Mapping[str, Any]", item)
+        raw_role: Any = entry.get("role")
+        role: str = raw_role if raw_role in _ROLES else ROLE_PRIMARY
+        entries.append((role, FailureContext.from_state(entry.get("context"))))
+    return entries
+
+
+def _combine_contexts(
+    entries: list[tuple[str, FailureContext]],
+) -> tuple[FailureContext, list[str]]:
+    """Join the fetched contexts the way ``_fetch_logs_payload`` joins them.
+
+    Two rules are transcribed.  The excerpts are concatenated with the
+    separator the monolith writes between ``payload.stdout`` and
+    ``payload.stderr``; and when both files carry a traceback the *stderr* one
+    is preferred, because Python tracebacks and segfault reports are written
+    to stderr, so that is the exception which actually terminated the payload.
+
+    Both are domain rules.  Leaving them to the agent would put a separator
+    string and a precedence rule into a tool description, where they would
+    drift from the implementation that has to agree with them.
+
+    A setup context is used only when no payload content was supplied.  That
+    covers the erroring ``setup.stdout`` case exactly — :func:`plan_fetch`
+    ends the loop there, so no payload entry exists — and, as the module
+    docstring records, returns content in one case where the monolith returns
+    an empty excerpt.
+
+    Args:
+        entries: Role/context pairs from :func:`_fetched_entries`.
+
+    Returns:
+        Tuple of the combined context and any remarks.
+    """
+    notes: list[str] = []
+    grouped: dict[str, list[FailureContext]] = {role: [] for role in sorted(_ROLES)}
+    for role, context in entries:
+        grouped[role].append(context)
+    for role in sorted(grouped):
+        if len(grouped[role]) > 1:
+            notes.append(
+                f"{len(grouped[role])} {role} files supplied; using the first."
+            )
+
+    primary: FailureContext | None = next(iter(grouped[ROLE_PRIMARY]), None)
+    secondary: FailureContext | None = next(iter(grouped[ROLE_SECONDARY]), None)
+    setup: FailureContext | None = next(iter(grouped[ROLE_SETUP]), None)
+
+    stderr_usable: bool = secondary is not None and _has_content(secondary)
+    if stderr_usable or (primary is not None and _has_content(primary)):
+        base: FailureContext = primary or FailureContext()
+        if secondary is not None and stderr_usable:
+            chosen: FailureContext = secondary if secondary.exception else base
+            return FailureContext(
+                excerpt=base.excerpt + STDERR_SEPARATOR + secondary.excerpt,
+                exception=chosen.exception,
+                traceback_count=chosen.traceback_count,
+            ), notes
+        return base, notes
+
+    if setup is not None and _has_content(setup):
+        notes.append(
+            "No payload log content was supplied; classified from setup.stdout."
+        )
+        return setup, notes
+
+    return FailureContext(), notes
+
+
+def classify(job: Any, fetched: Any) -> dict[str, Any]:
+    """Classify a job failure from its metadata and the logs already fetched.
+
+    Pure: no network, no job ID, nothing to cache.  Everything it needs has
+    already been fetched by :func:`fetch_metadata` and :func:`fetch_text`, so
+    making it a function of its arguments keeps it cheap to call, trivial to
+    test, and safe to call twice.
+
+    The excerpt it classifies is the one it builds from *fetched*, and it is
+    returned alongside the verdict — the classification and the text it was
+    taken from are the pair an agent needs to explain the answer.
+
+    Args:
+        job: The metadata subset from :func:`fetch_metadata`.  Read
+            tolerantly; a non-mapping yields a metadata-free classification
+            rather than an error.
+        fetched: List of :func:`fetch_text` results, in the order they were
+            fetched.  May be empty, which is the correct input for a job whose
+            status carries no logs: the monolith classifies such a job from
+            metadata alone, and so does this.
+
+    Returns:
+        Dict with ``failure_type``, the combined ``context`` and ``notes``.
+    """
+    job_dict: dict[str, Any] = (
+        dict(cast("Mapping[str, Any]", job)) if isinstance(job, Mapping) else {}
+    )
+    entries: list[tuple[str, FailureContext]] = _fetched_entries(fetched)
+    context, notes = _combine_contexts(entries)
+
+    if not entries:
+        notes.append(
+            "No log content was supplied; classified from job metadata alone."
+        )
+
+    return {
+        "failure_type": classify_failure(job_dict, context.excerpt, context.exception),
+        "context": _capped_context_state(context, _max_chars()),
+        "notes": notes,
+    }
+
+
+_CLASSIFY_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "failure_type": {
+            "type": "string",
+            "description": (
+                "Short failure category, e.g. 'stagein_timeout', "
+                "'payload_error', 'reassigned_by_jedi'.  'unknown' when "
+                "nothing matched."
+            ),
+        },
+        "context": _CONTEXT_SCHEMA,
+        "notes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Remarks about how the contexts were combined.",
+        },
+        "error": {
+            "type": "string",
+            "description": "Present instead of a verdict when the call failed.",
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def get_classify_definition() -> dict[str, Any]:
+    """Return the MCP tool definition for ``atlas.log.classify``.
+
+    Returns:
+        Definition dict carrying ``outputSchema`` and restricting itself to
+        the ``primitive`` profile.
+    """
+    return {
+        "name": "atlas.log.classify",
+        "description": (
+            "Classify a PanDA job failure from the metadata and the logs you "
+            "have already fetched. Pass the atlas.log.fetch_metadata result "
+            "as 'job' and the atlas.log.fetch_text results as 'fetched', in "
+            "the order you fetched them — this joins their excerpts and picks "
+            "which traceback to trust, so do not merge them yourself. Call it "
+            "with an empty 'fetched' for a job that has no logs; it will "
+            "classify from metadata alone."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job": {
+                    "type": "object",
+                    "description": (
+                        "The atlas.log.fetch_metadata result, unmodified."
+                    ),
+                    "additionalProperties": True,
+                },
+                "fetched": {
+                    "type": "array",
+                    "description": (
+                        "The atlas.log.fetch_text results, in fetch order.  "
+                        "Each needs at least its 'role' and 'context'."
+                    ),
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+            },
+            "required": ["job"],
+            "additionalProperties": False,
+        },
+        "outputSchema": _CLASSIFY_OUTPUT_SCHEMA,
+        "profiles": ["primitive"],
+        "tags": ["atlas", "panda", "log", "primitive", "code-mode"],
+    }
+
+
+class AtlasLogClassifyTool:
+    """MCP tool wrapping :func:`classify`.
+
+    The only primitive that does no I/O, so its ``call()`` runs inline rather
+    than through ``asyncio.to_thread``.  Like every primitive here, each
+    return path goes through :func:`_tool_result`; see that function for why.
+    """
+
+    def __init__(self) -> None:
+        """Initialise with the tool definition."""
+        self._def: dict[str, Any] = get_classify_definition()
+
+    def get_definition(self) -> dict[str, Any]:
+        """Return the MCP tool definition.
+
+        Returns:
+            Tool definition dictionary.
+        """
+        return self._def
+
+    async def call(self, arguments: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+        """Classify a failure from supplied metadata and log contexts.
+
+        Args:
+            arguments: Dict with required ``job`` (mapping) and optional
+                ``fetched`` (list).
+
+        Returns:
+            A ``(content, structured)`` tuple.
+        """
+        if not isinstance(arguments, dict):
+            return _tool_result({"error": "arguments must be a dict"})
+
+        if "job" not in arguments:
+            return _tool_result({"error": "missing job"})
+
+        try:
+            payload: dict[str, Any] = classify(
+                arguments.get("job"), arguments.get("fetched")
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.exception("Unexpected error classifying a failure")
+            return _tool_result({"error": repr(exc)})
+
+        return _tool_result(payload)
+
+
+classify_tool = AtlasLogClassifyTool()
+
+
 __all__ = [
-    "AtlasLogPlanFetchTool",
+    "DEFAULT_MAX_CHARS",
+    "ENV_MAX_CHARS",
+    "MAX_LISTING_ENTRIES",
     "PAYLOAD_STDERR",
     "PAYLOAD_STDOUT",
     "ROLE_PRIMARY",
@@ -703,10 +2098,28 @@ __all__ = [
     "ROLE_SETUP",
     "SETUP_LOG",
     "SETUP_SIGNAL",
+    "STDERR_SEPARATOR",
     "STRATEGY_METADATA_ONLY",
     "STRATEGY_PAYLOAD_1305",
     "STRATEGY_PILOTLOG",
+    "AtlasLogClassifyTool",
+    "AtlasLogFetchMetadataTool",
+    "AtlasLogFetchTextTool",
+    "AtlasLogListFilesTool",
+    "AtlasLogPlanFetchTool",
+    "classify",
+    "classify_tool",
+    "fetch_metadata",
+    "fetch_metadata_tool",
+    "fetch_text",
+    "fetch_text_tool",
+    "get_classify_definition",
     "get_definition",
+    "get_fetch_text_definition",
+    "get_list_files_definition",
+    "get_metadata_definition",
+    "list_files",
+    "list_files_tool",
     "plan_fetch",
     "plan_fetch_tool",
 ]

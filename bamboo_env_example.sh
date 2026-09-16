@@ -196,9 +196,21 @@ export ASKPANDA_PLUGIN="atlas"
 # value logs a warning and falls back to orchestrated.
 #
 # Tools currently opting in to "primitive":
-#   atlas.log.plan_fetch   Decides which of a failed job's logs to download
-#                          next. Re-entrant: fetch what "next" names, pass the
-#                          signals back as "observed", repeat until "done".
+#   atlas.log.plan_fetch      Decides which of a failed job's logs to download
+#                             next. Re-entrant: fetch what "next" names, pass
+#                             the signals back as "observed", until "done".
+#   atlas.log.fetch_metadata  Job metadata subset: status, site, error codes,
+#                             timing. Facts only, no decisions.
+#   atlas.log.list_files      The job's log tarball with sizes, root files
+#                             first.
+#   atlas.log.fetch_text      Downloads one log file and returns its
+#                             diagnostic excerpt, plus the setup_has_error
+#                             signal plan_fetch consumes.
+#   atlas.log.classify        Joins the fetched excerpts and returns the
+#                             failure category. Pure — no network.
+#
+# The five compose into the loop panda_log_analysis runs internally:
+#   fetch_metadata -> plan_fetch <-> fetch_text -> classify
 #
 # Primitives declare an outputSchema and return structured content, so they
 # require mcp >= 1.10.0 at runtime — below that floor the SDK ignores the
@@ -209,6 +221,24 @@ export ASKPANDA_PLUGIN="atlas"
 # Left commented out: the default is the correct setting for every interface
 # shipped in this repo.
 # export BAMBOO_TOOL_PROFILE="orchestrated"
+
+# Character budget for what a primitive returns: the excerpt atlas.log.fetch_text
+# extracts from a log file, and the verbatim traceback carried alongside it.
+#
+# Deliberately separate from the monolith's internal _MAX_EXCERPT_CHARS, which
+# it happens to equal by default (8000). A code-mode agent may have a far
+# larger context than Bamboo's own synthesis step; raising this budget for one
+# must not move the other, so panda_log_analysis is unaffected by any value set
+# here.
+#
+# On the payload path the budget is split as the monolith splits it:
+# payload.stdout is excerpted against (budget - 2000) and payload.stderr
+# against 2000, so the joined excerpt stays within budget. setup.stdout and
+# pilotlog.txt get the whole figure.
+#
+# An unset, unparseable or non-positive value logs a warning and falls back to
+# 8000, rather than failing every call over a configuration typo.
+# export BAMBOO_PRIMITIVE_MAX_CHARS="8000"
 
 ########################################
 # RAG / CHROMADB (doc_search / doc_bm25 tools)
