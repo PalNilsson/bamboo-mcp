@@ -1308,7 +1308,10 @@ def _fetch_logs_payload(
 
     If ``setup.stdout`` is absent, empty, or error-free the function falls
     through to the ``payload.stdout`` → ``payload.stderr`` path, skipping any
-    file that the file-size index confirms to be zero-length.
+    file that the file-size index confirms to be zero-length.  When that path
+    yields nothing either — both payload files zero-length or undownloadable
+    — an error-free ``setup.stdout`` that *was* read becomes the excerpt, so
+    the caller still gets the job's environment context rather than nothing.
 
     Args:
         job_id: PanDA job ID.
@@ -1325,12 +1328,13 @@ def _fetch_logs_payload(
     result = _LogFetchResult()
 
     # --- setup.stdout first ---
-    setup_fetched = False
+    # Kept in scope past this block: the no-payload-logs fallback below needs
+    # the text itself, not just the fact that it was read.
+    setup_text: str | None = None
     if _file_is_nonempty(file_index, "setup.stdout"):
         result.setup_log_url = _log_file_url(job_id, "setup.stdout", base_url)
         setup_text = _fetch_log_text(job_id, "setup.stdout", base_url, timeout)
         if setup_text:
-            setup_fetched = True
             if _setup_log_has_error(setup_text):
                 setup_ctx = extract_failure_context(
                     setup_text, "setup.stdout", pilot_error_code,
@@ -1402,11 +1406,25 @@ def _fetch_logs_payload(
         chosen = stderr_ctx if stderr_ctx.exception else stdout_ctx
         result.exception = chosen.exception
         result.traceback_count = chosen.traceback_count
-    elif setup_fetched:
+    elif setup_text:
         # setup.stdout was fetched but contained no recognised error; use it
         # as the excerpt so the LLM still has environment context.
+        #
+        # Extracted here rather than read back out of ``setup_log_excerpt``:
+        # that field is only ever assigned on the has-error branch above,
+        # which returns early, so reading it here could only ever resolve to
+        # the empty string — the LLM was promised environment context and got
+        # none.  Extraction is deferred to this branch rather than run
+        # eagerly above so a job that reaches the payload logs pays nothing
+        # for it.
+        setup_ctx = extract_failure_context(
+            setup_text, "setup.stdout", pilot_error_code,
+            pilot_error_diag, _MAX_EXCERPT_CHARS,
+        )
         result.log_available = True
-        result.log_excerpt = result.setup_log_excerpt or ""
+        result.log_excerpt = setup_ctx.excerpt
+        result.exception = setup_ctx.exception
+        result.traceback_count = setup_ctx.traceback_count
     else:
         logger.info(
             "No usable logs for job %d; proceeding with metadata only.", job_id

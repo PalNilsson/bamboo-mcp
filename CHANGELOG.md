@@ -127,6 +127,52 @@ All notable changes to Bamboo are documented here.
   structured half of the tuple fails 30 tests.
 
 ### Fixed
+- **A clean `setup.stdout` no longer produces an empty excerpt**
+  (`packages/askpanda_atlas/askpanda_atlas/log_analysis_impl.py`, ePIC mirror
+  regenerated). When a pilot-1305 job's `setup.stdout` was downloaded, reported
+  no setup error, and the payload logs then yielded nothing — both confirmed
+  zero-length by the listing, or both undownloadable — `_fetch_logs_payload`
+  fell back on `result.setup_log_excerpt or ""`. That field is only ever
+  assigned inside the has-error branch above, which returns early, so the
+  expression could only ever resolve to the empty string. The comment beside
+  it promised the caller environment context and the code delivered none;
+  `log_excerpt or None` then turned that into `None`, so synthesis was told
+  there was no log at all for a job whose setup log had been read
+  successfully. The branch now excerpts the setup text through
+  `extract_failure_context` and carries the exception and traceback count it
+  finds.
+
+  **Visible in production.** A job in that state now reaches the TUI, the
+  Streamlit interface, the REST facade and the "Analyse failure" button with
+  setup context in `log_excerpt` where it previously had none.
+  `setup_log_excerpt` is unchanged and still means "setup.stdout reported an
+  error" — it is a separate evidence key, not a second copy of the excerpt.
+  Extraction is deferred into the fallback branch rather than run eagerly, so
+  a job that reaches the payload logs pays nothing for it.
+
+  Fixed ahead of the B7 equivalence walkthrough rather than after it: the
+  primitive path already returned the setup context here, so leaving the
+  monolith as it was would have encoded the bug in a fixture that the Track A
+  granularity study then reuses. The Track B regression gate holds —
+  `packages/askpanda_atlas/tests/test_log_analysis.py` passes byte-identical.
+  New monolith tests land in `test_log_analysis_fallback.py` until that gate
+  is lifted; five of them fail against the previous behaviour and five pin the
+  neighbouring cases that were already correct. Mutation-tested: 13 mutants of
+  the fallback predicate, its assignments, its budget and the pilot-version
+  rule below, 13 killed.
+
+- **`atlas.log.fetch_text` parsed a pilot version from files the monolith
+  never reads for one** (`log_primitives_impl.py`). `parse_pilot_version`
+  matches its pattern anywhere in the text, and `fetch_text` ran it over every
+  file it downloaded. `_fetch_logs_payload` never parses a version at all — it
+  falls back to the `pilotid` metadata field — so a `payload.stdout` that
+  echoed a version line would make a composed loop report a version
+  `fetch_and_analyse` does not, with no way for the caller to know which
+  result to trust. Now keyed on the filename, exactly as the `setup_has_error`
+  signal is: `pilotlog.txt` only, whatever role the caller assigned it. Latent
+  rather than observed — no test hit it — and found while tracing the
+  equivalence contract for B7.
+
 - **`atlas.log.list_files` could emit a payload its own schema rejects.**
   Entries were projected with a bare `record.get(...)`, so an entry missing
   `dirname` or `modification` produced `null` against a declared string type

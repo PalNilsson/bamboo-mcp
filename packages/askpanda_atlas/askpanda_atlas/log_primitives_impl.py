@@ -46,17 +46,22 @@ wire.  The budget comes from :data:`ENV_MAX_CHARS`, read independently of the
 monolith's ``_MAX_EXCERPT_CHARS`` so that raising it for a large-context
 code-mode agent cannot change the orchestrated path.
 
-Known divergence from the monolith
-----------------------------------
-When ``setup.stdout`` is fetched, reports *no* setup error, and the payload
-logs then yield nothing, ``_fetch_logs_payload`` produces an empty excerpt: it
-only ever assigns ``setup_log_excerpt`` inside its has-error branch, so the
-``elif setup_fetched`` fallback resolves ``None or ""``.  :func:`classify`
-falls back to the setup context in that case and returns its excerpt.  The
-divergence is deliberate and one-directional — the primitive path returns
-content where the monolith returns none — and is recorded here rather than
-fixed, because fixing it means changing the monolith and the Track B
-regression gate requires ``test_log_analysis.py`` to pass unmodified.
+Equivalence with the monolith
+-----------------------------
+The composed loop and one ``fetch_and_analyse`` call must reach the same
+excerpt, the same exception and the same verdict for the same job.  That is
+asserted scenario by scenario in
+``packages/askpanda_atlas/tests/test_log_equivalence.py``, and it is the
+reason several rules here are transcriptions rather than reinventions: the
+character budget per role, the ``payload.stderr`` separator, the
+stderr-first exception precedence, and the file the pilot version may be
+parsed from.
+
+Two differences remain and are intended.  ``context.exception.raw`` is capped
+at the tool boundary (D-27) where the monolith carries it whole, and the
+primitives stop at :func:`classify` — the evidence bundling, link block and
+core-dump probe that ``fetch_and_analyse`` performs afterwards have no
+primitive counterpart by design.
 
 Why planning is a tool rather than a static rule
 ------------------------------------------------
@@ -164,6 +169,13 @@ ROLE_SECONDARY: str = "secondary"
 SETUP_LOG: str = "setup.stdout"
 PAYLOAD_STDOUT: str = "payload.stdout"
 PAYLOAD_STDERR: str = "payload.stderr"
+
+#: The only file a pilot version may be parsed from; see :func:`fetch_text`.
+#: Equal to what
+#: :func:`~askpanda_atlas.log_analysis_impl._select_log_filename` returns for
+#: every non-1305 job, which is the only path on which the monolith parses a
+#: version at all.
+PILOT_LOG: str = "pilotlog.txt"
 
 #: Key of the signal :func:`plan_fetch` consumes from a previous fetch.
 SETUP_SIGNAL: str = "setup_has_error"
@@ -1536,6 +1548,15 @@ def fetch_text(
     ``payload.stdout`` and merged into ``observed`` would make the next
     :func:`plan_fetch` skip the setup log entirely.
 
+    ``pilot_version`` is keyed on the filename for the same reason.  The
+    monolith parses a version only in ``_fetch_logs_pilotlog``, which runs
+    only for non-1305 jobs, where the file is always :data:`PILOT_LOG`; on the
+    payload path it falls back to the ``pilotid`` metadata field without
+    looking at ``payload.stdout`` at all.  ``parse_pilot_version`` matches its
+    pattern anywhere in the text, so a payload that echoed a version line
+    would otherwise make a composed loop report a version the monolith does
+    not — and the caller has no way to know which of its results to trust.
+
     Intentionally synchronous, for ``asyncio.to_thread``.
 
     Args:
@@ -1621,7 +1642,9 @@ def fetch_text(
         "context": _capped_context_state(context, budget),
         # Parsed from the full text: the pilot reports its version at
         # start-up, so an excerpt taken at the failure point will not have it.
-        "pilot_version": parse_pilot_version(text),
+        # Keyed on the filename for the same reason ``signals`` is: see the
+        # docstring.
+        "pilot_version": parse_pilot_version(text) if filename == PILOT_LOG else "",
         "notes": notes,
     })
     return result
@@ -1670,7 +1693,11 @@ _FETCH_TEXT_OUTPUT_SCHEMA: dict[str, Any] = {
         },
         "pilot_version": {
             "type": "string",
-            "description": "Pilot version parsed from this file; empty when absent.",
+            "description": (
+                "Pilot version, parsed from pilotlog.txt only; empty for any "
+                "other file and when absent.  For a job whose pilot log was "
+                "not read, use fetch_metadata's pilot_version_from_pilotid."
+            ),
         },
         "notes": {
             "type": "array",
@@ -1877,10 +1904,11 @@ def _combine_contexts(
     drift from the implementation that has to agree with them.
 
     A setup context is used only when no payload content was supplied.  That
-    covers the erroring ``setup.stdout`` case exactly — :func:`plan_fetch`
-    ends the loop there, so no payload entry exists — and, as the module
-    docstring records, returns content in one case where the monolith returns
-    an empty excerpt.
+    covers two cases, and the monolith covers both the same way: the erroring
+    ``setup.stdout``, where :func:`plan_fetch` ends the loop so no payload
+    entry exists, and the clean ``setup.stdout`` whose payload logs then
+    turned out to be empty, which ``_fetch_logs_payload`` falls back on in its
+    own ``elif setup_text`` branch.
 
     Args:
         entries: Role/context pairs from :func:`_fetched_entries`.
@@ -2093,6 +2121,7 @@ __all__ = [
     "MAX_LISTING_ENTRIES",
     "PAYLOAD_STDERR",
     "PAYLOAD_STDOUT",
+    "PILOT_LOG",
     "ROLE_PRIMARY",
     "ROLE_SECONDARY",
     "ROLE_SETUP",

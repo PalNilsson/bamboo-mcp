@@ -370,6 +370,34 @@ def test_the_pilot_version_comes_from_the_full_text(
     assert _fetch(_PILOTLOG, ROLE_PRIMARY)["pilot_version"] == "3.14.0.22"
 
 
+@pytest.mark.parametrize("filename", [PAYLOAD_STDOUT, PAYLOAD_STDERR, SETUP_LOG])
+def test_no_pilot_version_from_anything_but_the_pilot_log(
+    monkeypatch: pytest.MonkeyPatch, filename: str
+) -> None:
+    """A version line in a payload log is not the pilot's own report.
+
+    ``parse_pilot_version`` matches its pattern anywhere in the text, and
+    ``_fetch_logs_payload`` never parses a version at all — it falls back to
+    the ``pilotid`` metadata field.  Parsing one here would make a composed
+    loop report a version ``fetch_and_analyse`` does not, from a file the
+    monolith never reads for that purpose.
+    """
+    _wire(monkeypatch, {filename: "pilot version 9.9.9.9\npayload chatter\n"})
+    assert _fetch(filename, ROLE_PRIMARY)["pilot_version"] == ""
+
+
+def test_the_pilot_log_reports_its_version_whatever_role_it_was_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keyed on the filename, like the setup signal — not on the role.
+
+    An agent composing off-plan may fetch ``pilotlog.txt`` on a 1305 job and
+    label it however it likes; the version is a property of the file.
+    """
+    _wire(monkeypatch, {_PILOTLOG: "pilot version 3.14.0.22\n"}, job=_job(code=1305))
+    assert _fetch(_PILOTLOG, ROLE_SECONDARY)["pilot_version"] == "3.14.0.22"
+
+
 # ---------------------------------------------------------------------------
 # Unreadable files and bad arguments
 # ---------------------------------------------------------------------------
