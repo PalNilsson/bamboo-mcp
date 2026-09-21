@@ -148,6 +148,26 @@ Built-in tools are also registered directly in `bamboo.core.TOOLS`.
 > [CLAUDE.md Harvester Workers section](../CLAUDE.md#harvester-workers-harvester_worker_implpy)
 > for full implementation details.
 
+### Tool profiles
+
+Which discovered tools are *advertised* is filtered by `BAMBOO_TOOL_PROFILE`
+(`orchestrated`, the default; `primitive`; or `both`), read per `tools/list`.
+A definition may restrict itself with a `profiles` key; one that names no
+profile is advertised under all of them, which is every tool in the tree
+except the log-analysis compound/primitive pair.
+
+The filter is **advertising only** — `call_tool` is not gated by profile, and
+neither is `bamboo_executor`'s in-process resolution nor the `_tool_names`
+alias map — and **fail-open**: an unrecognised profile name, in the variable
+or in a definition, warns and degrades rather than making a tool vanish from
+the listing.
+
+Because the variable is read at listing time, a tool definition may differ
+between listings. `panda_log_analysis` rebuilds its own per call for exactly
+that reason; anything caching a definition across a profile change is wrong.
+
+See [`docs/code-mode.md`](code-mode.md) for the surface this exists to serve.
+
 ## Tool execution contract
 
 Each tool provides:
@@ -172,6 +192,30 @@ Callers that need the raw evidence parse it back with
 **Tools must never raise.** All error conditions are returned as
 `text_content(error_message)` so the MCP client always receives a well-formed
 response.
+
+### Tools that declare an `outputSchema`
+
+The five `atlas.log.*` code-mode primitives are the exception to the shape
+above.  Each declares an `outputSchema` and returns the two-element
+`(content, structured)` tuple the SDK validates against it, so a client reads
+`structuredContent` rather than re-parsing JSON out of a text block.  This
+requires `mcp >= 1.10.0`: below that floor the SDK ignores `outputSchema` and
+drops the structured half *silently*.
+
+Two consequences, both deliberate:
+
+- **No such schema carries a top-level `required`, and every one declares
+  `error`.**  The SDK rejects a result with no structured content from a tool
+  advertising an `outputSchema`, so a failure has to be expressible under the
+  schema too; one that demanded the success keys would turn every error path
+  into an opaque *"Output validation error"*.  `_validate_arguments` failures
+  in `core.py` carry structured content for the same reason.
+- **They do not reach `unpack_tool_result`.**  That unpacker expects the
+  list-of-content-dicts shape above.  The primitives are not planner-visible,
+  so nothing in Bamboo's own pipeline unpacks them; a code-mode client reads
+  the structured half directly.
+
+See [`docs/code-mode.md`](code-mode.md).
 
 ## Server-side argument validation
 
@@ -374,3 +418,4 @@ sufficient excerpt for follow-up resolution without bloating the prompt.
 ## See also
 
 - [`docs/architecture.md`](architecture.md) — process boundary, MCP wire, and `bamboo_answer` routing flow with diagrams
+- [`docs/code-mode.md`](code-mode.md) — the `atlas.log.*` primitive surface, `BAMBOO_TOOL_PROFILE`, and the equivalence contract with `panda_log_analysis`

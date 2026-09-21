@@ -54,7 +54,7 @@ A JSON-serialised evidence dict with the following keys:
 | `setup_log_url` | URL to `setup.stdout`. Populated for code 1305 jobs where `setup.stdout` was non-empty; `null` otherwise. |
 | `setup_log_excerpt` | Budget-capped content of `setup.stdout` when a fatal setup error was found. `null` if setup completed successfully or the file was absent. |
 | `log_available` | Whether at least one log file was successfully downloaded. |
-| `log_excerpt` | Most relevant section of the log, extracted by pattern matching. For code 1305 jobs where a setup error was found this is the `setup.stdout` content; otherwise it combines stdout and stderr (separated by `--- payload.stderr ---`). |
+| `log_excerpt` | Most relevant section of the log. For code 1305 jobs where a setup error was found this is the `setup.stdout` content; where the payload logs carried content it combines stdout and stderr (separated by `--- payload.stderr ---`); and where an error-free `setup.stdout` was read but both payload logs turned out to be empty, it is the excerpt of that setup log, so the job still arrives with environment context. |
 | `links_md` | Pre-built Markdown links block appended verbatim after LLM synthesis. |
 
 ---
@@ -115,6 +115,7 @@ For `piloterrorcode == 1305` (payload setup verification error) the download ord
 1. **`setup.stdout` (always first)** — If non-empty per the file-size index, download it and scan for a recognisable setup error (see `_SETUP_ERROR_PATTERNS` below).
 2. **If a setup error is found** — use `setup.stdout` as the primary excerpt and **stop**. Do not attempt `payload.stdout` or `payload.stderr`. The payload never ran, so those files will be empty and contain no additional diagnostic information.
 3. **If no setup error is found** (setup succeeded, or the file is absent/empty) — fall through to `payload.stdout` → `payload.stderr`, skipping any file confirmed zero-length by the index.
+4. **If that path yields nothing either** — both payload files zero-length or undownloadable — an error-free `setup.stdout` that *was* read becomes the excerpt, carrying any exception and traceback count found in it. `setup_log_excerpt` stays `null`: it means "setup.stdout reported an error", and is a separate evidence key rather than a second copy of the excerpt.
 
 #### Setup error patterns (`_SETUP_ERROR_PATTERNS`)
 
@@ -131,6 +132,7 @@ For `piloterrorcode == 1305` (payload setup verification error) the download ord
 |---|---|
 | `piloterrorcode == 1305`, setup error found | `setup.stdout` only |
 | `piloterrorcode == 1305`, no setup error | `payload.stdout` + `payload.stderr` (if non-empty) |
+| `piloterrorcode == 1305`, no setup error, both payload logs empty | the `setup.stdout` already read becomes the excerpt |
 | All other codes | `pilotlog.txt` only (or `payload.stdout` if `_select_log_filename` returns it) |
 
 The stderr fetch for code 1305 (no-setup-error path) is intentional: Python tracebacks, C++ exceptions, and segfaults frequently appear only on stderr and would be missed if only stdout were examined.
@@ -170,25 +172,29 @@ For the 100+ pilot error codes not in `_PILOT_CODE_PATTERNS`, the tool uses the 
 
 If the `piloterrordiag` pattern fails to match, the last 40 lines of the log are returned. This is a last resort that ensures something is always sent to the LLM rather than an empty excerpt.
 
-### Context window extraction for `setup.stdout` (code 1305, setup error)
+### Context window extraction for `setup.stdout` (code 1305)
 
-No pattern matching is attempted. The full content of `setup.stdout` is used, capped at `_MAX_EXCERPT_CHARS` (6 000 characters). Setup logs for jobs with fatal errors are typically short (a few hundred lines of `asetup`/Apptainer output ending with `!!!ERROR!!!`), so the cap is rarely reached.
+Extraction runs through `extract_failure_context` like every other file, so a traceback in the setup log is anchored on and parsed. When there is no traceback and the file *did* report a setup error, the whole capped file is kept instead of an anchored window: setup failures are shell output rather than tracebacks, and an anchor would crop the `asetup`/release diagnostics. The cap is `_MAX_EXCERPT_CHARS` (8 000 characters); setup logs for jobs with fatal errors are typically a few hundred lines ending with `!!!ERROR!!!`, so it is rarely reached.
 
 ### Context window extraction for payload logs (code 1305, no setup error)
 
-No pattern matching is attempted. The excerpt is built with a **split budget** to guarantee both the relevant stdout errors and the stderr traceback are always visible:
+Traceback-first, as everywhere: when a Python traceback is present the excerpt is built around it. Only when there is none does the character-based tail apply. The budget is **split** so that both the stdout errors and the stderr traceback are always visible:
 
 | Section | Budget | Method |
 |---|---|---|
-| `payload.stdout` | up to 4 000 characters | **Character-based tail** (last 4 000 chars) |
-| `payload.stderr` | up to 2 000 characters | Full content |
-| **Total** | **6 000 characters** | |
+| `payload.stdout` | up to 6 000 characters | Traceback-anchored window, else **character-based tail** |
+| `payload.stderr` | up to 2 000 characters | Same, within the reservation |
+| **Total** | **8 000 characters** | |
 
-**Why character-based (not line-based) for stdout:** Payload logs from frameworks like EventLoop and TopCPToolkit are often hundreds of thousands of characters of verbose `INFO` tool-initialisation messages, followed by a compact block of `ERROR` lines at the very end. A line-count tail would land in the middle of INFO messages and miss the ERROR block. A char-based tail always captures the final ERROR cascade.
+The reduced stdout budget is passed *into* extraction rather than applied as a slice afterwards: a post-hoc slice can cut a traceback and discard the terminal exception line, which is the part worth keeping. The reduction is unconditional — taken before it is known whether `payload.stderr` has content — so the joined excerpt stays within budget either way. When both files carry a traceback the **stderr** one is preferred, since that is where Python tracebacks and segfault reports are written.
+
+**Why character-based (not line-based) for the no-traceback stdout tail:** Payload logs from frameworks like EventLoop and TopCPToolkit are often hundreds of thousands of characters of verbose `INFO` tool-initialisation messages, followed by a compact block of `ERROR` lines at the very end. A line-count tail would land in the middle of INFO messages and miss the ERROR block. A char-based tail always captures the final ERROR cascade.
 
 ### Character cap
 
-The total excerpt sent to the LLM is capped at **6 000 characters**. The split budget above is how that cap is distributed for payload failures. For `pilotlog.txt` the full 6 000 characters are available for the context window.
+The total excerpt sent to the LLM is capped at **8 000 characters** (`_MAX_EXCERPT_CHARS`). The split budget above is how that cap is distributed for payload failures. For `pilotlog.txt` the full 8 000 characters are available for the context window. The verbatim traceback carried in the parsed exception has its own reservation of 5 000 characters within that budget.
+
+The code-mode primitives read their budget from `BAMBOO_PRIMITIVE_MAX_CHARS` instead, which defaults to the same 8 000 but is deliberately independent: see [`docs/code-mode.md`](../code-mode.md#budgets).
 
 ---
 
@@ -244,6 +250,32 @@ Both helpers return a `_LogFetchResult` dataclass carrying the six log-fetch out
 
 ---
 
+## The code-mode primitive surface
+
+This tool is *compound*: one call runs metadata fetch, file listing, log
+download, excerpt, classification and evidence bundling. An agentic framework
+built around **code mode** composes small primitives instead, so Bamboo
+advertises a second surface over the same implementation functions — five
+`atlas.log.*` tools — when `BAMBOO_TOOL_PROFILE=primitive`.
+
+The two surfaces **partition**: under the default `orchestrated` profile this
+tool is advertised and the primitives are withheld; under `primitive` the
+reverse; under `both`, all six. Nothing about this tool changes in a
+default deployment, and `call_tool` is not gated by profile in any case — the
+switch controls what is advertised, not what can be called.
+
+The primitives are held to reaching the same verdict, excerpt, exception and
+**download order** as this tool, scenario by scenario, by an equivalence
+walkthrough. Three differences between the two paths are intended and are
+stated in [`docs/code-mode.md`](../code-mode.md#the-equivalence-contract) —
+read those before treating either path's excerpt as ground truth.
+
+When the primitive surface is active, this tool's description appends a
+pointer to it. The pointer is omitted otherwise, because naming four tools
+the planner cannot select would put unselectable names into its prompt.
+
+---
+
 ## Plugin differences
 
 | Aspect | `askpanda_atlas` | `askpanda_epic` |
@@ -268,3 +300,4 @@ The analysis logic (log extraction, failure classification, evidence structure) 
 - [`pilot_source_analysis`](pilot_source_analysis.md) — follow-up tool for `pilot_monitoring_error`: fetches the relevant pilot3 source modules from GitHub and extracts the functions named in the traceback for LLM analysis
 - [`bamboo_last_evidence`](bamboo_last_evidence.md) — inspect the raw evidence dict via `/inspect` or `/json`
 - [`docs/rest-api.md`](../rest-api.md) — the REST facade behind the PanDA monitor's "Analyze failure" button, which reaches this tool by asking `bamboo_answer` "Analyze job N and explain the failure"
+- [`docs/code-mode.md`](../code-mode.md) — the five `atlas.log.*` primitives this tool decomposes into, the profile switch that selects them, and the equivalence contract between the two paths

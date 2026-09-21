@@ -1,10 +1,17 @@
 """Tests for ``_fetch_logs_payload``'s clean-``setup.stdout`` fallback.
 
 ``packages/askpanda_atlas/tests/test_log_analysis.py`` is the canonical suite
-for ``panda_log_analysis`` and is frozen for the duration of Track B: it is
-the regression gate, and it must pass byte-identical from B0 through B8.  New
-monolith tests therefore land here until that gate is lifted, at which point
-this module should be folded back into the canonical one.
+for ``panda_log_analysis``.  It was frozen for the duration of Track B — the
+regression gate, passing byte-identical from B0 through B8 — which is why
+these tests were written here rather than there.
+
+They stay here (D-47).  Folding them back would put 342 lines into an
+already 1 900-line module for no test-level gain: pytest collects both either
+way, and this module is a coherent account of one branch and the defect that
+was found in it.  Leaving the canonical suite untouched also keeps a cheap
+standing answer to "did any of this change ``panda_log_analysis``?" — the
+file's checksum.  New monolith tests may land in either module; put them
+wherever the subject already lives.
 
 What is covered
 ---------------

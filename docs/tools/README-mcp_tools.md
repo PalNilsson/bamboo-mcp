@@ -41,8 +41,8 @@ These tools search the PanDA/Bamboo documentation corpus for conceptual question
 |---|---|---|
 | `panda_doc_search` | [panda_doc_search.md](panda_doc_search.md) | Vector similarity search (ChromaDB) — ATLAS / ePIC corpus. |
 | `panda_doc_bm25` | [panda_doc_bm25.md](panda_doc_bm25.md) | BM25 keyword search over the same ATLAS / ePIC corpus. |
-| `cgsim.doc_search` | [cgsim.doc_search.md](cgsim.doc_search.md) | Vector similarity search over the CGSim / SimGrid corpus. |
-| `cgsim.doc_bm25` | [cgsim.doc_bm25.md](cgsim.doc_bm25.md) | BM25 keyword search over the same CGSim corpus. |
+| `cgsim.doc_search` | [cgsim_doc_search.md](cgsim_doc_search.md) | Vector similarity search over the CGSim / SimGrid corpus. |
+| `cgsim.doc_bm25` | [cgsim_doc_bm25.md](cgsim_doc_bm25.md) | BM25 keyword search over the same CGSim corpus. |
 
 ---
 
@@ -95,6 +95,35 @@ See [`docs/opensearch.md`](../opensearch.md) for the full schema, DSL examples, 
 
 ---
 
+## Code-mode primitive surface
+
+**ATLAS only, and not advertised by default.** These five tools decompose
+`panda_log_analysis` into composable steps for an agentic framework that
+writes code against small primitives rather than selecting one compound tool
+per turn. A server advertises them instead of the monolith when
+`BAMBOO_TOOL_PROFILE=primitive`, and alongside it under `both`; the default
+(`orchestrated`) withholds them entirely, so they never enter Bamboo's own
+planner catalog.
+
+They are documented together rather than one per file: they are only
+meaningful composed, and the loop, the budgets and the equivalence contract
+with `panda_log_analysis` belong in one place.
+
+| Tool | Description |
+|---|---|
+| `atlas.log.fetch_metadata` | Job metadata subset — status, site, error codes and diagnoses, timing, the pilot version implied by `pilotid`. Facts, not decisions. |
+| `atlas.log.plan_fetch` | Which log files to download next, and in what order. Re-entrant: hand back the `signals` from each fetch as `observed`. At most three calls. |
+| `atlas.log.fetch_text` | Downloads one file and returns its diagnostic excerpt, budgeted by the role `plan_fetch` assigned, plus the signals the next plan needs. |
+| `atlas.log.classify` | The verdict, from the metadata and the fetched excerpts. Pure — no network, safe to call twice. |
+| `atlas.log.list_files` | The job's log tarball with sizes, job-root files first. Not needed to diagnose a failure. |
+
+See [`docs/code-mode.md`](../code-mode.md) for the loop, the output shapes,
+`BAMBOO_TOOL_PROFILE`, `BAMBOO_PRIMITIVE_MAX_CHARS`, and the equivalence
+contract — including the three differences from `panda_log_analysis` that are
+intended.
+
+---
+
 ## Stub tools (not production)
 
 These tools exist in the codebase but are not connected to live data. They are superseded by the production tools listed above.
@@ -119,6 +148,7 @@ The following tools have no ePIC equivalent and are absent from the `askpanda_ep
 | `panda_jobs_query` | ATLAS-specific ingestion database |
 | `cric_query` | CRIC is an ATLAS computing resource catalogue |
 | `panda_server_health` | ATLAS PanDA MCP session wiring |
+| `atlas.log.*` (five primitives) | Code-mode surface; nothing would replace `panda_log_analysis` on an ePIC server, so the ePIC copy stays profile-agnostic |
 
 `code_query` and `pilot_source_analysis` are built-in core tools (not plugin-specific) and are available to all experiments.
 

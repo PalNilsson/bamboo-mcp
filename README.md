@@ -7,15 +7,25 @@ experiment operations, and CGSim distributed computing simulation.
 LLMs are used for *summarisation and explanation*, not as sources of truth.
 Structured evidence is always returned alongside natural-language answers.
 
-> **Status (August 2026):** core infrastructure is stable; latest release
-> **v1.0.8**. The newest addition is `atlas.core_dump_analysis`, which runs gdb
+> **Status (September 2026):** core infrastructure is stable; latest release
+> **v1.1.0**. The newest addition is a **code-mode primitive surface** — five
+> `atlas.log.*` tools that decompose `panda_log_analysis` into composable steps
+> for agentic frameworks that write code against small primitives rather than
+> selecting one compound tool per turn. It is off by default and selected with
+> `BAMBOO_TOOL_PROFILE`; see [`docs/code-mode.md`](docs/code-mode.md).
+>
+> Also new in v1.1.0: a REST analysis facade at `/api/v1` for the PanDA
+> monitor's "Analyse failure" button ([`docs/rest-api.md`](docs/rest-api.md)),
+> per-session conversational state, and spend accounting with admission
+> control.
+>
+> Earlier additions include `atlas.core_dump_analysis`, which runs gdb
 > against a failed ATLAS job's core dump inside the matching release container
 > and reports what the payload was actually doing when it was killed — the
 > question log analysis structurally cannot answer, since a looping-job kill
-> happens precisely because the payload stopped producing output.
->
-> Earlier additions include a multi-step AI Agent (`scripts/bamboo_agent.py`)
-> for complex multi-hop queries,
+> happens precisely because the payload stopped producing output; a multi-step
+> AI Agent (`scripts/bamboo_agent.py`)
+> for complex multi-hop queries; and
 > full OpenSearch self-observability — Bamboo logs every prompt/response turn and
 > can query its own logs for FAQ analysis, session replay, tool-usage analytics,
 > and per-model token cost breakdowns. Users can rate responses (1–5 stars) from
@@ -317,6 +327,7 @@ npx @modelcontextprotocol/inspector --url http://localhost:8000/mcp
 | [`docs/http-server.md`](docs/http-server.md) | Running the HTTP server for shared/testbed deployments |
 | [`docs/rest-api.md`](docs/rest-api.md) | REST analysis API — endpoints, polling, caching, budgets, PanDA monitor integration |
 | [`docs/mcp.md`](docs/mcp.md) | MCP protocol, tool contracts, LLM roles, orchestration |
+| [`docs/code-mode.md`](docs/code-mode.md) | Code-mode primitive surface — the five `atlas.log.*` tools, `BAMBOO_TOOL_PROFILE`, budgets, the equivalence contract |
 | [`docs/architecture.md`](docs/architecture.md) | Process boundary, MCP wire, `bamboo_answer` routing flow |
 | [`docs/interfaces.md`](docs/interfaces.md) | TUI, Streamlit UI, HTTP transport, context memory |
 | [`docs/plugins.md`](docs/plugins.md) | Writing and registering plugins |

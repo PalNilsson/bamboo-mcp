@@ -6,6 +6,74 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+---
+
+## v1.1.0 — 2026-09-21
+
+### Documentation
+- **`docs/code-mode.md`** (new). `BAMBOO_TOOL_PROFILE` and the five
+  `atlas.log.*` tools appeared in no document anywhere in the tree — nothing
+  outside `bamboo_env_example.sh` and this file. A surface shipped for
+  external agent authors that is discoverable only by reading the CHANGELOG
+  is not shipped.
+
+  Covers why there are two surfaces rather than a split monolith; the profile
+  switch with the counts `create_server`'s `list_tools` actually returns (26
+  orchestrated, 30 primitive, 31 both) and its three load-bearing properties;
+  the loop and its shape rules; the five tools and their output keys; the
+  budget table; the error and `outputSchema` contract; the equivalence
+  contract; composing off-plan; a worked example; and the limits.
+
+  One document rather than five under `docs/tools/`: the primitives are only
+  meaningful composed, and five documents each pointing at the loop would put
+  the contract in none of them.
+
+  Two sections exist for readers who would otherwise be surprised. The three
+  intended differences from `panda_log_analysis` are stated outright —
+  evidence bundling has no counterpart, `context.exception.raw` is capped at
+  the tool boundary, URLs are compared over files actually downloaded —
+  because a granularity study that treats the excerpt as ground truth without
+  knowing about the cap will measure the cap. And "composing off-plan" carries
+  the four properties that hold for a caller who ignores `plan_fetch`, which
+  are exactly the rules the equivalence walkthrough structurally cannot cover,
+  so the document names the modules that do cover them.
+
+- **`docs/tools/panda_log_analysis.md`**: a section on the primitive surface,
+  mirroring the pointer the tool's own description appends when the
+  primitives are advertised. Plus three corrections — not new drift, but now
+  visible as contradictions against `docs/code-mode.md`: `_MAX_EXCERPT_CHARS`
+  is 8 000 and the payload split 6 000/2 000, where the document said 6 000
+  and 4 000/2 000 in three places; extraction is traceback-first for every
+  file, where "no pattern matching is attempted" described the pre-traceback
+  behaviour; and the clean-setup fallback below was undocumented, so the
+  output table, the download-order list and the file-selection table now all
+  carry it.
+
+- **`docs/mcp.md`**: a "Tool profiles" subsection under tool discovery, and a
+  "Tools that declare an `outputSchema`" subsection under the execution
+  contract. The latter closes a real gap — the contract said a tool returns a
+  non-empty list of content dicts, which five tools no longer do. It states
+  the mcp >= 1.10.0 floor, why no output schema carries a top-level
+  `required`, and why the primitives never reach `unpack_tool_result`.
+
+- **`docs/tools/README-mcp_tools.md`**: a code-mode section with one line per
+  primitive, and a row in the ATLAS-only table recording why there is no ePIC
+  mirror. Drive-by: the `cgsim.doc_search` and `cgsim.doc_bm25` rows linked
+  files that do not exist (`cgsim.doc_search.md` for `cgsim_doc_search.md`).
+
+- **`README.md`**: status block moved to September 2026 and v1.1.0, naming the
+  code-mode surface and the REST facade; documentation index row for
+  `docs/code-mode.md`.
+
+- **`packages/askpanda_atlas/tests/test_log_analysis_fallback.py`** keeps its
+  own module rather than being folded back into `test_log_analysis.py` now
+  that the Track B regression gate has served its purpose. Folding would put
+  342 lines into an already 1 900-line module for no test-level gain — pytest
+  collects both either way — and leaving the canonical suite untouched keeps
+  its checksum as a cheap standing answer to "did any of this change
+  `panda_log_analysis`?". The docstring records the decision in place of the
+  promise to fold.
+
 ### Changed
 - **`panda_log_analysis` now declares `profiles: ["orchestrated"]`**
   (`packages/askpanda_atlas/askpanda_atlas/log_analysis_impl.py`). The two
