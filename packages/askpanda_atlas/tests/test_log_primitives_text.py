@@ -8,10 +8,11 @@ excerpt-joining and traceback-precedence rules :func:`classify` transcribes
 from ``_fetch_logs_payload``.  Each of those is a domain rule that, if left
 out, an agent would have to reinvent and would reinvent differently.
 
-One end-to-end equivalence check runs the primitive loop and the monolith over
-the same fixture and compares the excerpt, the exception and the verdict.  It
-is a small preview of the B7 walkthrough, kept here so a change that breaks
-equivalence fails in the commit that makes it.
+Equivalence with ``fetch_and_analyse`` is asserted in
+``test_log_equivalence.py``, over a table of scenarios.  The B5 preview of it
+that lived here has been removed rather than kept alongside: two modules
+asserting the same thing both need editing when the loop changes, and the
+walkthrough is the stronger of the two.
 
 Patching note
 -------------
@@ -29,13 +30,11 @@ from typing import Any
 
 import pytest
 
-from askpanda_atlas import log_analysis_impl as mono
 from askpanda_atlas import log_primitives_impl as impl
 from askpanda_atlas.log_analysis_impl import (
     _MAX_EXCERPT_CHARS,
     _STDERR_RESERVED_CHARS,
     FailureContext,
-    _fetch_logs_payload,
     classify_failure,
 )
 from askpanda_atlas.log_primitives_impl import (
@@ -620,66 +619,6 @@ def test_duplicate_roles_use_the_first_and_say_so() -> None:
 def test_a_non_mapping_job_degrades(job: Any) -> None:
     """Metadata-free classification beats an exception."""
     assert classify(job, [_entry(ROLE_PRIMARY, "")])["failure_type"] == "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Equivalence with the monolith (a B7 preview)
-# ---------------------------------------------------------------------------
-
-def test_the_primitive_loop_reproduces_the_monolith_on_the_payload_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Same fixture, both paths: excerpt, exception and verdict must agree.
-
-    The primitive loop runs exactly as an agent would: plan, fetch each file
-    the plan names with the role it assigned, classify what came back.
-    """
-    job = _job(code=1305)
-    texts: dict[str, str | None] = {
-        SETUP_LOG: "asetup ok, release found\n",
-        PAYLOAD_STDOUT: "payload chatter\n" * 100,
-        PAYLOAD_STDERR: _TRACEBACK,
-    }
-    sizes = {SETUP_LOG: 10, PAYLOAD_STDOUT: 20, PAYLOAD_STDERR: 30}
-
-    _wire(monkeypatch, texts, job=job)
-    monkeypatch.setattr(
-        impl,
-        "_fetch_file_listing",
-        lambda job_id, base_url, timeout: [
-            {"relative_path": path, "size_bytes": size, "name": path}
-            for path, size in sizes.items()
-        ],
-    )
-    monkeypatch.setattr(
-        mono,
-        "_fetch_log_text",
-        lambda job_id, filename, base_url, timeout: texts.get(filename),
-    )
-
-    # --- the primitive loop ---
-    observed: dict[str, Any] = {"fetched": []}
-    fetched: list[dict[str, Any]] = []
-    plan = impl.plan_fetch(_JOB_ID, _BASE_URL, 60, None)
-    for _ in range(3):
-        for entry in plan["next"]:
-            got = _fetch(entry["filename"], entry["role"])
-            fetched.append(got)
-            observed["fetched"].append(entry["filename"])
-            observed.update(got["signals"])
-        if plan["done"]:
-            break
-        plan = impl.plan_fetch(_JOB_ID, _BASE_URL, 60, observed)
-    verdict = classify(impl.fetch_metadata(_JOB_ID, _BASE_URL, 60), fetched)
-
-    # --- the monolith ---
-    monolith = _fetch_logs_payload(_JOB_ID, 1305, "payload failed", sizes, _BASE_URL, 60)
-    expected = classify_failure(job, monolith.log_excerpt, monolith.exception)
-
-    assert monolith.exception is not None, "the fixture must produce a traceback"
-    assert verdict["context"]["excerpt"] == monolith.log_excerpt
-    assert verdict["context"]["exception"]["exc_type"] == monolith.exception.exc_type
-    assert verdict["failure_type"] == expected
 
 
 # ---------------------------------------------------------------------------

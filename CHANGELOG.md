@@ -58,6 +58,46 @@ All notable changes to Bamboo are documented here.
   profile leaves a client with neither the compound tool nor the primitives.
 
 ### Added
+- **An equivalence walkthrough between the primitive loop and
+  `fetch_and_analyse`** (`packages/askpanda_atlas/tests/test_log_equivalence.py`,
+  `packages/askpanda_atlas/tests/log_scenarios.py`). Nineteen scenarios drive
+  both paths over the same job — same metadata, same listing, same downloaded
+  text — and compare the verdict, the excerpt, the exception type, the
+  traceback count, the pilot version, `log_available`, the URLs of the files
+  read, and the **download order**. That last one is the assertion with teeth:
+  an agreeing excerpt says the two paths arrived somewhere together, an
+  agreeing fetch order says `plan_fetch` transcribed `_fetch_logs_payload`'s
+  control flow rather than approximating it.
+
+  The scenarios cover the payload path in five shapes, the pilotlog path in
+  four, an unavailable listing, a job with no readable logs at all, a
+  metadata-only job, and one scenario per metadata field `_build_search_text`
+  reads, where the log says something else so a dropped field changes the
+  verdict rather than going unnoticed.
+
+  `expect_fetched` and `expect_failure_type` are in the table although
+  comparing the two paths does not need them. Two paths can agree and both be
+  wrong: a rule changed in the monolith and transcribed faithfully into
+  `plan_fetch` keeps every comparison green. Pinning the behaviour itself
+  means that change has to be made in the fixture table, where it is
+  reviewable.
+
+  The scenarios are a plain importable module rather than pytest fixtures, so
+  the Track A granularity study can consume them without running under
+  pytest. Same import pattern `tests/test_plugin_mirror_parity.py` uses for
+  `tests/plugin_mirror_spec.py`.
+
+  Three differences between the paths are intended and stated in the module
+  docstring: the primitives stop at `classify`, so evidence bundling has no
+  counterpart (the metadata subset is compared against the evidence
+  separately); `context.exception.raw` is capped at the tool boundary (D-27);
+  and `_fetch_logs_payload` emits `log_url` for a `payload.stdout` it decided
+  not to read, so URLs are compared over the files actually downloaded.
+
+  The B5 preview in `test_log_primitives_text.py` is removed rather than kept
+  alongside — two modules asserting the same thing both need editing when the
+  loop changes.
+
 - **Four more code-mode primitives: `atlas.log.fetch_metadata`,
   `atlas.log.list_files`, `atlas.log.fetch_text`, `atlas.log.classify`**
   (`packages/askpanda_atlas/askpanda_atlas/log_primitives_impl.py`). With
