@@ -724,6 +724,29 @@ class TestRealMonolithIsOrchestratedOnly:
         monkeypatch.setenv(tp.ENV_VAR, "both")
         assert "atlas.log." in self._definition()["description"]
 
+    def test_the_primitive_pointer_steers_the_planner_back_to_the_compound_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under ``both`` the note must say which of the two to reach for.
+
+        ``both`` is the recommended single-server deployment: it advertises
+        the primitives to a code-mode client while the planner catalog stays
+        pinned to ``orchestrated``.  The cost is that the catalog's copy of
+        this description then mentions ``atlas.log.*`` — four names the
+        planner cannot select.  What makes that safe is not the mention but
+        the preference stated alongside it, so the preference is pinned here.
+        A reworded note that merely described the primitives neutrally would
+        leave the test above green and reintroduce the routing hazard.
+
+        Args:
+            monkeypatch: Pytest environment patcher.
+        """
+        monkeypatch.setenv(tp.ENV_VAR, tp.PROFILE_BOTH)
+        description: str = self._definition()["description"]
+
+        assert "atlas.log." in description
+        assert "Prefer this one" in description
+
     def test_the_definition_is_not_cached_across_a_profile_change(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

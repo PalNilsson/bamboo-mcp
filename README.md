@@ -194,6 +194,19 @@ python scripts/bamboo_agent.py \
 
 See [`docs/agent.md`](docs/agent.md) for options, tuning, and testing instructions.
 
+**Job failure analysis (deterministic, requires HTTP server):**
+
+```bash
+python -m interfaces.agent.job_agent --panda-id 6799893074 \
+    --host localhost --port 8000
+```
+
+Composes the `atlas.log.*` primitives into a fixed loop, so the evidence is
+reproducible and only the final summary involves an LLM — `--no-synthesis`
+removes that one too. `--panda-id` repeats for a batch, and `--format jsonl`
+emits one record per job. See
+[`docs/code-mode.md`](docs/code-mode.md#the-reference-agent).
+
 **Running in AskCGSim mode:**
 
 ```bash

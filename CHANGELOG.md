@@ -6,6 +6,161 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`interfaces/agent/job_agent/`** (new package). A deterministic composer
+  for the `atlas.log.*` primitives, invoked as
+  `python -m interfaces.agent.job_agent --panda-id <id> --host <host> --port <port>`
+  or, in an installed deployment, as the `bamboo-job-agent` console script.
+
+  v1.1.0 shipped the primitive surface and a document describing the loop to
+  compose it with. Nothing in the tree actually ran that loop. The equivalence
+  walkthrough drives the *implementation functions* directly, so the one thing
+  it cannot tell you is whether a client composing them over the wire reaches
+  the same answer — which is the only way anyone will ever use them.
+
+  Four modules: `composer.py` holds the loop, `JobAnalysisResult` and the
+  synthesis call; `cli.py` holds argument parsing, four renderers and the
+  exit-code rule; `__main__.py` is the entry point; `__init__.py` re-exports
+  the composer only, so the package imports without the MCP SDK and the
+  Track A harness can drive `analyse_job` in-process against its own double.
+
+  **Deterministic rather than ReAct, and `BambooAgent` is not the engine.**
+  Its observations come from `_observation_from_result`, which reads text
+  content blocks only and truncates at 6 000 characters, where the primitives
+  return `structuredContent` validated against an `outputSchema` with an
+  8 000-character excerpt budget. The loop also has to pass `signals` back
+  verbatim and hand `classify` the whole ordered `fetched` list; through a
+  truncated text channel an agent would have to reconstruct both from prose,
+  which is the agent evaluating a domain predicate — the one thing the
+  primitive surface exists to prevent. There is one LLM call per job, at the
+  end, and `--no-synthesis` removes it.
+
+  `to_evidence()` projects the result onto `panda_log_analysis`'s own evidence
+  key names. That is not decoration: `rest._response_for` already renders an
+  `evidence` field in that vocabulary, and `_extract_evidence` derives its
+  `no_log` flag from `log_available`. Writing the projection now makes the
+  later "launch the agent from the PanDA monitor and get the result back"
+  integration a wiring change rather than a redesign. For the same reason
+  `outcome == "no_logs"` keys on `log_available` rather than on the
+  `metadata_only` strategy, so a failed job whose only log file was
+  zero-length reports it too — one rule instead of two that nearly agree.
+
+  The transport import sits inside `_run` rather than at module scope.
+  `interfaces/shared/mcp_client.py` imports `httpx` unconditionally, which
+  would otherwise make the parser, the renderers and the exit-code rule
+  unimportable — and untestable — wherever the HTTP stack is absent. `httpx`
+  is in no requirements file; it arrives transitively through `mcp`.
+
+  `observed` is snapshotted before each re-plan rather than passed live. Over
+  the wire it serialises immediately so this never bit, but the loop keeps
+  mutating the dict and a client that serialised after returning control would
+  send a later round's state.
+
+- **`tests/test_job_agent.py`** (new, 89 tests). Drives the agent against a
+  double dispatching to the real primitive tool objects, over every row of
+  `log_scenarios.py`, and asserts the **download order** as well as the
+  verdict — then compares `to_evidence()` against `fetch_and_analyse` key by
+  key with the same three documented exclusions the equivalence walkthrough
+  uses. An agent that fetched everything unconditionally and classified from
+  the union would pass a verdict comparison and fail the order one.
+
+  Also pinned: `filename` and `role` reach `fetch_text` verbatim (the role
+  sets the budget); the re-plan's `observed` carries the returned signals
+  rather than recomputed ones; `classify` receives the metadata subset
+  unmodified; `list_files` is never called unless asked for.
+
+  The scenario table is loaded by explicit path under a private module name
+  rather than by putting `packages/askpanda_atlas/tests` on `sys.path`. The
+  two suites are separate pytest invocations on purpose, and a shared
+  top-level module name across both rootdirs is what breaks that.
+
+- **`tests/test_job_agent_errors.py`** (new, 18 tests). What the scenario
+  table structurally cannot reach: an `error` payload from each primitive and
+  which of them are fatal to what — a `fetch_text` failure costs one file, a
+  `fetch_metadata`/`plan_fetch`/`classify` failure costs the job and is
+  *returned* so a batch continues, an unregistered tool costs the run and is
+  *raised* because every later job would fail identically. Plus the
+  three-call bound against a server stuck on `done: false`, a terminal plan
+  with a non-empty `next` (testing `done` before fetching would silently skip
+  the payload logs of every 1305 job), malformed plan entries, and payload
+  recovery from the text half when an `mcp` SDK below 1.10.0 drops the
+  structured one.
+
+- **`tests/test_job_agent_cli.py`** (new, 29 tests). Endpoint resolution
+  precedence, job-ID parsing including the stdin and `#`-prefixed forms,
+  per-format rendering, and the exit-code contract. An operator script reacts
+  to the number, so the difference between 2 and 3 is pinned explicitly.
+
+- **`pyproject.toml`**: `[project.scripts]` with `bamboo-job-agent`. The
+  module form always works from a source checkout; this is the ergonomic
+  equivalent for an installed deployment.
+
+### Fixed
+- **`docs/developer.md`**: a subsection on stale `*.egg-info` shadowing the
+  real entry points, under "Editable installs".
+
+  A working tree carrying `packages/askpanda_atlas/askpanda_atlas.egg-info` at
+  v1.0.9 and `core/bamboo_core.egg-info` at v1.0.8 fails six tests in
+  `test_tool_profiles.py` and `test_tool_name_canon.py`, and not one of the
+  messages says why. `conftest.py` puts those directories at the front of
+  `sys.path` so `importlib.metadata` finds them as distributions, and an
+  `entry_points.txt` predating `atlas.core_dump_analysis` and the five
+  `atlas.log.*` tools then shadows the current one.
+
+  What makes it worth a document rather than a shrug is how it presents: the
+  missing tools do not error, they are simply never advertised, so
+  `BAMBOO_TOOL_PROFILE=primitive` offers no primitives and `both` is
+  byte-identical to `orchestrated`. That reads as a bug in the profile switch,
+  which is where the time goes. The section says what to grep and what to
+  delete.
+
+  Both directories are gitignored build artifacts, so there is nothing to
+  commit here — only the document, and `rm -rf packages/*/[a-z]*.egg-info
+  core/*.egg-info` followed by a reinstall. These are also the only two places
+  in the tree still carrying a pre-1.1.0 version string.
+
+- **`docs/code_mode.md` renamed to `docs/code-mode.md`.** Every link to it in
+  the tree — two in `README.md`, two in `RELEASE_NOTES_v1.1.0.md`, three in
+  `docs/mcp.md`, one in `docs/tools/README-mcp_tools.md`, three in
+  `docs/tools/panda_log_analysis.md` — already used the hyphen, as did this
+  file's own v1.1.0 entry announcing it. Ten broken links, and the hyphen is
+  what the rest of `docs/` uses for multi-word names. Renaming the file fixes
+  all of them at once and leaves the announced name correct.
+
+### Changed
+- **`tests/test_tool_profiles.py`**: one test added to
+  `TestRealMonolithIsOrchestratedOnly`, asserting that the primitive pointer
+  appended under `both` states a preference for the compound tool.
+
+  `both` is the recommended single-server deployment, and its one cost is that
+  the planner catalog's copy of `panda_log_analysis`'s description then
+  mentions four `atlas.log.*` names the planner cannot select — the known
+  failure mode where a plan reaches for an unselectable tool and falls through
+  to RAG. What makes it safe is not the mention but the "Prefer this one"
+  alongside it. The existing test asserts the mention appears; a reworded note
+  that described the primitives neutrally would leave it green and
+  reintroduce the hazard, so the preference is now pinned too.
+
+- **`docs/code-mode.md`**: a "The reference agent" section — the invocation,
+  why the loop is deterministic rather than ReAct with the `BambooAgent`
+  truncation detail stated outright, what `JobAnalysisResult` and
+  `to_evidence()` add, the exit codes, which profile to run the server under,
+  and how the agent is held to the loop.
+
+  The profile section exists because the obvious conclusion from the rest of
+  the document is wrong: `BAMBOO_TOOL_PROFILE=primitive` is *not* required to
+  use the primitives, since the switch gates advertising and not `call_tool`,
+  and a second server dedicated to them buys only the guarantee that an agent
+  cannot reach the monolith — at the price of a second LLM pool, a second set
+  of database handles, and a cold metadata and listing cache the monitor's
+  analysis of the same job cannot warm.
+
+- **`docs/agent.md`**: a "Not the job agent" subsection with a table
+  separating the two, since both drive MCP tools from the command line and
+  the names do nothing to distinguish them.
+
+- **`README.md`**: a usage block for the job agent under the AI Agent block.
+
 ---
 
 ## v1.1.0 — 2026-09-21

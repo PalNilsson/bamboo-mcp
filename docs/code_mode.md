@@ -562,6 +562,109 @@ not pick which of the two tracebacks to trust, and did not join the excerpts.
 
 ---
 
+## The reference agent
+
+The worked example above is the loop by hand.  Shipped alongside it is the
+same loop as a program: `interfaces/agent/job_agent/`, a deterministic
+composer that connects to a running server, analyses one or more jobs, and
+synthesises an answer.
+
+```bash
+python -m interfaces.agent.job_agent --panda-id 6799893074 \
+    --host aipanda033.cern.ch --port 8000
+
+# several jobs over one session, evidence only, one JSON object per line
+python -m interfaces.agent.job_agent \
+    --panda-id 6799893074 --panda-id 6799893075 \
+    --no-synthesis --format jsonl
+
+# job IDs from a pipeline
+cut -f1 failed_jobs.tsv | python -m interfaces.agent.job_agent --format jsonl
+```
+
+An installed deployment also gets `bamboo-job-agent` as a console script.
+
+### Why it is not a ReAct agent
+
+Bamboo already has one — `interfaces/agent/agent.py`, driven by
+`scripts/bamboo_agent.py` — and it is the wrong shape for this.  Three
+reasons, in increasing order of how much they matter:
+
+- **Nothing on the diagnosis path is a judgement call.**  `plan_fetch` chooses
+  the files, `fetch_text` derives the budget from the role, `classify` picks
+  which traceback to trust.  A model asked to decide between them would be
+  re-deciding what the server already decided.
+- **An LLM in the loop is three extra calls per round trip** — reason,
+  evaluate, and the re-plan it has to be talked into — for a composition
+  whose control flow is four lines long.
+- **`BambooAgent` cannot carry the evidence.**  Its observations come from
+  `_observation_from_result`, which reads text content blocks only and
+  truncates at 6 000 characters.  The primitives' contract is
+  `structuredContent` validated against an `outputSchema`, with an
+  8 000-character excerpt budget, and the loop requires passing `signals` back
+  verbatim and the whole `fetched` list to `classify`.  Through a truncated
+  text channel the agent would have to reconstruct both from prose — which is
+  the agent evaluating a domain predicate, the one thing this surface exists
+  to prevent.
+
+So there is exactly one LLM call per job, at the end, and `--no-synthesis`
+removes that one too.  Nothing about the evidence depends on a model.
+
+### What it adds on top of the loop
+
+| | |
+|---|---|
+| `JobAnalysisResult` | metadata, every plan, every fetch, the verdict, the fetch order, notes, call counts |
+| `to_evidence()` | the result projected onto `panda_log_analysis`'s own evidence key names, so a consumer written against the compound tool reads it without a translation layer |
+| `outcome` | `analysed`, `no_logs` or `error` |
+| synthesis | one `bamboo_llm_answer` call, so the answer uses the server's configured provider and the agent needs no API key |
+| batch | `--panda-id` repeats; jobs run sequentially over one session |
+
+`outcome` is keyed on `log_available` rather than on the `metadata_only`
+strategy, matching the predicate the REST facade already derives its `no_log`
+flag from.  A failed job whose only log file turned out to be zero-length
+therefore reports `no_logs` too — there is nothing to show either way, and
+one rule is better than two that nearly agree.
+
+Exit codes: `0` every job analysed, `1` could not connect or the arguments
+were unusable, `2` a job failed to analyse, `3` no job failed but at least one
+had no log content.  An error outranks a missing log.
+
+### Which profile to run the server under
+
+None of them is required.  `BAMBOO_TOOL_PROFILE` gates `tools/list` and not
+`call_tool`, so the agent works against a server under the default
+`orchestrated` profile — it knows the five names and never consults the
+catalog.  The preflight warns when they are not advertised and continues.
+
+`BAMBOO_TOOL_PROFILE=both` on a single server is still the recommended
+deployment, and it is enough: the REST facade and the monitor's "Analyse
+failure" button reach `panda_log_analysis` through `bamboo_answer`'s fast
+path, and the planner catalog is pinned to `orchestrated` regardless of the
+environment, so neither moves.  A second server dedicated to the primitives
+buys only the guarantee that a code-mode agent *cannot* reach the monolith —
+worth having for a granularity study, not for production, where it costs a
+second LLM pool, a second set of database handles and, most of it, a cold
+metadata and listing cache that the monitor's analysis of the same job cannot
+warm.
+
+### How it is held to the loop
+
+`tests/test_job_agent.py` drives the agent against a double that dispatches
+to the real primitive tool objects, over every row of the scenario table, and
+asserts the **download order** as well as the verdict — then compares
+`to_evidence()` against `fetch_and_analyse` key by key, with the same three
+documented exclusions the equivalence walkthrough uses.  An agent that
+fetched everything unconditionally and classified from the union would pass a
+verdict comparison and fail this one.
+
+`tests/test_job_agent_errors.py` covers what the scenario table cannot reach:
+an `error` payload from each primitive, a `plan_fetch` that never terminates,
+a malformed plan entry, an unregistered tool, and an `mcp` SDK old enough to
+drop structured content.
+
+---
+
 ## Limits and non-goals
 
 - **Not planner-visible.**  The primitives declare `profiles: ["primitive"]`

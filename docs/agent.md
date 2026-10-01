@@ -20,6 +20,28 @@ spans job logs, pilot errors, and site configuration.
 For simple factual lookups the agent adds unnecessary latency (multiple round
 trips to the LLM). Prefer the TUI or Streamlit for those.
 
+### Not the job agent
+
+Bamboo ships a second agent, and the two are easy to confuse because both
+drive MCP tools against a running server from the command line.
+
+| | `BambooAgent` (this document) | `interfaces.agent.job_agent` |
+|---|---|---|
+| Question | anything | "why did job *N* fail" |
+| Loop | the LLM picks the next tool each step | fixed; every decision is a server-side rule |
+| LLM calls | three per step, plus synthesis | one, at the end — or none |
+| Tools | whatever `tools/list` advertises | the five `atlas.log.*` primitives |
+| Output | prose | prose **and** structured evidence |
+| Reproducible | no | yes, with `--no-synthesis` |
+
+Use this one for open questions that span several data sources.  Use the job
+agent when the question is a job ID, when the answer has to be the same twice
+running, or when something downstream needs the evidence rather than the
+prose.  `BambooAgent` is deliberately not the engine underneath it: its
+observations come from text content blocks truncated at 6 000 characters,
+which cannot carry the primitives' structured payloads intact.  See
+[`docs/code-mode.md`](code-mode.md#the-reference-agent).
+
 ---
 
 ## Architecture

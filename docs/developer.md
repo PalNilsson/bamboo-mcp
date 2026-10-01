@@ -40,6 +40,38 @@ pip install -e ./packages/askpanda_epic
 
 You do NOT need to reinstall for plain Python source file changes.
 
+### Stale `*.egg-info` shadows the real entry points
+
+A setuptools build leaves an `*.egg-info/` directory **inside the package
+source tree** — `packages/askpanda_atlas/askpanda_atlas.egg-info/`,
+`core/bamboo_core.egg-info/`. These are gitignored build artifacts, but
+`tests/conftest.py` puts those same directories at the front of `sys.path`, so
+`importlib.metadata` discovers them as installed distributions. An
+`entry_points.txt` left over from an earlier version then shadows the current
+one.
+
+The failure is quiet and misleading. The tools whose entry points are missing
+from the stale file simply never appear in `tools/list`, so
+`BAMBOO_TOOL_PROFILE=primitive` advertises no primitives at all and
+`BAMBOO_TOOL_PROFILE=both` is indistinguishable from `orchestrated` —
+which reads exactly like a bug in the profile switch. Six tests in
+`test_tool_profiles.py` and `test_tool_name_canon.py` fail, and none of their
+messages points here.
+
+Check it before believing any entry-point symptom:
+
+```bash
+grep -i '^Version' packages/askpanda_atlas/askpanda_atlas.egg-info/PKG-INFO
+grep 'atlas.log' packages/askpanda_atlas/askpanda_atlas.egg-info/entry_points.txt
+```
+
+If the version is behind the one in `pyproject.toml`, delete and reinstall:
+
+```bash
+rm -rf packages/*/[a-z]*.egg-info core/*.egg-info
+pip install -e ./core -e ./packages/askpanda_atlas
+```
+
 ---
 
 ## Optional feature dependencies

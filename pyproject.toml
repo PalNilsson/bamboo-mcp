@@ -18,6 +18,12 @@ package-dir = {"" = "."}
 where = ["."]
 include = ["bamboo*", "interfaces*"]
 
+# Console scripts shipped with the root package.  The module form
+# (python -m interfaces.agent.job_agent) always works from a source checkout;
+# this is the ergonomic equivalent for an installed deployment.
+[project.scripts]
+bamboo-job-agent = "interfaces.agent.job_agent.cli:main"
+
 [tool.askpanda]
 default_namespace = "atlas"
 
