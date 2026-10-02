@@ -382,7 +382,15 @@ def create_server() -> Server:  # pylint: disable=too-complex  # noqa: C901
 
         # Otherwise, try wrapping in ListToolsResult (often a model even if Tool is TypedDict).
         if inspect.isclass(ListToolsResult):
-            return ListToolsResult(tools=cast(list[Tool], defs))
+            # Rebind as Any before constructing.  ``inspect.isclass`` narrows
+            # its argument to ``type[object]`` when the symbol's own type is
+            # not known — which is what happens wherever ``mcp`` is
+            # unresolvable — and ``object.__init__`` takes no ``tools``.  The
+            # call is dynamic by design: this whole branch exists because the
+            # SDK has shipped these as models and as TypedDicts, so say so
+            # rather than let a narrowing decide what the constructor is.
+            result_cls: Any = ListToolsResult
+            return result_cls(tools=cast(list[Tool], defs))
 
         # Last resort: plain dicts
         return defs

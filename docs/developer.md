@@ -269,6 +269,32 @@ export PYRIGHT_PYTHON_ENV_DIR=/data/bamboo/.cache/pyright-nodeenv
 `PYRIGHT_PYTHON_CACHE_DIR` and `XDG_CACHE_HOME` move the whole cache root and
 work equally well.
 
+### Keep the pyright version pinned
+
+`requirements-dev.txt` pins pyright exactly, and the pin is load-bearing
+rather than tidiness. pyright ships its own copy of typeshed, so a version
+bump can change how a symbol narrows and turn clean code into an error with
+nothing in the repository having changed.
+
+One that actually happened: `inspect.isclass(X)` narrows `X` to
+`type[object]` when `X`'s own type is unknown, which is the case wherever
+`mcp` is unresolvable — an empty environment, the no-pytest venv below.
+`object.__init__` takes no keyword arguments, so `ListToolsResult(tools=...)`
+behind an `isclass` guard became *"No parameter named 'tools'"* under 1.1.411
+while 1.1.408 said nothing. The code was correct both times; the branch is
+dynamic by design, so it now binds through a local `Any` and reads the same
+under 1.1.408, 1.1.411 and 1.1.414.
+
+Install the dev tools from the file rather than by hand, so the pin applies:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+That also brings in `pytest-asyncio`, without which a seventh of the suite
+reports *"async def functions are not natively supported"* — see
+`tests/test_async_plugin_available.py`.
+
 ### pyright sees more where more is installed
 
 pyright reports on what it can resolve, so a clean run means "clean given the

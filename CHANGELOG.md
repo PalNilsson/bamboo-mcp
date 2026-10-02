@@ -96,6 +96,34 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **`core/bamboo/core.py`**: the `ListToolsResult` construction no longer
+  depends on how a type checker narrows an unresolved symbol.
+
+  Under pyright 1.1.411 the no-pytest run reported *"No parameter named
+  'tools'"* at `ListToolsResult(tools=...)`; 1.1.408 reported nothing, and the
+  normal run was clean under both. The cause is not `ListToolsResult`:
+  `inspect.isclass(X)` narrows `X` to `type[object]` when `X`'s own type is
+  unknown, which is exactly the case in an environment where `mcp` cannot be
+  resolved — and `object.__init__` takes no keyword arguments. In a populated
+  environment the symbol is `type[ListToolsResult]`, the narrowing keeps it,
+  and `tools` is a valid field, which is why only the stripped venv saw it.
+
+  The code was correct in both. That whole branch exists because the SDK has
+  shipped these types as models and as TypedDicts, so the call is dynamic by
+  intent; it now binds through a local `Any` after the runtime check rather
+  than leaving a narrowing to decide what the constructor is. Verified clean
+  under pyright 1.1.408, 1.1.411 and 1.1.414, in both the normal and the
+  no-pytest environments.
+
+- **`requirements-dev.txt`**: pyright pin moved `1.1.408` → `1.1.414`, and
+  `docs/developer.md` gains a note on why the pin is load-bearing. pyright
+  ships its own typeshed, so a version bump can change narrowing and turn
+  clean code into an error with nothing in the repository having changed —
+  which is what happened above, against a pin that had already drifted (the
+  file said 1.1.408, the machine had 1.1.411). The same note points at
+  installing from the file rather than by hand, which is also what supplies
+  `pytest-asyncio`.
+
 - **`packages/askpanda_atlas/askpanda_atlas/job_stats_impl.py`**: `hits.total`
   in its integer form was counted as zero documents.
 
