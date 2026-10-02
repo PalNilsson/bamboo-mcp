@@ -317,6 +317,31 @@ def parse_llm_params(raw: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _total_hits(response: Any) -> int:
+    """Return the total hit count of an OpenSearch response.
+
+    ``hits.total`` arrives in one of two shapes.  Modern OpenSearch sends an
+    object — ``{"value": N, "relation": "eq"}`` — but a cluster or client
+    configured with ``rest_total_hits_as_int`` sends a bare integer, and
+    opensearch-dsl surfaces whichever it got as a dynamic ``AttrDict``.  A
+    ``hasattr(total, "value")`` test therefore reports **zero documents** for
+    the integer form rather than the count, which looks like an empty result
+    set rather than a parsing problem.
+
+    Args:
+        response: The object ``Search.execute()`` returned.
+
+    Returns:
+        The total hit count, or ``0`` when it cannot be read.
+    """
+    total: Any = getattr(getattr(response, "hits", None), "total", None)
+    raw: Any = getattr(total, "value", total)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def fetch_job_stats(
     metric: str,
     field: str,
@@ -449,8 +474,13 @@ def fetch_job_stats(
         # fields).  Sort by sub-metric in the requested direction so
         # "highest" (desc) and "worst/lowest" (asc) both work correctly.
         group_field = f"{group_by}.keyword"
+        # opensearch-dsl builds aggregations through __getattr__, so `s.aggs`
+        # is typed as a plain AttrDict and the fluent bucket().metric() chain
+        # reads as calling a mapping.  Bind it as Any rather than scatter
+        # ignores across the chain.
+        aggs: Any = s.aggs
         (
-            s.aggs
+            aggs
             .bucket("by_group", "terms",
                     field=group_field,
                     size=top_n,
@@ -460,10 +490,7 @@ def fetch_job_stats(
 
         response = s.execute()
 
-        doc_count: int = (
-            response.hits.total.value
-            if hasattr(response.hits.total, "value") else 0
-        )
+        doc_count: int = _total_hits(response)
         buckets = [
             {
                 "key": b.key,
@@ -507,7 +534,7 @@ def fetch_job_stats(
 
     response = s.execute()
 
-    doc_count = response.hits.total.value if hasattr(response.hits.total, "value") else 0
+    doc_count = _total_hits(response)
     agg = response.aggregations[agg_name]
     value: float | int | None = getattr(agg, "value", None)
 

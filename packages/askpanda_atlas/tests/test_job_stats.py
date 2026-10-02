@@ -43,6 +43,7 @@ from askpanda_atlas.job_stats_impl import (
     _default_window,
     _error_evidence,
     _os_error_message,
+    _total_hits,
     fetch_job_stats,
     panda_job_stats_tool,
     parse_llm_params,
@@ -768,6 +769,95 @@ class TestParseLlmParamsNewFields:
 # ---------------------------------------------------------------------------
 # _os_error_message
 # ---------------------------------------------------------------------------
+
+
+class TestTotalHits:
+    """Unit tests for :func:`_total_hits`.
+
+    ``hits.total`` arrives in two shapes depending on how the cluster or the
+    client is configured, and opensearch-dsl hands back whichever it got as a
+    dynamic ``AttrDict``.  Reading only the object form reports zero documents
+    for the integer form — an empty result set rather than a parsing problem,
+    which is the kind of wrong answer nobody goes looking for.
+    """
+
+    class _Hits:
+        """Stand-in for ``response.hits``.
+
+        Attributes:
+            total: Whatever the cluster put in ``hits.total``.
+        """
+
+        def __init__(self, total: Any) -> None:
+            """Store the total.
+
+            Args:
+                total: The ``hits.total`` payload.
+            """
+            self.total = total
+
+    class _Response:
+        """Stand-in for an executed ``Search``.
+
+        Attributes:
+            hits: The hits container.
+        """
+
+        def __init__(self, total: Any) -> None:
+            """Store a hits container wrapping *total*.
+
+            Args:
+                total: The ``hits.total`` payload.
+            """
+            self.hits = TestTotalHits._Hits(total)
+
+    class _Total:
+        """Object form of ``hits.total``.
+
+        Attributes:
+            value: The count.
+            relation: The count's relation, unused here.
+        """
+
+        def __init__(self, value: Any) -> None:
+            """Store the count.
+
+            Args:
+                value: The count.
+            """
+            self.value = value
+            self.relation = "eq"
+
+    def test_object_form_is_read(self) -> None:
+        """The modern ``{"value": N, "relation": "eq"}`` shape."""
+        assert _total_hits(self._Response(self._Total(4217))) == 4217
+
+    def test_integer_form_is_read(self) -> None:
+        """``rest_total_hits_as_int`` sends a bare integer, and it counts."""
+        assert _total_hits(self._Response(1234)) == 1234
+
+    def test_zero_is_preserved(self) -> None:
+        """An empty result set is zero, not a parse failure."""
+        assert _total_hits(self._Response(self._Total(0))) == 0
+
+    def test_a_numeric_string_is_coerced(self) -> None:
+        """Some clients stringify the count; it is still a count."""
+        assert _total_hits(self._Response("57")) == 57
+
+    def test_a_missing_total_is_zero(self) -> None:
+        """No total at all degrades to zero rather than raising."""
+        assert _total_hits(self._Response(None)) == 0
+
+    def test_an_unreadable_total_is_zero(self) -> None:
+        """A shape nobody anticipated must not take down the tool."""
+        assert _total_hits(self._Response(self._Total("not a number"))) == 0
+
+    def test_a_response_without_hits_is_zero(self) -> None:
+        """A malformed response degrades the same way.
+
+        ``object()`` has neither ``hits`` nor ``total``.
+        """
+        assert _total_hits(object()) == 0
 
 
 class TestOsErrorMessage:

@@ -4147,7 +4147,12 @@ def _complete_via_anthropic(system: str, user: str, model: str | None,
     except Exception as exc:  # noqa: BLE001 - surface any SDK/transport failure uniformly
         raise RuntimeError(f"Anthropic API call failed: {exc}") from exc
 
-    text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+    # Narrow on ``block.type`` rather than ``getattr(block, "type", "")``:
+    # the SDK's content blocks are a discriminated union keyed on a Literal
+    # ``type``, so the direct comparison tells a type checker that only
+    # ``TextBlock`` survives the filter.  Through ``getattr`` it cannot, and
+    # every non-text member of the union is reported as lacking ``.text``.
+    text = "".join(block.text for block in response.content if block.type == "text")
     meta = {
         "backend": "anthropic",
         "provider": "anthropic",

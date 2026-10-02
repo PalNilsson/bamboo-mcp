@@ -231,6 +231,68 @@ pre-commit run --all-files
 The pre-commit hook checks for circular imports using
 `circular-import-detector==1.0.18`.  Run it before opening a PR.
 
+### pyright on a CERN machine: keep the Node bootstrap off AFS
+
+`pyright` on PyPI is a launcher, not a type checker — the checker is
+JavaScript. With no usable Node it downloads one and unpacks it into
+`~/.cache/pyright-python/nodeenv`, which on lxplus and `aipanda033` is AFS.
+An unpacked Node is several hundred megabytes and the AFS home quota is not,
+so the install dies partway through with `[Errno 122] Disk quota exceeded`
+under a wall of `nodeenv` tracebacks, having already consumed whatever quota
+was left:
+
+```
+OSError: [Errno 122] Disk quota exceeded:
+  '.../.cache/pyright-python/nodeenv/include/node/openssl/archs/BSD-x86/...'
+RuntimeError: nodeenv failed; for more reliable node.js binaries try
+  `pip install pyright[nodejs]`
+```
+
+Take that suggestion — it is the right fix here, not a workaround.
+`pyright[nodejs]` pulls in `nodejs-wheel-binaries`, which ships Node as a
+wheel into `site-packages`; the venv lives on `/data`, so nothing touches AFS.
+`pyright/node.py` checks for `nodejs_wheel` *before* a global `node` and
+before building a nodeenv, so it is used as soon as it is installed:
+
+```bash
+rm -rf ~/.cache/pyright-python      # reclaim the half-written nodeenv first
+pip install 'pyright[nodejs]'
+fs lq ~                             # confirm the quota came back
+```
+
+If you would rather keep the nodeenv, redirect it instead — but off AFS:
+
+```bash
+export PYRIGHT_PYTHON_ENV_DIR=/data/bamboo/.cache/pyright-nodeenv
+```
+
+`PYRIGHT_PYTHON_CACHE_DIR` and `XDG_CACHE_HOME` move the whole cache root and
+work equally well.
+
+### pyright sees more where more is installed
+
+pyright reports on what it can resolve, so a clean run means "clean given the
+packages present in this environment". `anthropic`, `opensearch-dsl` and
+`pysqlite3` are optional dependencies: where they are absent their imports
+resolve to `Unknown`, every attribute on them is permitted, and the modules
+that use them are effectively unchecked. Install them and real errors appear —
+not new ones, just ones that were always there and invisible.
+
+Run pyright somewhere with the optional extras installed before trusting a
+clean result, or treat a clean run on a minimal environment as weaker evidence
+than it looks:
+
+```bash
+pip install anthropic opensearch-dsl pysqlite3-binary
+```
+
+**Check the quota even if you do not care about pyright.** The same AFS home
+holds the sentence-transformers model ChromaDB loads from
+`~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/`.
+A full quota there does not raise — the RAG stack falls back to
+`DummyEmbedder` and its 8-dimensional vectors, and retrieval quietly becomes
+noise. A failed pyright run is the cheapest possible warning about that.
+
 ---
 
 ## Adding a new LLM provider

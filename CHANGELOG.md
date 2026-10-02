@@ -96,6 +96,68 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **`packages/askpanda_atlas/askpanda_atlas/job_stats_impl.py`**: `hits.total`
+  in its integer form was counted as zero documents.
+
+  `doc_count` was read as `response.hits.total.value if hasattr(response.hits.
+  total, "value") else 0`, at both the grouped and the scalar call site. That
+  covers the object form — `{"value": N, "relation": "eq"}` — but a cluster or
+  client configured with `rest_total_hits_as_int` sends a bare integer, and
+  the `hasattr` test then falls through to `0`. The tool reports an empty
+  result set rather than a parsing problem, which is the kind of wrong answer
+  nobody goes looking for.
+
+  Both sites now call a `_total_hits` helper that reads either shape and
+  degrades to `0` only when the value genuinely cannot be coerced. Seven
+  regression tests in `TestTotalHits` cover both forms, zero, a stringified
+  count, a missing total and a malformed response.
+
+  The fluent `s.aggs.bucket(...).metric(...)` chain is bound through a local
+  `aggs: Any` rather than scattering ignores: opensearch-dsl builds
+  aggregations through `__getattr__`, so the chain statically reads as calling
+  a mapping.
+
+- **`packages/askpanda_atlas/askpanda_atlas/_core_dump_analyzer.py`**: the
+  Anthropic response join now narrows on `block.type == "text"` rather than
+  `getattr(block, "type", "") == "text"`. The SDK's content blocks are a
+  discriminated union keyed on a `Literal` type; through `getattr` a checker
+  cannot narrow it, so all eleven non-text members were reported as lacking
+  `.text`. Behaviour is unchanged — every block carries `type`.
+
+- **`core/bamboo/tools/_sqlite_compat.py`**: `pysqlite3.sqlite_version` is read
+  through `getattr`. `pysqlite3/__init__.py` star-imports from `dbapi2`, which
+  pulls the name out of an unstubbed C extension, so it is not statically
+  visible however the import is annotated — and a build that did not export it
+  should not take down the shim it is reporting on.
+
+  These three accounted for all 15 pyright errors on a machine with the
+  optional extras installed. They were invisible in a minimal environment,
+  where `anthropic`, `opensearch-dsl` and `pysqlite3` resolve to `Unknown` and
+  every attribute on them is permitted — which is now noted in
+  `docs/developer.md`, because it means a clean pyright run is only as strong
+  as the environment it ran in.
+
+- **`docs/developer.md`**: a subsection under "Linting" on keeping pyright's
+  Node bootstrap off AFS.
+
+  `pyright` on PyPI is a launcher; the checker is JavaScript. With no usable
+  Node it unpacks one into `~/.cache/pyright-python/nodeenv`, which on lxplus
+  and `aipanda033` is AFS, where the home quota is a fraction of what an
+  unpacked Node needs. It dies partway through with `[Errno 122] Disk quota
+  exceeded` under several screens of `nodeenv` traceback, having already eaten
+  whatever quota was left.
+
+  `pip install 'pyright[nodejs]'` is the fix rather than a workaround:
+  `pyright/node.py` checks for `nodejs_wheel` before a global `node` and
+  before building a nodeenv, and the wheel lands in `site-packages` on
+  `/data`. `PYRIGHT_PYTHON_ENV_DIR` is documented as the alternative for
+  anyone who wants to keep the nodeenv but move it.
+
+  The section also flags what the failure is really telling you: the same AFS
+  home holds the sentence-transformers model ChromaDB loads. A full quota
+  there does not raise — the RAG stack falls back to `DummyEmbedder` and its
+  8-dimensional vectors, and retrieval silently becomes noise.
+
 - **`tests/test_prompt_log.py`**: a latent flake in
   `TestLogPromptEnabled::test_turn_number_increments`, plus the fixed sleeps
   three neighbouring tests shared with it.

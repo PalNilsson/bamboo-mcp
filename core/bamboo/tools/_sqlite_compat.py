@@ -121,9 +121,15 @@ def ensure_sqlite_compat() -> bool:
     # Replace the system sqlite3 with the bundled one before chromadb loads.
     sys.modules["sqlite3"] = pysqlite3  # type: ignore[assignment]
     _patched = True
+    # ``pysqlite3/__init__.py`` star-imports from ``dbapi2``, which in turn
+    # pulls the name out of an unstubbed C extension, so ``sqlite_version`` is
+    # not statically visible however the import is annotated.  Read it
+    # dynamically: this is a log line, and a pysqlite3 build that did not
+    # export it must not take down the shim it is reporting on.
+    bundled_version: str = str(getattr(pysqlite3, "sqlite_version", "unknown"))
     _log.debug(
         "pysqlite3 shim applied (bundled SQLite %s replaces system %s).",
-        pysqlite3.sqlite_version,
+        bundled_version,
         sqlite3.sqlite_version,
     )
     return True
