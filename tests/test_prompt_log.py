@@ -33,6 +33,27 @@ from bamboo.llm.prompt_log import (
 
 
 # ---------------------------------------------------------------------------
+# Draining the fire-and-forget writes
+# ---------------------------------------------------------------------------
+
+async def _drain_writes() -> None:
+    """Wait for every background prompt-log write to finish.
+
+    ``log_prompt`` hands the write to ``asyncio.create_task`` and returns
+    immediately, so awaiting it tells you nothing about whether the document
+    reached ``_write_document``.  Sleeping a fixed interval instead makes the
+    test a race against the thread pool: fine on an idle laptop, not on a
+    loaded CI box, and invisible until it is not.
+
+    Args:
+        None.
+    """
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending)
+
+
+# ---------------------------------------------------------------------------
 # _crc32_token
 # ---------------------------------------------------------------------------
 
@@ -292,7 +313,7 @@ class TestLogPromptEnabled:
                         input_tokens=100,
                         output_tokens=50,
                     )
-                    await asyncio.sleep(0.05)
+                    await _drain_writes()
 
                 asyncio.run(_run())
 
@@ -350,7 +371,7 @@ class TestLogPromptEnabled:
                         model="gemini-2.0-flash",
                         max_tokens=512,
                     )
-                    await asyncio.sleep(0.05)
+                    await _drain_writes()
 
                 asyncio.run(_run())
 
@@ -373,7 +394,7 @@ class TestLogPromptEnabled:
                         model="gemini-2.0-flash",
                         max_tokens=512,
                     )
-                    await asyncio.sleep(0.05)
+                    await _drain_writes()
 
                 asyncio.run(_run())
 
@@ -401,12 +422,16 @@ class TestLogPromptEnabled:
                             model="gemini-2.0-flash",
                             max_tokens=512,
                         )
-                    await asyncio.sleep(0.05)
+                    await _drain_writes()
 
                 asyncio.run(_run())
 
         assert len(captured) == 3
-        assert [d["turn_number"] for d in captured] == [1, 2, 3]
+        # Sorted, not as captured: the three writes run concurrently in the
+        # default thread pool, so arrival order is not assignment order.
+        # The property under test is that each call takes the next number,
+        # which is decided on the event loop before the task is spawned.
+        assert sorted(d["turn_number"] for d in captured) == [1, 2, 3]
 
 # ---------------------------------------------------------------------------
 # Circuit breaker

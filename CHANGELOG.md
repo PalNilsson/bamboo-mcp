@@ -96,6 +96,53 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **`tests/test_prompt_log.py`**: a latent flake in
+  `TestLogPromptEnabled::test_turn_number_increments`, plus the fixed sleeps
+  three neighbouring tests shared with it.
+
+  The test asserted `[d["turn_number"] for d in captured] == [1, 2, 3]` over a
+  list appended to by `_write_document`. But `log_prompt` hands the write to
+  `asyncio.create_task` and `_index_and_record` runs it through
+  `asyncio.to_thread`, so three calls produce three concurrent worker threads
+  and `captured` records *arrival* order, not assignment order. `[1, 3, 2]` is
+  a correct outcome. Forcing the interleaving with per-call delays reproduces
+  it on demand and yields `[2, 3, 1]`.
+
+  The production code is right and was not changed. Turn numbers are assigned
+  synchronously on the event loop, before the task is spawned, which is the
+  property the test name describes; the assertion is now `sorted(...)`.
+  Ordering the writes to satisfy the old assertion would mean serialising a
+  path whose entire purpose is to never block the request pipeline.
+
+  The four `await asyncio.sleep(0.05)` calls are replaced by a `_drain_writes`
+  helper that gathers the pending tasks. Awaiting `log_prompt` tells you
+  nothing about whether the document arrived, so the sleep was the test racing
+  the thread pool — fine on an idle laptop, not on a loaded box, and invisible
+  until it is not. Gathering also surfaces an exception in a write task where
+  the sleep swallowed it.
+
+- **`tests/test_async_plugin_available.py`** (new, 2 tests). Fails loudly when
+  `pytest-asyncio` is not loaded.
+
+  Roughly a seventh of this project's tests are `async def` marked with
+  `@pytest.mark.asyncio`. Without the plugin pytest does not error: it collects
+  each one, declines to run it, and reports *"async def functions are not
+  natively supported"* — 229 failures in `tests` and 13 in the plugin suites,
+  across thirty files, none of which names the cause.
+
+  The shape of the damage is what makes it expensive. The failures look like a
+  broad regression and they land in exactly the modules someone is most likely
+  to have just touched: every tool's `call()`, the executor, the planner, the
+  tracing spans, the provider adapters. Nothing in the output distinguishes it
+  from real breakage. Same role `test_mcp_server_api_compat.py` plays for the
+  `mcp` 2.0.0 `Server` removal — an environment fact the suite silently depends
+  on, asserted where the message can be useful.
+
+  The second test is skipped when the plugin is absent rather than run: the
+  `asyncio_mode` ini option is registered by the plugin itself, so asking for
+  it without the plugin raises `ValueError` and turns one clear failure into
+  two, the second pointing at pytest's internals.
+
 - **`docs/developer.md`**: a subsection on stale `*.egg-info` shadowing the
   real entry points, under "Editable installs".
 
