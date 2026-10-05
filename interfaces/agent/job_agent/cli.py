@@ -210,6 +210,51 @@ def quiet_connect_logging(log_level: str) -> "Iterator[None]":
         client_logger.setLevel(previous)
 
 
+def connect_hint(error: str, token: str) -> str:
+    """Return advice for a connect failure, or an empty string.
+
+    A bare ``401 Unauthorized`` is accurate and useless: the server enables
+    auth only when ``BAMBOO_MCP_TOKENS_FILE`` or ``BAMBOO_MCP_TOKENS`` is set,
+    and that is usually set in the *server's* shell by ``bamboo_env.sh``, so
+    the client's shell gives no sign that a token is wanted at all.  Worse,
+    the TUI over stdio never meets the HTTP layer and keeps working, which
+    makes the agent look broken rather than unauthenticated.
+
+    401 and 403 are different problems: the server returns 401 when the
+    ``Authorization`` header is absent and 403 when the token is present but
+    not in the allowlist, so saying "pass a token" to someone who already did
+    would send them the wrong way.
+
+    Args:
+        error: Text of the exception raised by ``connect()``.
+        token: The token the run was given, empty when there was none.
+
+    Returns:
+        A hint to print below the error, or ``""`` when none applies.
+    """
+    if "401" in error:
+        if token:
+            return (
+                "The server rejected the Authorization header. Pass the raw "
+                "token value, not 'Bearer <token>' and not a file path."
+            )
+        return (
+            "The server has Bearer auth enabled and no token was sent.\n"
+            "        Pass --token, or set BAMBOO_MCP_TOKEN in this shell.\n"
+            "        The accepted tokens are whatever BAMBOO_MCP_TOKENS_FILE "
+            "or BAMBOO_MCP_TOKENS\n"
+            "        names in the shell the server was started from "
+            "(tokens file lines are 'client_id: token')."
+        )
+    if "403" in error:
+        return (
+            "The token was sent but is not in the server's allowlist. Check it "
+            "against\n        BAMBOO_MCP_TOKENS_FILE or BAMBOO_MCP_TOKENS on "
+            "the server."
+        )
+    return ""
+
+
 def _clear_progress(quiet: bool) -> None:
     """Drop to a clean line after the last progress update.
 
@@ -448,6 +493,9 @@ async def _run(args: argparse.Namespace, job_ids: list[int]) -> int:
             await client.connect()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         print(f"[ERROR] Could not connect to {cfg.http_url}: {exc}", file=sys.stderr)
+        hint = connect_hint(str(exc), args.token)
+        if hint:
+            print(f"        {hint}", file=sys.stderr)
         return EXIT_CONNECT
 
     try:

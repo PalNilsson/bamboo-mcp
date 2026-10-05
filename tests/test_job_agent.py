@@ -1,659 +1,517 @@
-"""The job agent's loop, driven over the shared log-analysis scenarios.
+"""The job agent's command line: endpoints, job IDs, rendering, exit codes.
 
-``packages/askpanda_atlas/tests/test_log_equivalence.py`` already holds the
-*implementation* functions of the two log-analysis paths to one answer.  This
-module holds the **client loop** to the same standard: it drives
-:func:`interfaces.agent.job_agent.analyse_job` against a test double that
-dispatches to the real primitive tool objects, and compares what comes out
-against ``fetch_and_analyse`` over the same scenario.
+Everything here is testable without a server because the CLI module holds only
+presentation and process concerns — the analysis is
+:mod:`interfaces.agent.job_agent.composer`, and the one place the two meet
+(:func:`~interfaces.agent.job_agent.cli._run`) is replaced in the two tests
+that exercise argument plumbing end to end.
 
-Why the fetch order is asserted
--------------------------------
-An agreeing verdict says the agent arrived where the monolith arrived.  An
-agreeing **download order** says it arrived the documented way — setup log
-first on a 1305 job, the early stop when that setup log reports an error, the
-zero-length skips, the re-plan with ``observed``.  An agent that fetched
-everything unconditionally and classified from the union would pass a verdict
-comparison and fail this one, which is the point: the equivalence that makes
-the composition worth having is a property of *that* loop, not of any loop.
-
-``expect_fetched`` and ``expect_failure_type`` come from ``log_scenarios.py``
-rather than from the monolith, so a rule changed in both paths at once — the
-lockstep-drift failure — still has to be written down in the scenario table
-where it is reviewable.
-
-Loading the scenario table
---------------------------
-By explicit path under a private module name rather than by putting
-``packages/askpanda_atlas/tests`` on ``sys.path``.  The two suites are run as
-separate pytest invocations on purpose; a shared top-level module name across
-both rootdirs is exactly what breaks that.
+The exit-code contract is the part worth pinning: an operator script reacts to
+the number, not to the prose, and the difference between "a job broke" and "a
+job had nothing to show" is the difference between paging someone and not.
 """
 from __future__ import annotations
 
-import asyncio
-import importlib.util
 import json
-import pathlib
-import sys
 from typing import Any
 
 import pytest
 
-from askpanda_atlas import log_analysis_impl as mono
-from askpanda_atlas import log_primitives_impl as impl
-from interfaces.agent.job_agent import composer
+from interfaces.agent.job_agent import cli
 from interfaces.agent.job_agent.composer import (
-    MAX_PLAN_CALLS,
     OUTCOME_ANALYSED,
+    OUTCOME_ERROR,
     OUTCOME_NO_LOGS,
-    analyse_job,
-    analyse_jobs,
-    build_synthesis_brief,
-    missing_primitives,
+    JobAnalysisResult,
 )
 
+
+def _result(
+    job_id: int = 6799893074,
+    outcome: str = OUTCOME_ANALYSED,
+    **overrides: Any,
+) -> JobAnalysisResult:
+    """Build a completed result for the renderers.
+
+    Args:
+        job_id: The job ID.
+        outcome: The outcome.
+        **overrides: Attributes to set afterwards.
+
+    Returns:
+        The result.
+    """
+    result = JobAnalysisResult(
+        job_id=job_id,
+        outcome=outcome,
+        metadata={
+            "monitor_url": f"https://bigpanda.cern.ch/job?pandaid={job_id}",
+            "piloterrorcode": 1305,
+            "piloterrordiag": "Payload execution failed",
+            "jobstatus": "failed",
+            "computingsite": "CERN-PROD",
+            "atlasrelease": "21.0.15",
+            "jeditaskid": 12345678,
+            "attemptnr": 2,
+            "maxattempt": 5,
+            "pilot_version_from_pilotid": "3.14.0.22",
+        },
+        plans=[{"strategy": "payload_1305", "next": [], "done": True}],
+        fetched=[{
+            "filename": "payload.stdout",
+            "role": "primary",
+            "available": True,
+            "url": "https://bigpanda.cern.ch/filebrowser/?filename=payload.stdout",
+            "pilot_version": "",
+        }],
+        verdict={
+            "failure_type": "payload_error",
+            "context": {
+                "excerpt": "Segmentation fault",
+                "exception": {"exc_type": "ValueError"},
+                "traceback_count": 1,
+            },
+        },
+        fetch_order=["payload.stdout"],
+        answer_markdown="The payload segfaulted.",
+        tool_calls=4,
+        llm_calls=1,
+        elapsed_s=1.5,
+    )
+    for key, value in overrides.items():
+        setattr(result, key, value)
+    return result
+
+
 # ---------------------------------------------------------------------------
-# Scenario table
+# Endpoint resolution
 # ---------------------------------------------------------------------------
 
-_SCENARIOS_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "packages" / "askpanda_atlas" / "tests" / "log_scenarios.py"
-)
+def test_url_beats_host_and_port() -> None:
+    """``--url`` is the only form that can carry TLS or a custom path."""
+    assert cli.resolve_url("https://host/x/mcp", "other", 9000) == "https://host/x/mcp"
 
-if not _SCENARIOS_PATH.is_file():  # pragma: no cover - fixture tree absent
-    pytest.skip(
-        "askpanda_atlas test fixtures are not present in this checkout",
-        allow_module_level=True,
+
+def test_host_and_port_compose_an_endpoint() -> None:
+    """The ergonomic form builds the usual ``/mcp`` path."""
+    assert cli.resolve_url(None, "aipanda033.cern.ch", 8000) == (
+        "http://aipanda033.cern.ch:8000/mcp"
     )
 
-_SPEC = importlib.util.spec_from_file_location(
-    "_bamboo_job_agent_log_scenarios", _SCENARIOS_PATH
-)
-assert _SPEC is not None and _SPEC.loader is not None
-_SCENARIOS_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _SCENARIOS_MODULE
-_SPEC.loader.exec_module(_SCENARIOS_MODULE)
 
-SCENARIOS: list[Any] = list(_SCENARIOS_MODULE.SCENARIOS)
+def test_either_half_of_host_and_port_falls_back_to_the_other_default() -> None:
+    """Naming one half must not silently fall through to the environment."""
+    assert cli.resolve_url(None, "remote", None) == "http://remote:8000/mcp"
+    assert cli.resolve_url(None, None, 9001) == "http://localhost:9001/mcp"
 
-_JOB_ID = 6799893074
-#: The primitives resolve the base URL themselves through ``get_base_url``,
-#: so the monolith has to be driven with the same one or every URL comparison
-#: fails on the host rather than on the path.
-_BASE_URL = impl.get_base_url()
-_TIMEOUT = 60
 
-#: Evidence key each role's URL lands in on the monolith side.
-_URL_KEY_FOR_ROLE: dict[str, str] = {
-    composer.ROLE_SETUP: "setup_log_url",
-    composer.ROLE_PRIMARY: "log_url",
-    composer.ROLE_SECONDARY: "stderr_url",
-}
+def test_the_environment_is_used_only_when_nothing_was_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``BAMBOO_MCP_HTTP_URL`` is a default, not an override.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
+    monkeypatch.setenv("BAMBOO_MCP_HTTP_URL", "http://env:1234/mcp")
+    assert cli.resolve_url(None, None, None) == "http://env:1234/mcp"
+    assert cli.resolve_url(None, "cli", None) == "http://cli:8000/mcp"
+
+
+def test_the_endpoint_falls_back_to_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no flags and no environment, the local server is assumed.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
+    monkeypatch.delenv("BAMBOO_MCP_HTTP_URL", raising=False)
+    assert cli.resolve_url(None, None, None) == cli.DEFAULT_HTTP_URL
 
 
 # ---------------------------------------------------------------------------
-# Test doubles
+# Job IDs
 # ---------------------------------------------------------------------------
 
-class FakeToolResult:
-    """An MCP ``CallToolResult`` as far as the composer reads one.
+def test_repeated_flags_keep_their_order() -> None:
+    """``--panda-id`` repeats, and the batch runs in the order given."""
+    assert cli.read_job_ids(["3", "1", "2"], None) == [3, 1, 2]
+
+
+def test_duplicate_ids_are_analysed_once() -> None:
+    """A repeat would cost a second full analysis for an identical answer."""
+    assert cli.read_job_ids(["7", "7", "8", "7"], None) == [7, 8]
+
+
+def test_ids_are_read_from_stdin_when_no_flag_was_given() -> None:
+    """Piped input is the batch form that composes with other tools."""
+    assert cli.read_job_ids(None, "11\n12\n\n13\n") == [11, 12, 13]
+    assert cli.read_job_ids(None, "21 22\t23") == [21, 22, 23]
+
+
+def test_a_flag_wins_over_stdin() -> None:
+    """Explicit IDs are not merged with whatever happened to be on stdin."""
+    assert cli.read_job_ids(["5"], "99\n") == [5]
+
+
+def test_a_leading_hash_is_tolerated() -> None:
+    """Job IDs pasted from a ticket often arrive as ``#6799893074``."""
+    assert cli.read_job_ids(["#6799893074"], None) == [6799893074]
+
+
+def test_a_non_numeric_id_names_the_offender() -> None:
+    """The error says which value was wrong, not that one of them was."""
+    with pytest.raises(ValueError) as excinfo:
+        cli.read_job_ids(["123", "task-42"], None)
+    assert "task-42" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Exit codes
+# ---------------------------------------------------------------------------
+
+def test_everything_analysed_is_success() -> None:
+    """All jobs analysed exits 0."""
+    assert cli.exit_code([_result(), _result(2)]) == cli.EXIT_OK
+
+
+def test_a_job_without_logs_exits_three() -> None:
+    """Nothing broke; one job simply had nothing to show."""
+    assert cli.exit_code([_result(outcome=OUTCOME_NO_LOGS)]) == cli.EXIT_NO_LOGS
+
+
+def test_an_error_outranks_a_missing_log() -> None:
+    """A run with both reports the breakage, which is the one needing attention."""
+    results = [_result(outcome=OUTCOME_NO_LOGS), _result(2, outcome=OUTCOME_ERROR)]
+    assert cli.exit_code(results) == cli.EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def test_text_output_leads_with_the_job_and_the_verdict() -> None:
+    """The first line answers "which job, and what was wrong"."""
+    out = cli.format_text(_result(), verbose=False)
+    assert "Job 6799893074 — payload_error" in out
+    assert "CERN-PROD" in out
+    assert "1305" in out
+    assert "The payload segfaulted." in out
+    assert "(tools=4, llm=1, 1.50s)" in out
+
+
+def test_text_output_hides_the_excerpt_unless_asked() -> None:
+    """The excerpt can be thousands of characters; ``--verbose`` opts in."""
+    quiet = cli.format_text(_result(), verbose=False)
+    loud = cli.format_text(_result(), verbose=True)
+
+    assert "Segmentation fault" not in quiet
+    assert "Segmentation fault" in loud
+    assert "log excerpt" in loud
+
+
+def test_text_output_marks_a_job_with_no_log_content() -> None:
+    """An operator must not read "unknown" as "we found nothing wrong"."""
+    out = cli.format_text(_result(outcome=OUTCOME_NO_LOGS), verbose=False)
+    assert "no log content" in out
+
+
+def test_text_output_for_a_failed_analysis_shows_why() -> None:
+    """A failed analysis renders its reason rather than an empty fact block."""
+    out = cli.format_text(
+        _result(outcome=OUTCOME_ERROR, error="metadata fetch failed"), verbose=False
+    )
+    assert "ANALYSIS FAILED" in out
+    assert "metadata fetch failed" in out
+
+
+def test_markdown_output_is_the_answer_with_a_heading() -> None:
+    """The form to paste into a ticket."""
+    out = cli.format_markdown(_result())
+    assert out.startswith("## Job 6799893074 — payload_error")
+    assert "[BigPanDA](" in out
+    assert "The payload segfaulted." in out
+
+
+def test_markdown_falls_back_to_a_summary_without_synthesis() -> None:
+    """``--no-synthesis --format markdown`` must not produce an empty document."""
+    out = cli.format_markdown(_result(answer_markdown=""))
+    assert "payload_error" in out
+    assert "payload.stdout" in out
+
+
+def test_json_is_an_object_for_one_job_and_an_array_for_several() -> None:
+    """One job in, one object out; a batch is always an array."""
+    single = json.loads(cli.render([_result()], "json", verbose=False))
+    assert isinstance(single, dict)
+    assert single["job_id"] == 6799893074
+
+    several = json.loads(cli.render([_result(1), _result(2)], "json", verbose=False))
+    assert isinstance(several, list)
+    assert [r["job_id"] for r in several] == [1, 2]
+
+
+def test_jsonl_is_one_object_per_line_whatever_the_batch_size() -> None:
+    """The predictable shape for a pipeline."""
+    out = cli.render([_result(1), _result(2)], "jsonl", verbose=False)
+    lines = out.splitlines()
+    assert len(lines) == 2
+    assert [json.loads(line)["job_id"] for line in lines] == [1, 2]
+
+    assert len(cli.render([_result(1)], "jsonl", verbose=False).splitlines()) == 1
+
+
+def test_every_format_is_renderable() -> None:
+    """No format left unimplemented behind the choices list."""
+    for fmt in cli.FORMATS:
+        assert cli.render([_result()], fmt, verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# Connect hints
+# ---------------------------------------------------------------------------
+
+_401 = "Client error '401 Unauthorized' for url 'http://localhost:8000/mcp'"
+_403 = "Client error '403 Forbidden' for url 'http://localhost:8000/mcp'"
+
+
+def test_a_401_without_a_token_says_how_to_supply_one() -> None:
+    """The common case: auth is on at the server and the client knows nothing of it."""
+    hint = cli.connect_hint(_401, "")
+    assert "--token" in hint
+    assert "BAMBOO_MCP_TOKEN" in hint
+    assert "BAMBOO_MCP_TOKENS_FILE" in hint
+
+
+def test_a_401_with_a_token_does_not_repeat_the_advice() -> None:
+    """Telling someone to pass a token when they did sends them the wrong way."""
+    hint = cli.connect_hint(_401, "some-token")
+    assert "--token" not in hint
+    assert "raw token value" in hint
+
+
+def test_a_403_points_at_the_allowlist_not_at_the_missing_header() -> None:
+    """403 means the token arrived and was refused — a different problem."""
+    hint = cli.connect_hint(_403, "some-token")
+    assert "allowlist" in hint
+    assert "--token" not in hint
+
+
+def test_an_ordinary_connection_failure_gets_no_hint() -> None:
+    """A refused connection is self-explanatory; advice would be noise."""
+    assert cli.connect_hint("All connection attempts failed", "") == ""
+
+
+# ---------------------------------------------------------------------------
+# Connect logging
+# ---------------------------------------------------------------------------
+
+def test_the_rollback_traceback_is_hidden_at_the_default_level() -> None:
+    """Mistyping a port must not produce forty lines of anyio traceback."""
+    import logging
+
+    client_logger = logging.getLogger("interfaces.shared.mcp_client")
+    before = client_logger.level
+
+    with cli.quiet_connect_logging("WARNING"):
+        assert client_logger.level == logging.ERROR
+
+    assert client_logger.level == before
+
+
+def test_an_explicit_log_level_is_honoured() -> None:
+    """``--log-level INFO`` means the operator asked for the detail."""
+    import logging
+
+    client_logger = logging.getLogger("interfaces.shared.mcp_client")
+    before = client_logger.level
+
+    with cli.quiet_connect_logging("INFO"):
+        assert client_logger.level == before
+
+    assert client_logger.level == before
+
+
+def test_the_level_is_restored_after_a_failed_connect() -> None:
+    """The suppression is scoped to the call, including on the error path."""
+    import logging
+
+    client_logger = logging.getLogger("interfaces.shared.mcp_client")
+    before = client_logger.level
+
+    with pytest.raises(RuntimeError):
+        with cli.quiet_connect_logging("WARNING"):
+            raise RuntimeError("connection refused")
+
+    assert client_logger.level == before
+
+
+# ---------------------------------------------------------------------------
+# Parser and main
+# ---------------------------------------------------------------------------
+
+def test_parser_defaults_are_the_documented_ones() -> None:
+    """Defaults match the help text and the module docstring."""
+    args = cli.build_parser().parse_args(["--panda-id", "1"])
+
+    assert args.panda_id == ["1"]
+    assert args.format == "text"
+    assert args.no_synthesis is False
+    assert args.with_listing is False
+    assert args.host is None and args.port is None and args.url is None
+    assert args.timeout is None
+
+
+def test_repeating_the_flag_collects_every_value() -> None:
+    """``action="append"`` rather than ``nargs``, so IDs cannot swallow a flag."""
+    args = cli.build_parser().parse_args(
+        ["--panda-id", "1", "--panda-id", "2", "--no-synthesis"]
+    )
+    assert args.panda_id == ["1", "2"]
+    assert args.no_synthesis is True
+
+
+class _FakeStdin:
+    """A stdin that claims to be a terminal.
 
     Attributes:
-        content: The unstructured content list.
-        structuredContent: The structured payload, or ``None``.
+        text: What :meth:`read` returns.
     """
 
-    def __init__(self, content: Any, structured: Any) -> None:
-        """Store both halves of a tool result.
+    def __init__(self, text: str = "", tty: bool = True) -> None:
+        """Configure the fake.
 
         Args:
-            content: Unstructured content list.
-            structured: Structured payload.
+            text: Text to return from ``read``.
+            tty: What ``isatty`` reports.
         """
-        self.content = content
-        self.structuredContent = structured  # noqa: N815 - the SDK's own spelling
+        self.text = text
+        self._tty = tty
 
-
-class FakeListing:
-    """A ``tools/list`` result carrying only names.
-
-    Attributes:
-        tools: The advertised tool descriptors.
-    """
-
-    def __init__(self, names: list[str]) -> None:
-        """Build a listing from tool names.
-
-        Args:
-            names: Names to advertise.
-        """
-        self.tools = [{"name": name} for name in names]
-
-
-class PrimitiveClient:
-    """MCP client double dispatching to the real primitive tool objects.
-
-    Calls go through the tool classes rather than the bare implementation
-    functions, so the argument coercion, the ``(content, structured)`` tuple
-    and the error payloads are all exercised — everything between the agent
-    and the implementation except the wire itself.
-
-    Attributes:
-        calls: Every ``(name, arguments)`` pair received, in order.
-        llm_text: What ``bamboo_llm_answer`` returns.
-    """
-
-    def __init__(
-        self,
-        *,
-        advertised: list[str] | None = None,
-        llm_text: str = "The payload raised ValueError during stage-in.",
-    ) -> None:
-        """Initialise the double.
-
-        Args:
-            advertised: Names ``list_tools`` reports.  Defaults to the five
-                primitives plus ``bamboo_llm_answer``.
-            llm_text: Text the synthesis call returns.
-        """
-        self._tools: dict[str, Any] = {
-            composer.TOOL_PLAN_FETCH: impl.plan_fetch_tool,
-            composer.TOOL_FETCH_METADATA: impl.fetch_metadata_tool,
-            composer.TOOL_LIST_FILES: impl.list_files_tool,
-            composer.TOOL_FETCH_TEXT: impl.fetch_text_tool,
-            composer.TOOL_CLASSIFY: impl.classify_tool,
-        }
-        self._advertised = (
-            advertised
-            if advertised is not None
-            else [*composer.PRIMITIVE_TOOLS, composer.TOOL_LLM_ANSWER]
-        )
-        self.llm_text = llm_text
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-
-    async def list_tools(self) -> Any:
-        """Return the advertised tool listing.
+    def isatty(self) -> bool:
+        """Report whether this is a terminal.
 
         Returns:
-            A :class:`FakeListing`.
+            The configured value.
         """
-        return FakeListing(self._advertised)
+        return self._tty
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        """Dispatch one tool call to the real primitive.
-
-        Args:
-            name: Tool name.
-            arguments: Tool arguments.
+    def read(self) -> str:
+        """Return the configured text.
 
         Returns:
-            A :class:`FakeToolResult`.
+            The text.
+        """
+        return self.text
+
+
+def test_no_job_ids_prints_help_and_exits_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A usage error is a configuration problem, not an analysis failure.
+
+    Args:
+        monkeypatch: Pytest fixture.
+        capsys: Pytest fixture.
+    """
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+    assert cli.main([]) == cli.EXIT_CONNECT
+    assert "--panda-id" in capsys.readouterr().err + capsys.readouterr().out
+
+
+def test_a_bad_job_id_exits_one_without_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ID is rejected before a session is opened.
+
+    Args:
+        monkeypatch: Pytest fixture.
+        capsys: Pytest fixture.
+    """
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+
+    async def _must_not_run(args: Any, job_ids: list[int]) -> int:
+        """Fail if the runner is reached.
+
+        Args:
+            args: Ignored.
+            job_ids: Ignored.
 
         Raises:
-            RuntimeError: When the name is not one this double serves, with
-                the wording a real server uses so the composer's
-                unknown-tool detection is exercised.
+            AssertionError: Always.
         """
-        self.calls.append((name, dict(arguments)))
-        if name == composer.TOOL_LLM_ANSWER:
-            return FakeToolResult([{"type": "text", "text": self.llm_text}], None)
-        tool = self._tools.get(name)
-        if tool is None:
-            raise RuntimeError(f"Unknown tool: {name}")
-        content, structured = await tool.call(arguments)
-        return FakeToolResult(content, structured)
+        raise AssertionError("must not connect")
 
-    def names_called(self, tool: str) -> int:
-        """Count the calls made to one tool.
+    monkeypatch.setattr(cli, "_run", _must_not_run)
+    assert cli.main(["--panda-id", "oops"]) == cli.EXIT_CONNECT
+    assert "oops" in capsys.readouterr().err
+
+
+def test_main_forwards_the_parsed_ids_and_returns_the_runner_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Argument plumbing from the command line through to the composer.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
+    seen: dict[str, Any] = {}
+
+    async def _capture(args: Any, job_ids: list[int]) -> int:
+        """Record the arguments the runner received.
 
         Args:
-            tool: Tool name.
+            args: Parsed arguments.
+            job_ids: Resolved job IDs.
 
         Returns:
-            The number of calls.
+            A distinctive exit code.
         """
-        return sum(1 for name, _ in self.calls if name == tool)
+        seen["job_ids"] = job_ids
+        seen["format"] = args.format
+        seen["synthesise"] = not args.no_synthesis
+        seen["timeout"] = args.timeout
+        return cli.EXIT_NO_LOGS
+
+    monkeypatch.setattr(cli, "_run", _capture)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+
+    code = cli.main([
+        "--panda-id", "11", "--panda-id", "12",
+        "--format", "jsonl", "--no-synthesis", "--timeout", "30",
+    ])
+
+    assert code == cli.EXIT_NO_LOGS
+    assert seen == {
+        "job_ids": [11, 12],
+        "format": "jsonl",
+        "synthesise": False,
+        "timeout": 30,
+    }
 
 
-def wire(monkeypatch: pytest.MonkeyPatch, module: Any, scenario: Any) -> list[str]:
-    """Patch one module's metadata, listing and download entry points.
-
-    ``log_primitives_impl`` imports the three fetch helpers into its own
-    namespace, so the monolith and the primitives have to be patched
-    separately and each gets its own spy.  One shared spy would record both
-    paths into one list and make the fetch-order comparison meaningless.
-
-    Args:
-        monkeypatch: Pytest fixture.
-        module: ``log_analysis_impl`` or ``log_primitives_impl``.
-        scenario: The scenario supplying the responses.
-
-    Returns:
-        List accumulating the filenames this module downloads, in order.
-    """
-    fetched: list[str] = []
-
-    def _metadata(job_id: int, base_url: str, timeout: int) -> dict[str, Any]:
-        return {"job": scenario.job}
-
-    def _listing(job_id: int, base_url: str, timeout: int) -> list[dict[str, Any]] | None:
-        return scenario.listing()
-
-    def _text(job_id: int, filename: str, base_url: str, timeout: int) -> str | None:
-        fetched.append(filename)
-        return scenario.text_for(filename)
-
-    monkeypatch.setattr(module, "_fetch_metadata", _metadata)
-    monkeypatch.setattr(module, "_fetch_file_listing", _listing)
-    monkeypatch.setattr(module, "_fetch_log_text", _text)
-    return fetched
-
-
-def run_agent(client: PrimitiveClient, **kwargs: Any) -> Any:
-    """Run one analysis synchronously.
-
-    Args:
-        client: The MCP client double.
-        **kwargs: Forwarded to :func:`analyse_job`.
-
-    Returns:
-        The :class:`~interfaces.agent.job_agent.JobAnalysisResult`.
-    """
-    kwargs.setdefault("synthesise", False)
-    return asyncio.run(analyse_job(client, _JOB_ID, **kwargs))
-
-
-# ---------------------------------------------------------------------------
-# The loop, scenario by scenario
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.name)
-def test_agent_reproduces_the_expected_fetch_order(
-    monkeypatch: pytest.MonkeyPatch, scenario: Any
-) -> None:
-    """The agent downloads exactly the files the scenario table pins, in order.
-
-    Args:
-        monkeypatch: Pytest fixture.
-        scenario: One row of the scenario table.
-    """
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    assert result.error is None, result.error
-    assert result.fetch_order == list(scenario.expect_fetched)
-
-
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.name)
-def test_agent_reaches_the_expected_verdict(
-    monkeypatch: pytest.MonkeyPatch, scenario: Any
-) -> None:
-    """The agent's classification matches the scenario table.
-
-    Args:
-        monkeypatch: Pytest fixture.
-        scenario: One row of the scenario table.
-    """
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    assert result.failure_type == scenario.expect_failure_type
-
-
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.name)
-def test_agent_evidence_agrees_with_the_monolith(
-    monkeypatch: pytest.MonkeyPatch, scenario: Any
-) -> None:
-    """``to_evidence`` agrees with ``fetch_and_analyse`` key by key.
-
-    The comparison is restricted to the roles the agent actually downloaded:
-    ``_fetch_logs_payload`` assigns ``log_url`` before it knows whether it
-    will read ``payload.stdout``, so the monolith can link a file neither path
-    read.  ``context.exception.raw`` is excluded for the same documented
-    reason — it is capped at the tool boundary and whole in the monolith.
-
-    Args:
-        monkeypatch: Pytest fixture.
-        scenario: One row of the scenario table.
-    """
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-    evidence = result.to_evidence()
-
-    wire(monkeypatch, mono, scenario)
-    reference: dict[str, Any] = mono.fetch_and_analyse(_JOB_ID, _BASE_URL, _TIMEOUT)[
-        "evidence"
-    ]
-
-    roles = {str(entry.get("role") or "") for entry in result.fetched}
-
-    assert evidence["failure_type"] == reference["failure_type"]
-    assert evidence["log_excerpt"] == (reference["log_excerpt"] or "")
-    assert evidence["exception_type"] == reference["exception_type"]
-    assert evidence["traceback_count"] == reference["traceback_count"]
-    assert evidence["pilot_version"] == (reference["pilot_version"] or "")
-    assert evidence["log_available"] == reference["log_available"]
-
-    for role, key in _URL_KEY_FOR_ROLE.items():
-        if role in roles and reference[key]:
-            assert evidence[key] == reference[key]
-
-
-@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s.name)
-def test_agent_stays_within_the_plan_call_bound(
-    monkeypatch: pytest.MonkeyPatch, scenario: Any
-) -> None:
-    """No scenario costs more than the documented three ``plan_fetch`` calls.
-
-    Args:
-        monkeypatch: Pytest fixture.
-        scenario: One row of the scenario table.
-    """
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-    run_agent(client)
-
-    assert client.names_called(composer.TOOL_PLAN_FETCH) <= MAX_PLAN_CALLS
-
-
-# ---------------------------------------------------------------------------
-# Loop shape
-# ---------------------------------------------------------------------------
-
-def _scenario(name: str) -> Any:
-    """Return one scenario by name.
-
-    Args:
-        name: The scenario's ``name`` field.
-
-    Returns:
-        The scenario.
-    """
-    return _SCENARIOS_MODULE.by_name(name)
-
-
-def test_the_agent_passes_filename_and_role_through_untouched(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every ``fetch_text`` argument pair came from a plan entry verbatim.
-
-    The role sets the character budget server-side, so an agent that
-    normalised, defaulted or re-derived it would silently change how much of
-    each log is read.
+def test_ids_piped_in_reach_the_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``cut -f1 jobs.tsv | python -m interfaces.agent.job_agent`` works.
 
     Args:
         monkeypatch: Pytest fixture.
     """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-    result = run_agent(client)
+    seen: dict[str, Any] = {}
 
-    offered: set[tuple[str, str]] = set()
-    for plan in result.plans:
-        for entry in plan.get("next") or []:
-            offered.add((str(entry["filename"]), str(entry["role"])))
+    async def _capture(args: Any, job_ids: list[int]) -> int:
+        """Record the job IDs.
 
-    for name, args in client.calls:
-        if name == composer.TOOL_FETCH_TEXT:
-            assert (str(args["filename"]), str(args["role"])) in offered
+        Args:
+            args: Ignored.
+            job_ids: Resolved job IDs.
 
+        Returns:
+            Success.
+        """
+        seen["job_ids"] = job_ids
+        return cli.EXIT_OK
 
-def test_the_agent_feeds_back_signals_rather_than_recomputing_them(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The re-plan's ``observed`` carries the signals the fetch returned.
+    monkeypatch.setattr(cli, "_run", _capture)
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin("101\n102\n", tty=False))
 
-    ``plan_fetch`` counts the presence of ``setup_has_error`` as "the setup
-    log has been read", so a caller that dropped or synthesised the key would
-    change which files the next plan offers.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = _scenario("payload_1305_stdout_and_stderr")
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-    run_agent(client)
-
-    replans = [
-        args for name, args in client.calls
-        if name == composer.TOOL_PLAN_FETCH and "observed" in args
-    ]
-    assert replans, "a clean 1305 setup log must trigger exactly one re-plan"
-
-    observed = replans[0]["observed"]
-    assert observed["fetched"] == ["setup.stdout"]
-    assert observed.get(impl.SETUP_SIGNAL) is False
-
-
-def test_classify_receives_the_metadata_subset_unmodified(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``classify`` is handed the metadata payload exactly as it arrived.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-    result = run_agent(client)
-
-    classify_args = [
-        args for name, args in client.calls if name == composer.TOOL_CLASSIFY
-    ]
-    assert len(classify_args) == 1
-    assert classify_args[0]["job"] == result.metadata
-    assert classify_args[0]["fetched"] == result.fetched
-
-
-def test_a_metadata_only_job_downloads_nothing_and_reports_no_logs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A job that is not failed, holding or cancelled is classified from metadata.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = _scenario("metadata_only_finished_job")
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    assert result.fetch_order == []
-    assert result.strategy == "metadata_only"
-    assert result.outcome == OUTCOME_NO_LOGS
-    assert result.log_available is False
-
-
-def test_a_job_with_readable_logs_reports_analysed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A normal failed job with a readable log comes back ``analysed``.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = _scenario("pilotlog_stagein_timeout")
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    assert result.outcome == OUTCOME_ANALYSED
-    assert result.log_available is True
-    assert result.fetch_order == ["pilotlog.txt"]
-
-
-def test_the_listing_is_only_fetched_when_asked_for(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``atlas.log.list_files`` is off the diagnosis path and opt-in.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-
-    default_client = PrimitiveClient()
-    default_result = run_agent(default_client)
-    assert default_client.names_called(composer.TOOL_LIST_FILES) == 0
-    assert default_result.listing is None
-
-    listing_client = PrimitiveClient()
-    listing_result = run_agent(listing_client, with_listing=True)
-    assert listing_client.names_called(composer.TOOL_LIST_FILES) == 1
-    assert listing_result.listing is not None
-
-
-# ---------------------------------------------------------------------------
-# Synthesis
-# ---------------------------------------------------------------------------
-
-def test_synthesis_is_one_call_and_off_by_request(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Synthesis costs exactly one LLM call, and ``--no-synthesis`` costs none.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-
-    quiet = PrimitiveClient()
-    quiet_result = run_agent(quiet, synthesise=False)
-    assert quiet.names_called(composer.TOOL_LLM_ANSWER) == 0
-    assert quiet_result.llm_calls == 0
-    assert quiet_result.answer_markdown == ""
-
-    loud = PrimitiveClient(llm_text="Because the payload crashed.")
-    loud_result = run_agent(loud, synthesise=True)
-    assert loud.names_called(composer.TOOL_LLM_ANSWER) == 1
-    assert loud_result.llm_calls == 1
-    assert loud_result.answer_markdown == "Because the payload crashed."
-
-
-def test_the_brief_carries_the_excerpt_and_names_no_absent_field(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The synthesis brief holds the evidence and omits empty metadata fields.
-
-    An evidence brief padded with blank fields teaches the model that blanks
-    are normal, which is how an answer starts inventing values for them.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = _scenario("pilotlog_stagein_timeout")
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    brief = build_synthesis_brief(result)
-    assert f"PanDA job {_JOB_ID}" in brief
-    assert result.failure_type in brief
-    assert "pilotlog.txt" in brief
-    assert (result.verdict["context"]["excerpt"] or "") in brief
-    assert ": None" not in brief
-    assert ": \n" not in brief
-
-
-def test_the_synthesis_payload_is_a_system_and_user_message_pair(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``bamboo_llm_answer`` is called with the house message shape.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-    run_agent(client, synthesise=True, max_tokens=512, temperature=0.3)
-
-    calls = [args for name, args in client.calls if name == composer.TOOL_LLM_ANSWER]
-    assert len(calls) == 1
-    messages = calls[0]["messages"]
-    assert [m["role"] for m in messages] == ["system", "user"]
-    assert calls[0]["max_tokens"] == 512
-    assert calls[0]["temperature"] == 0.3
-
-
-# ---------------------------------------------------------------------------
-# Batch
-# ---------------------------------------------------------------------------
-
-def test_a_batch_reuses_one_session_and_keeps_job_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Several jobs analysed in order over a single client.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-    client = PrimitiveClient()
-
-    job_ids = [_JOB_ID, _JOB_ID + 1, _JOB_ID + 2]
-    results = asyncio.run(analyse_jobs(client, job_ids, synthesise=False))
-
-    assert [r.job_id for r in results] == job_ids
-    assert all(r.error is None for r in results)
-
-
-# ---------------------------------------------------------------------------
-# Preflight and result shapes
-# ---------------------------------------------------------------------------
-
-def test_preflight_reports_primitives_the_server_does_not_advertise() -> None:
-    """A server advertising only the monolith reports all five as missing."""
-    client = PrimitiveClient(advertised=["panda_log_analysis", "bamboo_health"])
-    assert asyncio.run(missing_primitives(client)) == list(composer.PRIMITIVE_TOOLS)
-
-
-def test_preflight_is_silent_when_the_listing_cannot_be_read() -> None:
-    """An unreadable listing is "we could not ask", not "they are absent"."""
-
-    class _Broken:
-        """A client whose listing call fails."""
-
-        async def list_tools(self) -> Any:
-            """Fail the way a disconnected session does.
-
-            Raises:
-                RuntimeError: Always.
-            """
-            raise RuntimeError("no session")
-
-        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-            """Unused.
-
-            Args:
-                name: Ignored.
-                arguments: Ignored.
-
-            Raises:
-                AssertionError: Always; the preflight must not call a tool.
-            """
-            raise AssertionError("preflight must not call tools")
-
-    assert asyncio.run(missing_primitives(_Broken())) == []
-
-
-def test_to_dict_round_trips_through_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The serialised result is JSON-compatible as written.
-
-    Args:
-        monkeypatch: Pytest fixture.
-    """
-    scenario = SCENARIOS[0]
-    wire(monkeypatch, impl, scenario)
-    result = run_agent(PrimitiveClient())
-
-    payload = json.loads(json.dumps(result.to_dict()))
-    assert payload["job_id"] == _JOB_ID
-    assert payload["failure_type"] == result.failure_type
-    assert payload["fetch_order"] == result.fetch_order
-    assert payload["evidence"]["failure_type"] == result.failure_type
+    assert cli.main([]) == cli.EXIT_OK
+    assert seen["job_ids"] == [101, 102]

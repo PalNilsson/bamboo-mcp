@@ -96,6 +96,21 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **`interfaces/agent/job_agent/cli.py`**: a bare `401 Unauthorized` on connect
+  now says what to do about it.
+
+  The server enables Bearer auth only when `BAMBOO_MCP_TOKENS_FILE` or
+  `BAMBOO_MCP_TOKENS` is set, and that is normally set in the *server's* shell
+  by `bamboo_env.sh` — so the client's shell gives no sign a token is wanted.
+  The TUI over stdio never meets the HTTP layer and keeps working, which makes
+  the agent look broken rather than unauthenticated.
+
+  401 and 403 get different advice: the server returns 401 when the
+  `Authorization` header is absent and 403 when the token is present but not
+  in the allowlist, so telling someone to pass a token when they already did
+  would send them the wrong way. An ordinary refused connection gets no hint,
+  because it needs none.
+
 - **`core/bamboo/core.py`**: the `ListToolsResult` construction no longer
   depends on how a type checker narrows an unresolved symbol.
 
