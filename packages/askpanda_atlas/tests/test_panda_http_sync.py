@@ -17,7 +17,13 @@ import askpanda_atlas._fallback_http as fallback_http
 # Helpers
 # ---------------------------------------------------------------------------
 
-PUBLIC_FUNCTIONS = ["get_base_url", "fetch_jsonish", "job_counts_from_payload", "datasets_summary"]
+PUBLIC_FUNCTIONS = [
+    "get_base_url",
+    "fetch_jsonish",
+    "job_counts_from_payload",
+    "datasets_summary",
+    "panda_monitor_headers",
+]
 
 
 def _public_names(module) -> set[str]:

@@ -630,6 +630,21 @@ Exit codes: `0` every job analysed, `1` could not connect or the arguments
 were unusable, `2` a job failed to analyse, `3` no job failed but at least one
 had no log content.  An error outranks a missing log.
 
+### BigPanDA requires a token
+
+Every log file and file listing comes from BigPanDA's filebrowser, which now
+answers an unauthenticated request with `401` and
+`{"error": "No token provided"}`. Set `PANDA_MONITOR_TOKEN` in the server's
+environment; `PANDA_MONITOR_TOKEN_SCHEME` overrides the `Bearer` prefix for a
+deployment that wants the raw value.
+
+Without it the loop still runs and still produces a verdict — `classify`
+reaches one from `piloterrordiag` alone — so the failure does not look like a
+failure. What distinguishes it is `fetch_text`'s note, which names the status
+and the variable rather than saying the file may not exist, and
+`log_available: false` with no 404 behind it. Treat a run where every job
+reports no log as an authentication problem until proved otherwise.
+
 ### Which profile to run the server under
 
 None of them is required.  `BAMBOO_TOOL_PROFILE` gates `tools/list` and not

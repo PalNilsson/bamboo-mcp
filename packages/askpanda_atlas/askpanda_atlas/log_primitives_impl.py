@@ -138,6 +138,7 @@ from askpanda_atlas.log_analysis_impl import (
     FailureContext,
     _fetch_file_listing,
     _fetch_log_text,
+    _log_failure_reason,
     _fetch_metadata,
     _file_is_nonempty,
     _log_file_url,
@@ -1521,6 +1522,33 @@ def _file_context(
     return context
 
 
+def _unavailable_note(job_id: int, filename: str, base_url: str) -> str:
+    """Describe why a log file could not be read.
+
+    The note used to say "it may not exist" whatever had happened, so a 404,
+    an expired credential and a read timeout were indistinguishable to anyone
+    reading the result.  That is how BigPanDA's filebrowser beginning to
+    require a token presented, for an unknown length of time, as jobs simply
+    having no logs.
+
+    Falls back to the old wording when no cause was recorded, which is the
+    honest answer: nothing failed that we know of, so the file probably is
+    absent.
+
+    Args:
+        job_id: PanDA job ID.
+        filename: The file that could not be read.
+        base_url: BigPanDA base URL.
+
+    Returns:
+        The note to attach to the fetch result.
+    """
+    reason = _log_failure_reason(job_id, filename, base_url)
+    if reason:
+        return f"{filename} could not be downloaded: {reason}"
+    return f"{filename} could not be downloaded; it may not exist."
+
+
 def fetch_text(
     job_id: int,
     filename: str,
@@ -1612,7 +1640,7 @@ def fetch_text(
     if not text:
         notes.append(
             f"{filename} is empty." if text == ""
-            else f"{filename} could not be downloaded; it may not exist."
+            else _unavailable_note(job_id, filename, base_url)
         )
         result.update({
             "available": False,

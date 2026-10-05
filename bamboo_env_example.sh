@@ -12,6 +12,20 @@ export PANDA_BASE_URL="https://bigpanda.cern.ch"
 export ASKPANDA_PANDA_RETRIES="2"
 export ASKPANDA_PANDA_BACKOFF_SECONDS="0.8"
 
+# Access token for BigPanDA. REQUIRED for any log analysis: the filebrowser
+# endpoint that serves job log files and file listings now answers an
+# unauthenticated request with HTTP 401 and {"error": "No token provided"}.
+#
+# Without it, panda_log_analysis and the atlas.log.* primitives still return a
+# verdict — classified from piloterrordiag alone — and say so in
+# log_unavailable_reason. Set it, or every analysis is metadata-only.
+# export PANDA_MONITOR_TOKEN="..."
+
+# Authorization scheme for the token above. Defaults to "Bearer", giving
+# "Authorization: Bearer <token>". Set it to an empty string to send the raw
+# token value with no prefix.
+# export PANDA_MONITOR_TOKEN_SCHEME="Bearer"
+
 # Path to the DuckDB file written by the ingestion agent.
 # Used by the panda_jobs_query tool (atlas.jobs_query).
 # Defaults to "jobs.duckdb" in the current working directory if unset.

@@ -11,9 +11,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests  # type: ignore[import]
 
 from askpanda_atlas._cache import (  # type: ignore[import]
     METADATA_TTL,
+    LOG_MISSING_TTL,
     LOG_TTL,
     _MISS,
     _get,
@@ -22,6 +24,7 @@ from askpanda_atlas._cache import (  # type: ignore[import]
     cached_fetch_log,
     clear,
     invalidate,
+    last_log_failure,
     stats,
 )
 
@@ -317,25 +320,137 @@ def test_cached_fetch_log_returns_none_for_404() -> None:
     mock_get.assert_called_once()  # 404 result is cached — no second request
 
 
-def test_cached_fetch_log_none_persists_across_time(
+def test_cached_fetch_log_404_expires_and_is_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cached None (404) for a log is never re-fetched, even after a long time."""
+    """A 404 is cached briefly, not forever.
+
+    A job that has just failed may not have had its log tarball uploaded yet.
+    Under the old infinite TTL the first premature look decided the answer for
+    the lifetime of the process, so a log that appeared a minute later was
+    never seen.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
     url = "https://bigpanda.cern.ch/filebrowser/?pandaid=45&json&filename=gone.txt"
     mock_resp = MagicMock()
     mock_resp.status_code = 404
 
-    with patch("requests.get", return_value=mock_resp):
+    with patch("requests.get", return_value=mock_resp) as first:
         cached_fetch_log(url)
+        cached_fetch_log(url)
+    first.assert_called_once()      # within the window, still cached
 
     original = time.monotonic
-    monkeypatch.setattr(time, "monotonic", lambda: original() + 3.15e8)
+    monkeypatch.setattr(time, "monotonic", lambda: original() + LOG_MISSING_TTL + 1)
 
-    with patch("requests.get", return_value=mock_resp) as mock_get2:
-        result = cached_fetch_log(url)
+    with patch("requests.get", return_value=mock_resp) as second:
+        assert cached_fetch_log(url) is None
+    second.assert_called_once()     # window passed — asked again
 
-    assert result is None
-    mock_get2.assert_not_called()   # infinite TTL — never re-fetched
+
+def test_an_unauthorized_log_is_never_cached() -> None:
+    """A 401 must not decide this URL's answer for the process lifetime.
+
+    BigPanDA's filebrowser began requiring a token, and under the old policy
+    every log URL attempted before the token was configured kept returning
+    "no log" until the server was restarted — indistinguishable from a job
+    that genuinely has none.
+    """
+    url = "https://bigpanda.cern.ch/filebrowser/?pandaid=47&json&filename=pilotlog.txt"
+    denied = MagicMock()
+    denied.status_code = 401
+    denied.raise_for_status.side_effect = requests.HTTPError(
+        "401 Client Error: Unauthorized", response=denied
+    )
+
+    with patch("requests.get", return_value=denied) as calls:
+        assert cached_fetch_log(url) is None
+        assert cached_fetch_log(url) is None
+    assert calls.call_count == 2     # retried, not pinned
+
+
+def test_the_reason_for_a_failure_is_recoverable() -> None:
+    """``last_log_failure`` explains an empty result without re-fetching."""
+    url = "https://bigpanda.cern.ch/filebrowser/?pandaid=48&json&filename=pilotlog.txt"
+    denied = MagicMock()
+    denied.status_code = 401
+    denied.raise_for_status.side_effect = requests.HTTPError(
+        "401 Client Error: Unauthorized", response=denied
+    )
+
+    with patch("requests.get", return_value=denied):
+        assert cached_fetch_log(url) is None
+
+    failure = last_log_failure(url)
+    assert failure.status == 401
+    assert "PANDA_MONITOR_TOKEN" in failure.reason
+
+
+def test_a_success_clears_an_earlier_failure_reason() -> None:
+    """Once the file is readable, the stale reason must not linger."""
+    url = "https://bigpanda.cern.ch/filebrowser/?pandaid=49&json&filename=pilotlog.txt"
+    denied = MagicMock()
+    denied.status_code = 401
+    denied.raise_for_status.side_effect = requests.HTTPError(
+        "401 Client Error: Unauthorized", response=denied
+    )
+    with patch("requests.get", return_value=denied):
+        cached_fetch_log(url)
+    assert last_log_failure(url).reason
+
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.text = "log content"
+    ok.raise_for_status = MagicMock()
+    with patch("requests.get", return_value=ok):
+        assert cached_fetch_log(url) == "log content"
+
+    assert last_log_failure(url).reason == ""
+
+
+def test_no_token_configured_sends_no_authorization_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfigured deployment behaves exactly as it did before.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
+    monkeypatch.delenv("PANDA_MONITOR_TOKEN", raising=False)
+    url = "https://bigpanda.cern.ch/filebrowser/?pandaid=50&json&filename=pilotlog.txt"
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.text = "content"
+    ok.raise_for_status = MagicMock()
+
+    with patch("requests.get", return_value=ok) as call:
+        cached_fetch_log(url)
+
+    assert "Authorization" not in call.call_args.kwargs["headers"]
+
+
+def test_a_configured_token_is_sent_as_a_bearer_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token reaches the filebrowser request.
+
+    Args:
+        monkeypatch: Pytest fixture.
+    """
+    monkeypatch.setenv("PANDA_MONITOR_TOKEN", "s3cr3t")
+    monkeypatch.delenv("PANDA_MONITOR_TOKEN_SCHEME", raising=False)
+    url = "https://bigpanda.cern.ch/filebrowser/?pandaid=51&json&filename=pilotlog.txt"
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.text = "content"
+    ok.raise_for_status = MagicMock()
+
+    with patch("requests.get", return_value=ok) as call:
+        cached_fetch_log(url)
+
+    assert call.call_args.kwargs["headers"]["Authorization"] == "Bearer s3cr3t"
 
 
 def test_cached_fetch_log_after_clear_refetches() -> None:

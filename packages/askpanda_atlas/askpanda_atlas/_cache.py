@@ -65,6 +65,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 METADATA_TTL: float = 60.0   # seconds — task and job metadata
 LOG_TTL: float = math.inf     # logs are immutable once written
 
+#: TTL for the recorded *reason* a download failed.  Only the reason is kept
+#: this way, never the failed outcome itself: a caller that wants the file
+#: still re-requests it, while a caller that wants to explain an empty result
+#: can find out why without issuing a second request of its own.
+LOG_REASON_TTL: float = 300.0
+
+#: TTL for a log file the server answered ``404`` for.  Bounded rather than
+#: infinite: a job that has just failed may not have had its log tarball
+#: uploaded yet, and under :data:`LOG_TTL` the first premature look would
+#: decide the answer for the lifetime of the process.
+LOG_MISSING_TTL: float = 300.0
+
 #: User-Agent sent with every request originating from this module.
 USER_AGENT: str = "AskPanDA/1.0"
 
@@ -195,7 +207,168 @@ def cached_fetch_jsonish(
     from askpanda_atlas._fallback_http import fetch_jsonish  # type: ignore[import]
 
     result = fetch_jsonish(url, timeout)
-    _set(url, result, ttl)
+    status = result[0]
+    if 200 <= status < 300:
+        _set(url, result, ttl)
+    else:
+        # Never cache a failure here.  Callers may pass ``math.inf`` — the
+        # file listing does — and a 401 or a 5xx pinned under an infinite TTL
+        # keeps answering for the lifetime of the process long after the
+        # cause is fixed.  Re-asking a failing endpoint is the cheaper
+        # mistake.
+        logger.debug("Not caching non-2xx response (HTTP %d) for %s", status, url)
+    return result
+
+
+@dataclass(frozen=True)
+class LogFetch:
+    """Outcome of one log-file download.
+
+    ``cached_fetch_log`` used to collapse every failure into ``None``, so a
+    missing file, an expired credential and a read timeout were
+    indistinguishable to the caller — which is how a BigPanDA ``401`` spent an
+    afternoon presenting as "the log may not exist".  The reason travels with
+    the result now.
+
+    Attributes:
+        text: Log content, or ``None`` when it could not be read.
+        status: HTTP status code, or ``None`` when the request never got one
+            (a timeout, a DNS failure, a TLS error).
+        reason: Short human-readable cause, empty on success.  Written for
+            whoever reads it in an evidence bundle or a tool note, so it names
+            the thing to go and check.
+    """
+
+    text: str | None
+    status: int | None = None
+    reason: str = ""
+
+
+def _log_failure_reason(status: int | None, detail: str) -> str:
+    """Describe a failed log download in one short phrase.
+
+    Args:
+        status: HTTP status code, or ``None`` when the request never
+            completed.
+        detail: Exception text, used only when there is no status.
+
+    Returns:
+        The reason string for :attr:`LogFetch.reason`.
+    """
+    if status == 404:
+        return "not found (HTTP 404) — the log may not have been uploaded yet"
+    if status in (401, 403):
+        return (
+            f"access denied (HTTP {status}) — BigPanDA requires a token; "
+            f"check PANDA_MONITOR_TOKEN on the server"
+        )
+    if status is not None:
+        return f"download failed (HTTP {status})"
+    return f"download failed: {detail}"
+
+
+def _reason_key(url: str) -> str:
+    """Return the cache key under which a failure reason is recorded.
+
+    Args:
+        url: The log file's URL.
+
+    Returns:
+        The side-channel key, namespaced so it cannot collide with the URL.
+    """
+    return f"logreason:{url}"
+
+
+def last_log_failure(url: str) -> LogFetch:
+    """Return why the most recent download of *url* failed, without re-fetching.
+
+    Reads the cache only.  This exists so a caller that obtained its text
+    through the ordinary :func:`cached_fetch_log` path — and got ``None`` —
+    can still explain itself, without that path having to carry a second
+    return value through every intermediate function.
+
+    Args:
+        url: The log file's URL.
+
+    Returns:
+        The recorded :class:`LogFetch`, or an empty one when nothing is
+        recorded.  An empty reason means "not known here", never "no failure".
+    """
+    recorded = _get(_reason_key(url))
+    if isinstance(recorded, LogFetch):
+        return recorded
+    main = _get(url)
+    if isinstance(main, LogFetch) and main.text is None:
+        return main
+    return LogFetch(None, None, "")
+
+
+def cached_fetch_log_detailed(
+    url: str,
+    timeout: int = 60,
+) -> LogFetch:
+    """Fetch a log file, reporting why when it cannot be read.
+
+    Caching is deliberately asymmetric, because the three outcomes have
+    different lifetimes:
+
+    - **Success** is cached under :data:`LOG_TTL` (``math.inf``).  A log file
+      is immutable once written.
+    - **404** is cached under :data:`LOG_MISSING_TTL`.  "Not uploaded yet" is
+      a state that ends, and an infinite TTL would freeze a premature look
+      into the answer for the whole process.
+    - **Everything else is not cached at all.**  A 401, a 5xx and a timeout
+      are all conditions that get fixed, and the old code pinned them under
+      ``math.inf``: one expired token, or one network blip, and that URL
+      returned "no log" until someone restarted the server — with no way to
+      tell that from a job that genuinely has no log.
+
+    Args:
+        url: Full URL of the log file (filebrowser endpoint).
+        timeout: HTTP timeout in seconds (only used on a cache miss).
+
+    Returns:
+        A :class:`LogFetch` carrying the text, or the status and reason.
+    """
+    cached = _get(url)
+    if cached is not _MISS:
+        return cached  # type: ignore[return-value]
+
+    import requests  # type: ignore[import]
+
+    from askpanda_atlas._fallback_http import (  # type: ignore[import]
+        panda_monitor_headers,
+    )
+
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": USER_AGENT, **panda_monitor_headers()},
+            stream=True,
+        )
+        status: int | None = resp.status_code
+        if status == 404:
+            logger.info("Log file not found (404): %s", url)
+            result = LogFetch(None, status, _log_failure_reason(status, ""))
+            _set(url, result, LOG_MISSING_TTL)
+            return result
+        resp.raise_for_status()
+        result = LogFetch(resp.text, status, "")
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        reason = _log_failure_reason(status, f"{type(exc).__name__}: {exc}")
+        logger.warning("Log download failed for %s: %s", url, exc)
+        # The outcome is not cached — see the docstring; a transient failure
+        # must not decide this URL's answer for the lifetime of the process.
+        # The reason is, briefly, so a caller can say why it has no text.
+        failure = LogFetch(None, status, reason)
+        _set(_reason_key(url), failure, LOG_REASON_TTL)
+        return failure
+
+    _set(url, result, LOG_TTL)
+    with _lock:
+        _store.pop(_reason_key(url), None)
     return result
 
 
@@ -203,50 +376,20 @@ def cached_fetch_log(
     url: str,
     timeout: int = 60,
 ) -> str | None:
-    """Fetch a log file via requests.get, returning the cached result on repeat calls.
+    """Fetch a log file, returning its text only.
 
-    Log files are immutable once written, so hits are cached with
-    :data:`LOG_TTL` (``math.inf``) — they are never re-downloaded within
-    the same process lifetime.
+    Retained for callers that have nothing to do with the reason.  New code
+    should prefer :func:`cached_fetch_log_detailed`, which can say why an
+    empty result is empty.
 
     Args:
         url: Full URL of the log file (filebrowser endpoint).
         timeout: HTTP timeout in seconds (only used on a cache miss).
 
     Returns:
-        Log text as a string, or ``None`` if the file is not found or
-        the download fails.
+        Log text as a string, or ``None`` if it could not be read.
     """
-    cached = _get(url)
-    if cached is not _MISS:
-        return cached  # type: ignore[return-value]
-
-    import logging
-
-    import requests  # type: ignore[import]
-
-    _logger = logging.getLogger(__name__)
-
-    try:
-        resp = requests.get(
-            url,
-            timeout=timeout,
-            headers={"User-Agent": "AskPanDA/1.0"},
-            stream=True,
-        )
-        if resp.status_code == 404:
-            _logger.info("Log file not found (404): %s", url)
-            result: str | None = None
-        else:
-            resp.raise_for_status()
-            result = resp.text
-    except requests.RequestException as exc:
-        _logger.warning("Log download failed for %s: %s", url, exc)
-        result = None
-
-    # Cache even None so we don't hammer a 404 endpoint.
-    _set(url, result, LOG_TTL)
-    return result
+    return cached_fetch_log_detailed(url, timeout).text
 
 
 # ---------------------------------------------------------------------------
@@ -376,11 +519,15 @@ def head_remote_file(
     """
     import requests  # type: ignore[import]
 
+    from askpanda_atlas._fallback_http import (  # type: ignore[import]
+        panda_monitor_headers,
+    )
+
     try:
         resp = requests.head(
             url,
             timeout=timeout,
-            headers={"User-Agent": USER_AGENT},
+            headers={"User-Agent": USER_AGENT, **panda_monitor_headers()},
             allow_redirects=True,
         )
     except requests.RequestException as exc:
@@ -529,9 +676,15 @@ def stream_to_file(
     """
     import requests  # type: ignore[import]
 
+    from askpanda_atlas._fallback_http import (  # type: ignore[import]
+        panda_monitor_headers,
+    )
+
     part = dest.with_name(dest.name + PARTIAL_SUFFIX)
     resume_from = _resume_offset(part, expected_bytes, allow_resume)
-    headers = {"User-Agent": USER_AGENT}
+    # The media endpoint is SSO-gated and answers an unauthenticated request
+    # with a 200 HTML login page, so it is a candidate for the same token.
+    headers = {"User-Agent": USER_AGENT, **panda_monitor_headers()}
     if resume_from:
         headers["Range"] = f"bytes={resume_from}-"
 

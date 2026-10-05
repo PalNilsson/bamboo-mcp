@@ -7,6 +7,41 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Added
+- **BigPanDA access token** (`PANDA_MONITOR_TOKEN`). BigPanDA's filebrowser
+  stopped serving its `&json` form unauthenticated: it now answers `401` with
+  `{"error": "No token provided"}`. That endpoint is the only route to a job's
+  log files and file listing, so **every log analysis in Bamboo had silently
+  become metadata-only** — the TUI, the REST facade, and the monitor's
+  "Analyse failure" button.
+
+  It had gone unnoticed because the failure is shaped like a success.
+  `classify_failure` falls back to `piloterrordiag`, so a stage-in failure
+  still came back `stagein_timeout`; the synthesis LLM then wrote fluent prose
+  around a real error code; and the only hint was a note reading *"it may not
+  exist"*, which is what the code said for every failure including this one.
+  Found only by running the new job agent against live jobs — no test could
+  have caught it, because the suites stub `_fetch_log_text` and the scenario
+  table supplies the text.
+
+  `panda_monitor_headers()` reads the token per call and sends
+  `Authorization: Bearer <token>`, returning an empty mapping when unset so an
+  unconfigured deployment is byte-identical to before.
+  `PANDA_MONITOR_TOKEN_SCHEME` overrides the prefix — empty sends the raw
+  value — because the exact form BigPanDA wants is the one part of this not
+  verifiable from the repository, and a wrong guess should be a configuration
+  change rather than a code change.
+
+  The helper lives in five places, because the HTTP and cache layers are
+  hand-maintained copies: `bamboo.tools._panda_http` (canonical),
+  `askpanda_atlas._fallback_http`, `askpanda_epic._fallback_http`, and both
+  plugins' `_cache`. Three of the five were found by a test going red rather
+  than by anyone remembering they existed, which is why
+  `tests/test_panda_token_parity.py` now pins the credential surface across
+  all of them. The token also goes to `head_remote_file` and `stream_to_file`,
+  whose endpoint is SSO-gated and answers unauthenticated requests with a
+  200 HTML login page.
+
+### Added
 - **`interfaces/agent/job_agent/`** (new package). A deterministic composer
   for the `atlas.log.*` primitives, invoked as
   `python -m interfaces.agent.job_agent --panda-id <id> --host <host> --port <port>`
@@ -96,6 +131,53 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **A failed log download no longer reports itself as an absent file.**
+  `cached_fetch_log` collapsed a 404, a 401, a read timeout and a TLS error
+  into the same `None`, and the note said *"it may not exist"* for all of
+  them. That conflation is what let BigPanDA's new token requirement run
+  undetected.
+
+  New `LogFetch(text, status, reason)` and `cached_fetch_log_detailed` carry
+  the cause. `fetch_text`'s note now reads *"access denied (HTTP 401) —
+  BigPanDA requires a token; check PANDA_MONITOR_TOKEN on the server"*, and
+  `panda_log_analysis`'s evidence gains `log_unavailable_reason`. A 404 keeps
+  the old wording, because for a 404 the old wording is true.
+
+  The reason travels through a short-TTL cache side-channel rather than a
+  second return value. The first attempt threaded it through directly and
+  broke 39 tests: `_fetch_log_text` is the seam every suite patches, and
+  bypassing it sent the equivalence walkthrough at the real network. It is now
+  still the only function that touches HTTP, so a test that stubs it to return
+  `None` gets an empty reason and issues no request — correct, since in that
+  world nothing failed and the fixture simply has no such file.
+
+- **Transient download failures are no longer cached forever.** The comment
+  said *"Cache even None so we don't hammer a 404 endpoint"*, but the code
+  pinned a 401, a 5xx and a timeout under `math.inf` alongside it. Two
+  consequences, both real: once the token is configured a running server would
+  keep answering "no log" for every previously attempted URL until restarted,
+  and a single network blip poisoned that file for the process lifetime.
+
+  Caching is now asymmetric by outcome. Success keeps `LOG_TTL`
+  (`math.inf`) — a written log is immutable. A 404 gets the new
+  `LOG_MISSING_TTL` of 300 s, because a job that has just failed may not have
+  uploaded its tarball yet and an unbounded TTL freezes a premature look into
+  the answer. Everything else is not cached at all. `cached_fetch_jsonish`
+  likewise stops caching non-2xx, which mattered because the file listing
+  passes `math.inf`.
+
+- **An unread log is now disclosed in the answer.** `_SYSTEM_LOG_ANALYSIS` and
+  the job agent's synthesis prompt both require the first sentence to say the
+  log was not read and to give the reason, with the distinction stated
+  outright: a 404 means the job has no log, a 401 means Bamboo was refused and
+  the log exists but was never opened. The agent's brief states it explicitly
+  rather than leaving the model to infer it from an empty excerpt.
+
+  This is the part that let the outage hide. An answer built from metadata
+  alone is not wrong — for a stage-in failure it is often word-for-word what
+  the full analysis would say — but it must not read as though the log had
+  been consulted and found uninformative.
+
 - **`interfaces/agent/job_agent/cli.py`**: a bare `401 Unauthorized` on connect
   now says what to do about it.
 

@@ -327,6 +327,62 @@ def _fetch_log_text(job_id: int, filename: str, base_url: str, timeout: int) -> 
     return cached_fetch_log(url, timeout)
 
 
+def _log_failure_reason(job_id: int, filename: str, base_url: str) -> str:
+    """Return why the last download of one log file failed, without re-fetching.
+
+    Deliberately routed through the cache rather than through a second
+    network call, so that :func:`_fetch_log_text` remains the only function
+    that touches HTTP — and therefore the only seam a test has to patch.  A
+    test that stubs ``_fetch_log_text`` to return ``None`` gets an empty
+    reason here and no request, which is correct: in that world nothing
+    failed, the fixture simply has no such file.
+
+    Args:
+        job_id: PanDA job ID.
+        filename: Log filename that could not be read.
+        base_url: BigPanDA base URL.
+
+    Returns:
+        A short cause, or an empty string when none was recorded.
+    """
+    from askpanda_atlas._cache import last_log_failure  # type: ignore[import]
+
+    return last_log_failure(_log_file_url(job_id, filename, base_url)).reason
+
+
+def _fetch_into(
+    result: "_LogFetchResult",
+    job_id: int,
+    filename: str,
+    base_url: str,
+    timeout: int,
+) -> str | None:
+    """Download one log file and record the first failure reason on *result*.
+
+    The first failure wins rather than the last.  On the payload path the
+    files are fetched in order of diagnostic value, so the reason the most
+    important one could not be read is the one worth reporting; a later
+    ``payload.stderr`` that is merely absent should not overwrite a ``401``
+    on ``payload.stdout``.
+
+    Args:
+        result: The fetch result being built, mutated in place.
+        job_id: PanDA job ID.
+        filename: Log filename to fetch.
+        base_url: BigPanDA base URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        The log text, or ``None`` when it could not be read.
+    """
+    text = _fetch_log_text(job_id, filename, base_url, timeout)
+    if text is None and not result.log_unavailable_reason:
+        reason = _log_failure_reason(job_id, filename, base_url)
+        if reason:
+            result.log_unavailable_reason = f"{filename}: {reason}"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Setup log error detection
 # ---------------------------------------------------------------------------
@@ -1229,6 +1285,7 @@ class _LogFetchResult:
     exception: ExceptionInfo | None = None
     traceback_count: int = 0
     pilot_version: str = ""
+    log_unavailable_reason: str = ""
 
     def to_state(self) -> dict[str, Any]:
         """Return a round-trippable representation of the fetch result.
@@ -1252,6 +1309,7 @@ class _LogFetchResult:
             "exception": self.exception.to_state() if self.exception else None,
             "traceback_count": self.traceback_count,
             "pilot_version": self.pilot_version,
+            "log_unavailable_reason": self.log_unavailable_reason,
         }
 
     @classmethod
@@ -1287,6 +1345,7 @@ class _LogFetchResult:
             exception=exception,
             traceback_count=coerce_int(state.get("traceback_count")),
             pilot_version=coerce_str(state.get("pilot_version")),
+            log_unavailable_reason=coerce_str(state.get("log_unavailable_reason")),
         )
 
 
@@ -1332,7 +1391,7 @@ def _fetch_logs_payload(
     setup_text: str | None = None
     if _file_is_nonempty(file_index, "setup.stdout"):
         result.setup_log_url = _log_file_url(job_id, "setup.stdout", base_url)
-        setup_text = _fetch_log_text(job_id, "setup.stdout", base_url, timeout)
+        setup_text = _fetch_into(result, job_id, "setup.stdout", base_url, timeout)
         if setup_text:
             if _setup_log_has_error(setup_text):
                 setup_ctx = extract_failure_context(
@@ -1364,14 +1423,14 @@ def _fetch_logs_payload(
     result.log_url = _log_file_url(job_id, log_filename, base_url)
     log_text: str | None = None
     if _file_is_nonempty(file_index, log_filename):
-        log_text = _fetch_log_text(job_id, log_filename, base_url, timeout)
+        log_text = _fetch_into(result, job_id, log_filename, base_url, timeout)
     else:
         logger.info("payload.stdout is zero-length for job %d; skipping.", job_id)
 
     stderr_text: str | None = None
     if _file_is_nonempty(file_index, "payload.stderr"):
         result.stderr_url = _log_file_url(job_id, "payload.stderr", base_url)
-        stderr_text = _fetch_log_text(job_id, "payload.stderr", base_url, timeout)
+        stderr_text = _fetch_into(result, job_id, "payload.stderr", base_url, timeout)
     else:
         logger.info("payload.stderr is zero-length for job %d; skipping.", job_id)
 
@@ -1466,7 +1525,7 @@ def _fetch_logs_pilotlog(
 
     log_text: str | None = None
     if _file_is_nonempty(file_index, log_filename):
-        log_text = _fetch_log_text(job_id, log_filename, base_url, timeout)
+        log_text = _fetch_into(result, job_id, log_filename, base_url, timeout)
     else:
         logger.info("%s is zero-length for job %d; skipping.", log_filename, job_id)
 
@@ -1857,6 +1916,7 @@ def fetch_and_analyse(job_id: int, base_url: str, timeout: int) -> dict[str, Any
         "setup_log_url": setup_log_url,
         "setup_log_excerpt": setup_log_excerpt,
         "log_available": log_available,
+        "log_unavailable_reason": fetch_result.log_unavailable_reason or None,
         "log_excerpt": log_excerpt or None,
         "pilot_version": pilot_version or None,
     }

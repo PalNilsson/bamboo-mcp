@@ -513,6 +513,11 @@ _SYSTEM_SYNTHESIS: str = (
     "- When the evidence does not determine the cause, say so plainly and "
     "name what is missing. A confident wrong answer is worse than an "
     "uncertain one.\n"
+    "- When the brief says no log content was read, say so in the first "
+    "sentence and give the reason it states. A log that could not be opened "
+    "and a job that has no log are different findings: the first says nothing "
+    "about the job. Diagnose from the metadata after that if you can, but "
+    "never write as though the log had been read.\n"
     "- Keep it under roughly 300 words. Markdown is fine; no diagrams."
 )
 
@@ -579,6 +584,15 @@ def build_synthesis_brief(result: JobAnalysisResult) -> str:
         lines.append(f"Files read: {', '.join(result.fetch_order)}")
     else:
         lines.append("Files read: none (no log files were downloaded)")
+
+    if not result.log_available:
+        # Stated explicitly rather than left for the model to infer from an
+        # empty excerpt.  "The log was refused" and "the job has no log" are
+        # different findings, and only the notes distinguish them.
+        lines.append("No log content was read for this job.")
+        for note in result.notes:
+            if "could not be downloaded" in note:
+                lines.append(f"Reason: {note}")
 
     context: dict[str, Any] = result.verdict.get("context") or {}
     exception: Any = context.get("exception")

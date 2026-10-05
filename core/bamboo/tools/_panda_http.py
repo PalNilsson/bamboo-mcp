@@ -27,6 +27,50 @@ def get_base_url() -> str:
     return os.getenv("PANDA_BASE_URL", "https://bigpanda.cern.ch").rstrip("/")
 
 
+#: Environment variable holding the BigPanDA access token.
+ENV_MONITOR_TOKEN: str = "PANDA_MONITOR_TOKEN"
+
+#: Environment variable overriding the Authorization scheme.  Set it to an
+#: empty string to send the token value bare, with no scheme prefix.
+ENV_MONITOR_TOKEN_SCHEME: str = "PANDA_MONITOR_TOKEN_SCHEME"
+
+#: Scheme used when :data:`ENV_MONITOR_TOKEN_SCHEME` is unset.
+DEFAULT_MONITOR_TOKEN_SCHEME: str = "Bearer"
+
+
+def panda_monitor_headers() -> dict[str, str]:
+    """Return the Authorization header for BigPanDA, or an empty mapping.
+
+    BigPanDA's filebrowser endpoint used to serve its ``&json`` form
+    unauthenticated.  It no longer does: an unauthenticated request now gets
+    ``401`` with ``{"error": "No token provided"}``, which means no log file
+    and no file listing can be read without a credential.
+
+    Read from the environment on every call rather than captured at import,
+    so a token can be supplied or rotated without reaching into module state,
+    and so a test can set one with ``monkeypatch.setenv``.
+
+    The scheme is configurable because the exact form BigPanDA expects is the
+    one part of this that is not verifiable from here: ``Bearer <token>``
+    covers the usual case, and setting
+    :data:`ENV_MONITOR_TOKEN_SCHEME` to an empty string sends the raw value
+    for a deployment that wants the token unprefixed.  Getting it wrong is
+    then a configuration change rather than a code change.
+
+    Returns:
+        ``{"Authorization": ...}`` when a token is configured, otherwise an
+        empty dict — so an unconfigured deployment behaves exactly as before
+        and callers can always splat the result into their headers.
+    """
+    token: str = os.getenv(ENV_MONITOR_TOKEN, "").strip()
+    if not token:
+        return {}
+    scheme: str = os.getenv(
+        ENV_MONITOR_TOKEN_SCHEME, DEFAULT_MONITOR_TOKEN_SCHEME
+    ).strip()
+    return {"Authorization": f"{scheme} {token}" if scheme else token}
+
+
 def fetch_jsonish(
     url: str,
     timeout: int = 30,
@@ -50,7 +94,11 @@ def fetch_jsonish(
     resp = requests.get(
         url,
         timeout=timeout,
-        headers={"Accept": "application/json", "User-Agent": "AskPanDA/1.0"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "AskPanDA/1.0",
+            **panda_monitor_headers(),
+        },
         allow_redirects=True,
     )
     status = resp.status_code
