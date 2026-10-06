@@ -394,13 +394,63 @@ SCENARIOS: tuple[LogScenario, ...] = (
         name="payload_1305_no_usable_logs",
         pins=(
             "Every file zero-length: nothing is downloaded, and both paths "
-            "classify from metadata alone rather than reporting an error."
+            "classify from metadata alone rather than reporting an error.  "
+            "The diag says nothing a pattern matches, so the verdict comes "
+            "from pilot error 1305 itself — the job failed in its payload, "
+            "and only the reason is missing.  This used to be 'unknown', "
+            "which reads as 'nothing identifiable was wrong' rather than "
+            "'we could not look'."
         ),
         job=_job(diag="Payload failed with an unknown error"),
         texts={},
         sizes={SETUP_LOG: 0, PAYLOAD_STDOUT: 0, PAYLOAD_STDERR: 0},
         expect_fetched=(),
-        expect_failure_type="unknown",
+        expect_failure_type="payload_error",
+    ),
+    LogScenario(
+        name="metadata_only_remote_file_1361",
+        pins=(
+            "Pilot error 1361 with no readable log.  The diag — 'Remote file "
+            "could not be opened' — matches no pattern in the table, and "
+            "before the code fallback existed this job reported 'unknown' "
+            "despite the pilot having stated exactly what went wrong."
+        ),
+        job=_job(
+            code=1361,
+            diag=(
+                "Remote file could not be opened:Remote file(s) could not be "
+                "opened: ['root://eos.example.org:1094//atlasdatadisk/"
+                "DAOD_PHYS.34870879._000004.pool.root.1']"
+            ),
+        ),
+        texts={},
+        sizes={PILOT_LOG: 0},
+        expect_fetched=(),
+        expect_failure_type="stagein_failed",
+    ),
+    LogScenario(
+        name="metadata_only_network_unreachable_1324",
+        pins=(
+            "'Network is unreachable' is the POSIX ENETUNREACH string and is "
+            "what XRootD reports.  The table only held the bare 'network "
+            "unreachable' spelling, so the one intervening word sent every "
+            "such job to 'unknown'.  1324 is deliberately not in the code "
+            "table — it spans stage-in and stage-out — so this row pins the "
+            "text match rather than the fallback."
+        ),
+        job=_job(
+            code=1324,
+            diag=(
+                "Service not available at the moment: TXT.43313123._000252."
+                "tar.gz.1 from EXAMPLE_DATADISK, Error on XrdCl:CopyProcess:"
+                "Run(): [ERROR] Server responded with an error: [3014] Unable "
+                "to open file; Network is unreachable (source)')]:fail"
+            ),
+        ),
+        texts={},
+        sizes={PILOT_LOG: 0},
+        expect_fetched=(),
+        expect_failure_type="network",
     ),
     LogScenario(
         name="listing_unavailable_fails_open",

@@ -131,6 +131,37 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **Classification falls back to the pilot error code instead of giving up.**
+  `classify_failure` was substring matching over `piloterrordiag` and the log
+  excerpt and nothing else, which fails two ways that look identical from the
+  answer. The diag is free text the pilot writes, so a phrasing off by one
+  word stops matching; and when no log can be read, the diag is the only text
+  there is. Both produced `"unknown"`, which an operator reads as "nothing
+  identifiable was wrong" rather than "we could not look".
+
+  Found on three live jobs analysed on 2026-10-05. Pilot error 1361 ("Remote
+  file could not be opened") matched nothing at all. Pilot error 1324 carried
+  **"Network is unreachable"** — the POSIX `ENETUNREACH` string, and what
+  XRootD reports — against a table entry reading `"network unreachable"`: one
+  intervening word, and every job that hit it went to `unknown`.
+
+  `_PILOT_CODE_CATEGORIES` maps the nine codes whose meaning is unambiguous,
+  consulted only **after** the exception and the pattern table, so no job that
+  already classified changes its answer — it can only replace `"unknown"` with
+  something better. A non-zero code the table does not interpret now yields
+  `pilot_error`: weak, but the pilot did set a code, so `unknown` is wrong.
+  1201 (caught signal) and 1324 (service not available, both transfer
+  directions) are deliberately omitted — one code, several causes — and left
+  to the text, which can distinguish them.
+
+  One scenario changes verdict: `payload_1305_no_usable_logs` moves from
+  `unknown` to `payload_error`. That job is a 1305 with every log file
+  zero-length, so the pilot stated it failed in its payload and only the
+  reason is missing. The row's `pins` prose records the reasoning, since the
+  scenario table is where a change to both paths at once has to be written
+  down to be reviewable. Two rows added for the new paths, and 25 direct tests
+  in `test_classify_pilot_codes.py` pin the ordering as much as the mapping.
+
 - **A failed log download no longer reports itself as an absent file.**
   `cached_fetch_log` collapsed a 404, a 401, a read timeout and a TLS error
   into the same `None`, and the note said *"it may not exist"* for all of

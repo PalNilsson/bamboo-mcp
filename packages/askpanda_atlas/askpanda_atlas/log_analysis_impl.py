@@ -142,7 +142,13 @@ _FAILURE_PATTERNS: list[tuple[str, list[str]]] = [
     ("segfault", ["segmentation fault", "sigsegv", "signal 11"]),
     ("disk_full", ["no space left", "disk quota", "disk full", "work directory.*too large"]),
     ("memory", ["out of memory", "oom killer", "memory limit", "job has exceeded the memory"]),
-    ("network", ["connection refused", "network unreachable", "dns failure", "socket error"]),
+    # "network is unreachable" is the POSIX ENETUNREACH string and is what
+    # XRootD actually reports, so the bare "network unreachable" spelling
+    # missed every job that hit it.
+    ("network", [
+        "connection refused", "network unreachable", "network is unreachable",
+        "dns failure", "socket error",
+    ]),
     ("input_missing", ["no such file", "file not found", "input file missing"]),
     ("stagein_failed", ["failed to stage-in", "stage-in failed", "piloterrorcode.*1099"]),
     # Pilot infrastructure errors: UID not found in process table scan during CPU monitoring.
@@ -202,6 +208,42 @@ _PILOT_CODE_PATTERNS: dict[int, str] = {
     # 1354: UID not found when scanning the process table for CPU monitoring.
     # This is a pilot infrastructure error, not a user payload failure.
     1354: "getpwuid",
+}
+
+# Pilot error codes whose meaning is unambiguous enough to classify from
+# metadata alone.
+#
+# Classification is otherwise substring matching over ``piloterrordiag`` and
+# the log excerpt, which fails in two ways that are invisible from the answer.
+# The diag is free text written by the pilot, so a phrasing that drifts by one
+# word stops matching; and when no log can be read at all — a job whose tarball
+# is not uploaded yet, or a BigPanDA that refuses the download — there is
+# nothing but the diag to match against.  Both produce ``"unknown"``, which
+# reads as "nothing was wrong that we could identify" rather than "we could not
+# look".
+#
+# The code is authoritative where the text is not: the pilot sets it
+# deliberately, and these particular codes have one meaning each.  Consulted
+# only *after* the exception and the pattern table, so no job that already
+# classified changes its answer — this can only replace ``"unknown"`` with
+# something better.
+#
+# Deliberately omitted: 1201 (caught signal) covers too many causes, and 1324
+# (service not available) spans stage-in and stage-out, so both are left to the
+# text, which can distinguish them.
+_PILOT_CODE_CATEGORIES: dict[int, str] = {
+    1099: "stagein_failed",
+    1104: "disk_full",
+    1150: "timeout",
+    1151: "stagein_timeout",
+    1235: "memory",
+    1305: "payload_error",
+    # Not payload_error: the pilot raised while preparing or running the
+    # payload, which does not mean the user's payload was at fault.  Mirrors
+    # the preference _classify_from_exception already applies.
+    1310: "pilot_exception",
+    1354: "pilot_monitoring_error",
+    1361: "stagein_failed",
 }
 
 # Pilot error codes whose diagnostic content *follows* the anchor line
@@ -1207,6 +1249,24 @@ def _classify_from_exception(exception: ExceptionInfo) -> str | None:
     return None
 
 
+def _pilot_error_code_of(job: dict[str, Any]) -> int:
+    """Return a job's pilot error code, tolerating whatever BigPanDA sent.
+
+    ``piloterrorcode`` is occasionally a string, and occasionally a string
+    that is not a number.  Classification must not raise on either.
+
+    Args:
+        job: The ``job`` dict from the BigPanDA metadata response.
+
+    Returns:
+        The code, or ``0`` when there is none or it cannot be read.
+    """
+    try:
+        return int(job.get("piloterrorcode") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def classify_failure(
     job: dict[str, Any],
     log_excerpt: str,
@@ -1244,6 +1304,18 @@ def classify_failure(
     for category, keywords in _FAILURE_PATTERNS:
         if any(kw in search for kw in keywords):
             return category
+
+    # Nothing in the text matched.  Fall back to the pilot error code, which
+    # is set deliberately rather than phrased, before giving up.
+    code = _pilot_error_code_of(job)
+    mapped = _PILOT_CODE_CATEGORIES.get(code)
+    if mapped is not None:
+        return mapped
+    if code:
+        # The code is one this table does not interpret, but a non-zero code
+        # still means the pilot reported a failure.  Saying so is weak; saying
+        # "unknown" is wrong.
+        return "pilot_error"
     return "unknown"
 
 
