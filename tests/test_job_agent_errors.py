@@ -32,6 +32,7 @@ from interfaces.agent.job_agent.composer import (
     JobAnalysisResult,
     ToolCallError,
     ToolUnavailableError,
+    is_error_result,
     analyse_job,
     analyse_jobs,
     structured_payload,
@@ -568,3 +569,129 @@ def test_text_is_joined_across_content_blocks() -> None:
         content = [{"type": "text", "text": "first"}, _Block()]
 
     assert text_from_result(_Mixed()) == "first\nsecond"
+
+
+# ---------------------------------------------------------------------------
+# isError results
+# ---------------------------------------------------------------------------
+
+class _ErrorResult:
+    """A result the MCP server flagged as a tool error.
+
+    Attributes:
+        isError: Always ``True``.
+        content: The exception text the handler produced.
+    """
+
+    def __init__(self, text: str) -> None:
+        """Build an error result.
+
+        Args:
+            text: The error text.
+        """
+        self.isError = True  # noqa: N815 - the SDK's own spelling
+        self.content = [{"type": "text", "text": text}]
+        self.structuredContent = None  # noqa: N815 - the SDK's own spelling
+
+
+def test_an_error_flag_is_recognised_in_both_result_shapes() -> None:
+    """Both the attribute and the mapping form are read."""
+    assert is_error_result(_ErrorResult("boom")) is True
+    assert is_error_result({"isError": True, "content": []}) is True
+    assert is_error_result(Result({"job_id": 1})) is False
+
+
+def test_a_flagged_primitive_result_is_a_tool_error_not_a_payload() -> None:
+    """A handler that raised must not have its traceback parsed as a payload."""
+
+    class _Flagging(ScriptedClient):
+        """Flags the metadata call as an error."""
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            """Return a flagged result for the metadata call.
+
+            Args:
+                name: Tool name.
+                arguments: Tool arguments.
+
+            Returns:
+                A flagged error result, or the scripted response.
+            """
+            if name == composer.TOOL_FETCH_METADATA:
+                self.calls.append((name, dict(arguments)))
+                return _ErrorResult("ValueError: something went wrong inside the tool")
+            return await super().call_tool(name, arguments)
+
+    result = run(_Flagging())
+
+    assert result.outcome == OUTCOME_ERROR
+    assert result.error is not None
+    assert "something went wrong inside the tool" in result.error
+
+
+def test_a_provider_failure_does_not_become_the_answer() -> None:
+    """A billing or quota error must be a failed synthesis, not a diagnosis.
+
+    This happened: *"Anthropic error after retries: Your credit balance is too
+    low…"* was rendered where the job's diagnosis belonged, and counted as a
+    successful LLM call, because the server returns a raised handler as a
+    normal result with ``isError`` set.
+    """
+
+    class _BrokeProvider(ScriptedClient):
+        """Flags the synthesis call as an error."""
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            """Return a flagged result for the synthesis call.
+
+            Args:
+                name: Tool name.
+                arguments: Tool arguments.
+
+            Returns:
+                A flagged error result, or the scripted response.
+            """
+            if name == composer.TOOL_LLM_ANSWER:
+                self.calls.append((name, dict(arguments)))
+                return _ErrorResult(
+                    "Anthropic error after retries: Error code: 400 - "
+                    "Your credit balance is too low to access the Anthropic API."
+                )
+            return await super().call_tool(name, arguments)
+
+    client = _BrokeProvider(plans=[_terminal_plan([_entry("pilotlog.txt")])])
+    result = run(client, synthesise=True)
+
+    assert result.outcome == OUTCOME_ANALYSED
+    assert result.answer_markdown == ""
+    assert result.llm_calls == 0
+    assert any("credit balance" in note for note in result.notes)
+    assert any("synthesis failed" in note for note in result.notes)
+    assert result.failure_type == "payload_error"
+
+
+def test_a_flagged_unknown_tool_is_still_fatal_for_the_run() -> None:
+    """The unknown-tool diagnosis works through the flagged path too."""
+
+    class _Unknown(ScriptedClient):
+        """Reports the metadata tool as unknown via a flagged result."""
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+            """Return a flagged unknown-tool result.
+
+            Args:
+                name: Tool name.
+                arguments: Tool arguments.
+
+            Returns:
+                A flagged error result, or the scripted response.
+            """
+            if name == composer.TOOL_FETCH_METADATA:
+                self.calls.append((name, dict(arguments)))
+                return _ErrorResult(f"Unknown tool: {name}")
+            return await super().call_tool(name, arguments)
+
+    with pytest.raises(ToolUnavailableError) as excinfo:
+        run(_Unknown())
+
+    assert "ASKPANDA_PLUGIN" in str(excinfo.value)

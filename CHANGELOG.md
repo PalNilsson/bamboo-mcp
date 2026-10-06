@@ -131,6 +131,27 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **`interfaces/agent/job_agent/composer.py`**: a tool result flagged
+  `isError` is no longer read as if it were an answer.
+
+  When an MCP tool handler raises, the server does not propagate the
+  exception — it returns a normal result with `isError` set and the exception
+  text as content. The composer read the text and never checked the flag, so a
+  provider billing failure arrived in a synthesised job analysis verbatim:
+  *"Anthropic error after retries: Your credit balance is too low to access
+  the Anthropic API"*, rendered where the diagnosis belonged and counted in
+  the footer as `llm=1`.
+
+  `is_error_result` is now checked on every call. A flagged synthesis becomes
+  a `synthesis failed` note with `answer_markdown` empty and `llm_calls` at
+  zero — the evidence survives, which is the valuable part. A flagged
+  primitive becomes a `ToolCallError` rather than having its traceback parsed
+  as a payload, and the unknown-tool diagnosis works through that path too.
+
+  The primitives themselves do not use this route: their failures are ordinary
+  structured payloads carrying an `error` key, which is why the loop reads
+  those separately. `isError` means the handler itself blew up.
+
 - **The BigPanDA token is sent only to the endpoints that accept it, and the
   scheme is `Token`.** Two corrections to the credential plumbing, both found
   against the live service.

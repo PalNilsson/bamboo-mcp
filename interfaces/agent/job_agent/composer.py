@@ -663,12 +663,48 @@ async def _synthesise(
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         raise ToolCallError(f"{TOOL_LLM_ANSWER} failed: {exc}") from exc
+
+    if is_error_result(raw):
+        # Without this the provider's error text becomes the job's diagnosis.
+        raise ToolCallError(
+            f"{TOOL_LLM_ANSWER} failed: {text_from_result(raw).strip()}"
+        )
+
     return text_from_result(raw).strip()
 
 
 # ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
+
+def is_error_result(result: Any) -> bool:
+    """Report whether an MCP result is flagged as a tool error.
+
+    When a tool handler raises, the MCP server does not propagate the
+    exception — it returns a normal result with ``isError`` set and the
+    exception text as content.  A caller that reads the text without checking
+    the flag treats the error message as the answer.
+
+    That is not hypothetical: a provider billing failure reached a synthesised
+    job analysis verbatim as *"Anthropic error after retries: Your credit
+    balance is too low…"*, presented where the diagnosis should have been and
+    counted as a successful LLM call.
+
+    The primitives do not use this path — their failures are ordinary
+    structured payloads carrying an ``error`` key, which is why the loop reads
+    those separately.  ``isError`` means the handler itself blew up.
+
+    Args:
+        result: Raw result from ``call_tool``.
+
+    Returns:
+        ``True`` when the result is flagged as an error.
+    """
+    flag = getattr(result, "isError", None)
+    if flag is None and isinstance(result, dict):
+        flag = result.get("isError")
+    return bool(flag)
+
 
 async def _call(
     client: MCPCallable,
@@ -696,6 +732,13 @@ async def _call(
         if any(marker in message for marker in _UNKNOWN_TOOL_MARKERS):
             raise ToolUnavailableError(f"{tool}: {exc}. {_UNKNOWN_TOOL_ADVICE}") from exc
         raise ToolCallError(f"{tool} failed: {exc}") from exc
+
+    if is_error_result(raw):
+        detail = text_from_result(raw).strip() or "no detail given"
+        if any(marker in detail.lower() for marker in _UNKNOWN_TOOL_MARKERS):
+            raise ToolUnavailableError(f"{tool}: {detail}. {_UNKNOWN_TOOL_ADVICE}")
+        raise ToolCallError(f"{tool} failed: {detail}")
+
     return structured_payload(raw, tool=tool)
 
 
@@ -1014,6 +1057,7 @@ __all__ = [
     "analyse_job",
     "analyse_jobs",
     "build_synthesis_brief",
+    "is_error_result",
     "missing_primitives",
     "structured_payload",
     "text_from_result",
