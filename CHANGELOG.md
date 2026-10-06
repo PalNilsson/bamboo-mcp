@@ -31,6 +31,14 @@ All notable changes to Bamboo are documented here.
   drop the scalar. See `docs/handover-rag-collection-routing.md`, which also
   carries the open questions for `bamboo-mcp-services` (D-78 – D-83).
 
+- **`scripts/probe_rag.py --topic` resolves the collection the way the RAG
+  tools do.** The probe opened a collection by name and never called
+  `resolve_collection_for_topic()`, so it could not see topic routing at all —
+  running it after setting `BAMBOO_CHROMA_COLLECTION_MAP` produced byte-identical
+  output and read as "the fix did not work". A diagnostic that bypasses the code
+  path under investigation is worse than none, because it is believed. Without
+  `--topic` the old behaviour is unchanged (D-76, partially).
+
 - **Tool-retrieval trace spans now carry `hits`, and the TUI renders them
   properly.** The span reuses `EVENT_RETRIEVAL`, whose renderer reads a `hits`
   field this span never emitted, so `/tracing` showed

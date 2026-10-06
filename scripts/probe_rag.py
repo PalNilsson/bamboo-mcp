@@ -564,6 +564,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--topic",
+        default="",
+        help=(
+            "Resolve the collection the way the RAG tools do, from a topic key "
+            "(panda, atlas, rucio, root, bamboo, ...) through "
+            "BAMBOO_CHROMA_COLLECTION_MAP. Without this the probe opens "
+            "--collection directly and therefore cannot tell you whether topic "
+            "routing is configured correctly."
+        ),
+    )
+    parser.add_argument(
         "--collection",
         default=os.getenv("BAMBOO_CHROMA_COLLECTION", _DEFAULT_CHROMA_COLLECTION),
         help=(
@@ -612,6 +623,23 @@ def main() -> None:
 
     chroma_path: str = args.path
     collection_name: str = args.collection
+    topic: str = str(args.topic or "").strip()
+    if topic:
+        # Exercise the path the RAG tools actually take. Opening a collection by
+        # name skips topic resolution entirely, so a probe run without --topic
+        # says nothing about whether BAMBOO_CHROMA_COLLECTION_MAP is working —
+        # which is exactly the configuration that was silently wrong.
+        try:
+            from bamboo.tools._chroma_routing import (  # noqa: PLC0415
+                resolve_collection_for_topic,
+            )
+            collection_name = resolve_collection_for_topic(chroma_path, topic)
+        except ImportError:
+            print(
+                "error: --topic needs the bamboo package on sys.path.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     top_k: int = max(1, args.top_k)
     min_score: float = max(0.0, min(1.0, args.min_score))
     verbose: bool = args.verbose
@@ -623,7 +651,10 @@ def main() -> None:
 
     print("Bamboo RAG smoke-test")
     print(f"  ChromaDB path : {os.path.abspath(chroma_path)}")
-    print(f"  Collection    : {collection_name}")
+    if topic:
+        print(f"  Topic         : {topic!r}  ->  {collection_name}")
+    else:
+        print(f"  Collection    : {collection_name}")
     print(f"  Queries       : {len(queries_with_desc)}")
     print(f"  top_k={top_k}  min_score={min_score}")
 
