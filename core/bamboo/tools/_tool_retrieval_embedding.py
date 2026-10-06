@@ -440,7 +440,7 @@ class HybridRetriever:
         catalog: Sequence[Mapping[str, Any]],
         k: int,
     ) -> list[str]:
-        """Return up to *k* tool names, best match first.
+        """Return up to k tool names, best match first.
 
         Args:
             question: The user's question.
