@@ -194,20 +194,46 @@ one ranks, whatever the ranks. Fusion degenerates into "the intersection, then
 the leftovers", and the single-source find hybrid exists to rescue is exactly
 what it structurally cannot rescue.
 
-`RRF_K=60` assumes rankings over thousands of documents. The default here is now
-10, where a confident single-source rank can compete. That is reasoning, not a
-measurement — hybrid is not the shipped backend, and the number to trust is
-whatever a sweep of `BAMBOO_TOOL_RETRIEVAL_RRF_K` reports:
+`RRF_K=60` assumes rankings over thousands of documents. A sweep confirmed the
+prediction exactly:
 
-```bash
-for n in 3 5 10 20 60; do
-    BAMBOO_TOOL_RETRIEVAL_RRF_K=$n \
-        python scripts/eval_tool_retrieval.py --retriever hybrid --k 10
-done
-```
+| `RRF_K` | 3 | 5 | 10 | 20 | 60 |
+|---|---|---|---|---|---|
+| recall@10 | 1.000 | 1.000 | 0.992 | 0.992 | 0.992 |
+| payload | 0.404 | 0.399 | 0.394 | 0.395 | 0.395 |
 
-Even at its best, hybrid would buy at most one case in 120 at the price of
-making an ONNX model a hard dependency of the planner path.
+The default is now 5. **Treat that 1.000 with suspicion rather than pride.**
+`RRF_K` was chosen on the same 120 cases it is reported against, the gain is a
+single case, and it is the case the sweep went looking for. That is a fit, not a
+validated improvement.
+
+Hybrid is still not the default, for a reason unrelated to its score. It makes
+an embedding model a hard dependency of the planner path, and when the model is
+missing the fallback is the *whole* catalogue — a host without the model loses
+100% of the benefit, where lexical would have lost none. One case in 120 does not
+buy that.
+
+### The case hybrid was chasing, and what actually fixed it
+
+The question was *"Which questions received the lowest ratings last month?"*,
+which needs `opensearch_promptlog_query`. Lexical missed it, and the cause was
+not a semantic gap — it was this page's own 800-character indexing window. That
+tool's description is 8,151 characters; the word "question" first appeared at
+character 917 and "rating" at 6,903. BM25 never saw the words it needed.
+
+Raising the cap does not fix it. At 9,000 characters the tool is retrieved, but
+its 8 kB of text then crowds `panda_jobs_query` out of two site-health questions
+— the same attention-dilution problem this whole feature exists to solve,
+reproducing inside the ranker.
+
+What fixed it was rewriting the first paragraph of the description so the
+vocabulary a user would actually use appears in the indexed window. Lexical went
+to **1.000 recall with no model, no tuning and no new dependency**.
+
+**The lesson generalises: a tool's opening sentences are its retrieval surface.**
+A description written for a reader who already knows what the tool is for will
+underperform one that states the words a user would type. This is also free —
+the same sentences are what the planner reads first.
 
 ---
 
@@ -222,10 +248,18 @@ least three labelled cases or a written exemption. The exemptions are for tools
 the interface invokes rather than a user asking for them in words
 (`bamboo_llm_probe`, `atlas.ui_manifest`).
 
-If a tool is retrieved poorly, the fix is almost always its description.
-Retrieval can only match words the description contains, so a description
-written for a human reader who already knows what the tool is for will
-underperform one that states the vocabulary a user would actually use.
+If a tool is retrieved poorly, the fix is almost always its description — see
+the worked example above, where a description change did what an embedding model
+could not. Retrieval only matches words inside the first 800 characters, so check
+there first:
+
+```python
+from bamboo.tools.tool_retrieval import index_terms
+print(" ".join(index_terms(entry)))
+```
+
+If the words a user would type are not in that output, no retriever will find
+the tool.
 
 ### Adding a backend
 

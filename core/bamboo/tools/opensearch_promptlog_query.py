@@ -221,10 +221,24 @@ class OpenSearchPromptlogQueryTool:
         return {
             "name": "opensearch_promptlog_query",
             "description": (
+                # The opening sentences are load-bearing twice over. They are
+                # what the planner reads first, and they are the only part tool
+                # retrieval indexes — the full description is 8 kB, and indexing
+                # it whole would let one tool dominate the term statistics of a
+                # 22-tool catalog. So the vocabulary a user would actually use
+                # has to appear here, not 7 kB down in the field reference.
+                # Before this paragraph existed, "Which questions received the
+                # lowest ratings last month?" failed to retrieve this tool: the
+                # word "rating" first appeared at character 6903.
                 "Query Bamboo's prompt/response log index (bamboomcp-promptlog-*) "
-                "in OpenSearch.  Use this tool to analyse past Bamboo sessions: "
-                "count turns, inspect tool usage patterns, compare token costs "
-                "across providers/models, replay a specific session, or find "
+                "in OpenSearch.  Use this tool to analyse Bamboo's own usage and "
+                "answer quality: star ratings and rated responses, which questions "
+                "scored lowest or highest, rating distribution and average rating "
+                "per model or provider, session replay, which tools were used, "
+                "turn counts, and token cost per turn — over any time window, such "
+                "as today, yesterday, last week or last month.\n\n"
+                "Also: count turns, inspect tool usage patterns, compare token "
+                "costs across providers/models, replay a specific session, or find "
                 "responses that used a particular tool.\n\n"
                 "Document schema (per turn):\n"
                 "  @timestamp    (date)     UTC time of LLM call\n"

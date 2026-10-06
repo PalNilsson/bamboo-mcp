@@ -6,6 +6,101 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **`opensearch_promptlog_query`'s description now states its purpose in the
+  first paragraph.** The tool was not retrieved for "Which questions received
+  the lowest ratings last month?", and the cause was not a semantic gap: the
+  description is 8,151 characters, retrieval indexes the first 800, and the word
+  "question" first appeared at character 917 with "rating" at 6,903. BM25 never
+  saw the words it needed.
+
+  Raising the indexing cap does not fix it. At 9,000 characters the tool is
+  retrieved, but its 8 kB then crowds `panda_jobs_query` out of two site-health
+  questions — the attention-dilution problem this feature exists to solve,
+  reproducing inside the ranker. Front-loading the vocabulary instead took
+  lexical recall to **1.000** with no model, no tuning and no new dependency.
+
+  Re-measure after pulling: this moves the numbers.
+
+  The general lesson is in `docs/tool-retrieval.md` — a tool's opening sentences
+  are its retrieval surface, and they are free, because they are also what the
+  planner reads first.
+
+### Changed
+- **`RRF_K` default lowered again, 10 → 5**, on a measured sweep. Hybrid scores
+  0.992 at K = 10, 20 and 60, and 1.000 at K = 3 and 5, confirming the
+  arithmetic prediction exactly. Hybrid remains off by default: it makes an
+  embedding model a hard dependency of the planner path, and when the model is
+  missing the fallback is the *whole* catalogue, so a host without it loses 100%
+  of the benefit where lexical loses none.
+
+  The 1.000 deserves suspicion rather than pride — `RRF_K` was chosen on the
+  same 120 cases it is reported against, the gain is one case, and it is the
+  case the sweep went looking for. A fit, not a validated improvement. The same
+  case was then fixed with no model at all, above.
+
+- **Tool retrieval is now on by default**, as `lexical` with `k=10`. The planner
+  receives roughly 39% of the tool JSON it used to. `BAMBOO_TOOL_RETRIEVAL=off`
+  is the kill switch and restores the previous behaviour exactly — same catalog,
+  same prompt, same guidance. New documentation: `docs/tool-retrieval.md`.
+
+  Measured over 120 labelled questions on a 22-tool ATLAS catalog:
+
+  | backend | k | recall | hard | guidance | payload |
+  |---|---|---|---|---|---|
+  | null (baseline) | — | 1.000 | 1.000 | 1.000 | 1.000 |
+  | **lexical** | **10** | **0.992** | **0.983** | **1.000** | **0.389** |
+  | lexical | 12 | 0.992 | 0.983 | 1.000 | 0.453 |
+  | embedding | 10 | 0.975 | 0.949 | 0.971 | 0.442 |
+  | embedding | 12 | 0.992 | 0.983 | 0.990 | 0.553 |
+  | hybrid | 10 | 0.992 | 0.983 | 1.000 | 0.395 |
+
+  The embedding backend measured worse on recall *and* payload, and lost exactly
+  where the lexical-first argument predicted it would: its `k=10` failures were
+  `panda_queue_info` for "Is BNL accepting MCORE jobs?", `atlas.job_stats` for
+  "maximum queue time for failed jobs", and `code_query` for "Show me the retry
+  logic in `pilot/util/https.py`" — a literal source path. Rare jargon is this
+  catalogue's meaning, and it is what a small general-purpose embedding model
+  has least signal for.
+
+  k=10 over k=12 because they score identically on every recall metric and k=10
+  is 6 points cheaper.
+
+- **`RRF_K` default lowered from 60 to 10**, and exposed as
+  `BAMBOO_TOOL_RETRIEVAL_RRF_K`. Hybrid retrieval failed the one case it was
+  built to rescue — the question whose wording shares no term with
+  `opensearch_promptlog_query`'s description, which the embedding backend alone
+  solves. That is arithmetic, not luck: with *N* scorable tools, a tool ranked
+  first by one backend scores `1/(K+1)` and a tool ranked *last by both* scores
+  `2/(K+N)`. At K=60 with N=20 those are 0.0164 and 0.0250, so every tool both
+  backends rank beats every tool only one ranks, whatever the ranks. Fusion
+  degenerates into "the intersection, then the leftovers" and structurally
+  cannot surface a single-source find. The literature's 60 assumes rankings over
+  thousands of documents.
+
+  10 is reasoning rather than measurement; hybrid is not the shipped backend and
+  the knob exists so a sweep can settle it.
+
+- **`docs/tool-retrieval.md` linked from the README documentation table.** The
+  page was unreferenced from anywhere in the tree, which in a repository whose
+  only documentation index is that table means it did not exist for anyone who
+  had not been told about it. The README status block is also refreshed to
+  October and now leads with retrieval.
+
+- **The routing diagram in `docs/architecture.md` gains the retrieval step.**
+  `docs/mcp_tools_selection.mmd` turns out to be a stale duplicate of it —
+  referenced by nothing, and missing the topic guard, the fast-path subgraph and
+  `bypass_fast_path` that the inline version has. It now carries a `%%` header
+  saying so and pointing at the live copy. It should probably be deleted; left
+  in place pending a decision, since it holds one node (content-free follow-up
+  reformulation) that the live diagram does not.
+
+- **`scripts/eval_tool_retrieval.py` reports a catalogue fingerprint.** The same
+  command on two hosts produced 29,527 and 29,750 characters and recalls of
+  0.983 and 0.992, because their plugin descriptions differed. Without the
+  fingerprint that reads as noise in the retriever rather than a difference in
+  what was measured.
+
 ### Added
 - **Embedding and hybrid retrieval backends** —
   `core/bamboo/tools/_tool_retrieval_embedding.py`. `BAMBOO_TOOL_RETRIEVAL`

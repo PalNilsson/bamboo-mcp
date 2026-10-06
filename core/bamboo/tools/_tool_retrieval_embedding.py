@@ -53,13 +53,17 @@ ENV_RRF_K = "BAMBOO_TOOL_RETRIEVAL_RRF_K"
 #: observed, with hybrid missing the one case the embedding backend alone
 #: solved.
 #:
-#: 60 assumes rankings over thousands of documents.  For a corpus of 22, the
-#: crossover is near K = N, so 10 leaves a confident single-source rank able to
-#: compete.  This is reasoning, not a measurement: hybrid is not the shipped
-#: backend, and the number to trust is whatever
-#: ``scripts/eval_tool_retrieval.py --retriever hybrid`` reports after a sweep
-#: of :data:`ENV_RRF_K`.
-RRF_K = 10
+#: 60 assumes rankings over thousands of documents.  A sweep confirmed the
+#: prediction exactly: on a 22-tool catalog hybrid scored 0.992 at K=10, 20 and
+#: 60, and 1.000 at K=3 and K=5.  5 is the default.
+#:
+#: Treat that 1.000 with suspicion rather than pride.  K was chosen on the same
+#: 120 cases it is reported against, the gain is a single case, and it is the
+#: case the sweep went looking for — a fit, not a validated improvement.  The
+#: same case was subsequently fixed with no model at all, by writing the
+#: offending tool's description so that its own vocabulary appears in the
+#: indexed window.
+RRF_K = 5
 
 
 def active_rrf_k() -> int:
