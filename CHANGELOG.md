@@ -7,6 +7,84 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Added
+- **Query-conditioned tool retrieval** — `core/bamboo/tools/tool_retrieval.py`,
+  hooked into the planner via `_collect_tool_catalog_with_decision()`.
+  **Off by default**; `BAMBOO_TOOL_RETRIEVAL` is unset and nothing changes
+  until it is set to `lexical`.
+
+  The planner is shown all 22 tools on every question — ~29 kB of JSON, of
+  which `opensearch_promptlog_query` alone is a third. Retrieval scores the
+  catalogue against the question and passes on only what it plausibly needs.
+
+  **Measured on the 120-case corpus** (`scripts/eval_tool_retrieval.py
+  --retriever lexical`), against the C2 baseline of recall 1.000 / payload
+  1.000:
+
+  | k | recall@k | hard | guidance | payload |
+  |---|---|---|---|---|
+  | 6 | 0.900 | 0.898 | 0.873 | 0.235 |
+  | 8 | 0.958 | 0.932 | 0.941 | 0.309 |
+  | 10 | 0.983 | 0.966 | 0.971 | **0.391** |
+  | 12 | 0.992 | 0.983 | 0.990 | 0.452 |
+  | 14 | 0.992 | 0.983 | 0.990 | 0.512 |
+
+  k = 12 is the knee; k = 14 buys nothing and costs 6% more payload. k = 10
+  gives a 61% smaller prompt for 2 misses in 120. Both remaining failures at
+  k = 12 and above are `hard` cases, which is the corpus working as intended.
+
+  **Lexical (BM25) rather than embeddings, as planned.** The corpus is 22 short
+  strings of rare jargon — `pilottiming`, `HS06`, `cmtconfig`, `queuedata` —
+  near the best case for exact term matching and the worst for a small
+  general-purpose embedding model, whose weakest tokens are precisely those.
+  It also loads nothing, runs in microseconds, adds no dependency to the
+  planner path, and cannot fail on a vector-dimension mismatch. `ToolRetriever`
+  keeps the choice reversible: an embedding backend is a second implementation
+  of the same protocol, and C4 will compare them on recall rather than taste.
+
+  Only the planner's catalogue is narrowed. `bamboo_answer`'s deterministic
+  fast path, `bamboo_executor`'s in-process resolution and the MCP `tools/list`
+  surface all bypass `_collect_tool_catalog()` and are untouched. Routing
+  guidance is filtered in lockstep via C1's `available_tools`, but **only when
+  retrieval actually narrowed the catalogue** — passing the names
+  unconditionally would also withhold clauses on a host missing a tool for an
+  unrelated reason (no DuckDB drops `panda_jobs_query`, and with it the
+  site-health clause), which is a change to the un-retrieved path and does not
+  belong in a commit that lands switched off.
+
+  `panda_doc_search` and `panda_doc_bm25` are pinned past the scorer and count
+  against `k`, per T-4. The pins are load-bearing: without them recall at
+  k = 10 drops from 0.983 to 0.892, because the fallback route's two tools are
+  individually weak matches for the general-knowledge questions they exist to
+  answer.
+
+  Every path back to the full catalogue is logged with a distinct reason —
+  `disabled`, `no_question`, `catalog_small`, `backend_error`, `empty_result` —
+  because a retrieval layer that has quietly stopped retrieving presents as
+  nothing worse than a larger prompt. A backend that raises, or that returns a
+  name absent from the catalogue, falls back and logs at ERROR.
+
+- **Per-question tool-selection debug line.** Every retrieval decision is
+  logged and mirrored into the trace stream as an `EVENT_RETRIEVAL` record, so
+  selections show up in `/tracing`. The line names every surviving tool with
+  its score, marks the pinned ones, and lists every withheld tool with its
+  score — counts alone would answer the easy question and hide the one actually
+  being asked, which is always *which* tools:
+
+  ```
+  tool retrieval: backend=lexical k=10 kept 10/22
+  [panda_doc_bm25(pinned), panda_doc_search(pinned), panda_log_analysis=4.87,
+   atlas.pilot_source_analysis=2.92, ... ] withheld [panda_harvester_workers=0.83, ...]
+  ```
+
+  It logs at DEBUG by default. `BAMBOO_TOOL_RETRIEVAL_LOG=1` raises it to INFO,
+  so a test run can see selections without turning on global DEBUG and burying
+  the line in HTTP and SDK chatter. Configuration: `BAMBOO_TOOL_RETRIEVAL`
+  (`off` | `lexical`), `BAMBOO_TOOL_RETRIEVAL_K` (default 10),
+  `BAMBOO_TOOL_RETRIEVAL_MIN_CATALOG` (default 12),
+  `BAMBOO_TOOL_RETRIEVAL_LOG`. All read at call time and all fail open to the
+  default with a warning logged once per distinct bad value.
+
+### Added
 - **Tool-retrieval evaluation harness** — `core/bamboo/evaluation/`,
   `scripts/eval_tool_retrieval.py`, and a 120-case labelled corpus at
   `tests/data/tool_selection_corpus.json`. Pure stdlib, nothing on a request

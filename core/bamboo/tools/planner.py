@@ -596,12 +596,18 @@ def _collect_tool_catalog(namespaces: list[str] | None = None) -> list[dict[str,
     excluded from both sources.  This does not follow ``BAMBOO_TOOL_PROFILE``;
     see that constant for why.
 
+    This function assembles the catalog and never narrows it.  Query-conditioned
+    narrowing lives in :func:`_collect_tool_catalog_with_decision`, which wraps
+    this one, so that a caller with no question — every caller outside the
+    planner — cannot accidentally acquire retrieval by omitting an argument.
+
     Args:
         namespaces: Optional list of namespaces to include for *entry-point*
             tools (e.g. ['atlas']). Core tools are always included.
 
     Returns:
-        List[Dict[str, Any]]: Tool definitions suitable for prompt inclusion.
+        List[Dict[str, Any]]: Tool definitions suitable for prompt inclusion,
+        in catalog order.
     """
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
@@ -693,6 +699,37 @@ def _collect_tool_catalog(namespaces: list[str] | None = None) -> list[dict[str,
         })
 
     return out
+
+
+def _collect_tool_catalog_with_decision(
+    namespaces: list[str] | None = None,
+    question: str = "",
+) -> tuple[list[dict[str, Any]], Any]:
+    """Collect the planner catalog and report what retrieval did to it.
+
+    The planner needs both halves: the narrowed catalog to put in the prompt,
+    and the decision to know whether to filter the routing guidance in
+    lockstep.  Re-deriving "was it narrowed?" by assembling the catalog a
+    second time would cost a second entry-point scan and could disagree with
+    the first if a plugin reloaded between them.
+
+    Args:
+        namespaces: Optional namespace filter for entry-point tools.
+        question: The user's question.  Empty leaves the catalog whole and
+            yields no decision.
+
+    Returns:
+        Tuple[List[Dict[str, Any]], Any]: The catalog entries, and the
+        ``RetrievalDecision`` that produced them — ``None`` when no question
+        was supplied and retrieval was therefore never consulted.
+    """
+    out = _collect_tool_catalog(namespaces=namespaces)
+    if not question.strip():
+        return out, None
+
+    from bamboo.tools.tool_retrieval import narrow_catalog  # noqa: PLC0415
+
+    return narrow_catalog(question, out)
 
 
 class BambooPlannerTool:
@@ -794,9 +831,25 @@ class BambooPlannerTool:
         plugin_id: str = str(arguments.get("plugin_id", "") or "").strip().lower()
 
         schema = get_plan_json_schema()
-        tool_catalog = _collect_tool_catalog(namespaces=namespaces_list)
+        tool_catalog, retrieval = _collect_tool_catalog_with_decision(
+            namespaces=namespaces_list, question=question
+        )
 
-        system = build_planner_system_prompt(schema, plugin_id=plugin_id)
+        # Routing guidance is filtered against the catalog only when retrieval
+        # actually narrowed it.  Passing the names unconditionally would also
+        # withhold clauses on a host where a tool is missing for an unrelated
+        # reason — an absent DuckDB drops panda_jobs_query, and with it the
+        # site-health clause.  That may well be the behaviour we want, but it
+        # is a change to the un-retrieved path and does not belong in the commit
+        # that lands retrieval switched off.
+        available = (
+            frozenset(str(entry["name"]) for entry in tool_catalog)
+            if retrieval is not None and retrieval.applied
+            else None
+        )
+        system = build_planner_system_prompt(
+            schema, plugin_id=plugin_id, available_tools=available
+        )
         user = build_planner_user_prompt(question=question, tool_catalog=tool_catalog, hints=hints_dict)
         planner_messages: list[Message] = [
             {"role": "system", "content": system},

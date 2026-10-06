@@ -39,6 +39,7 @@ from bamboo.tools.planner import (  # noqa: E402
     _collect_tool_catalog,
     routing_rules_for_plugin,
 )
+from bamboo.tools.tool_retrieval import LexicalRetriever  # noqa: E402
 
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "data" / "tool_selection_corpus.json"
 
@@ -47,7 +48,7 @@ DEFAULT_CORPUS = REPO_ROOT / "tests" / "data" / "tool_selection_corpus.json"
 #: sees them and they count against the *k* budget.
 PINNED_TOOLS = frozenset({"panda_doc_search", "panda_doc_bm25"})
 
-RETRIEVERS: dict[str, Any] = {"null": NullRetriever}
+RETRIEVERS: dict[str, Any] = {"null": NullRetriever, "lexical": LexicalRetriever}
 
 
 def _build_retriever(name: str) -> ToolRetriever:
