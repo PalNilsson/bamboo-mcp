@@ -344,7 +344,7 @@ def cached_fetch_log_detailed(
         resp = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": USER_AGENT, **panda_monitor_headers()},
+            headers={"User-Agent": USER_AGENT, **panda_monitor_headers(url)},
             stream=True,
         )
         status: int | None = resp.status_code
@@ -527,7 +527,7 @@ def head_remote_file(
         resp = requests.head(
             url,
             timeout=timeout,
-            headers={"User-Agent": USER_AGENT, **panda_monitor_headers()},
+            headers={"User-Agent": USER_AGENT, **panda_monitor_headers(url)},
             allow_redirects=True,
         )
     except requests.RequestException as exc:
@@ -684,7 +684,7 @@ def stream_to_file(
     resume_from = _resume_offset(part, expected_bytes, allow_resume)
     # The media endpoint is SSO-gated and answers an unauthenticated request
     # with a 200 HTML login page, so it is a candidate for the same token.
-    headers = {"User-Agent": USER_AGENT, **panda_monitor_headers()}
+    headers = {"User-Agent": USER_AGENT, **panda_monitor_headers(url)}
     if resume_from:
         headers["Range"] = f"bytes={resume_from}-"
 

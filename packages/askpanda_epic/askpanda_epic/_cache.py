@@ -302,7 +302,7 @@ def cached_fetch_log_detailed(
         resp = requests.get(
             url,
             timeout=timeout,
-            headers={"User-Agent": USER_AGENT, **panda_monitor_headers()},
+            headers={"User-Agent": USER_AGENT, **panda_monitor_headers(url)},
             stream=True,
         )
         status: int | None = resp.status_code

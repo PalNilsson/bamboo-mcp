@@ -21,10 +21,16 @@ export ASKPANDA_PANDA_BACKOFF_SECONDS="0.8"
 # log_unavailable_reason. Set it, or every analysis is metadata-only.
 # export PANDA_MONITOR_TOKEN="..."
 
-# Authorization scheme for the token above. Defaults to "Bearer", giving
-# "Authorization: Bearer <token>". Set it to an empty string to send the raw
-# token value with no prefix.
-# export PANDA_MONITOR_TOKEN_SCHEME="Bearer"
+# Authorization scheme for the token above. Defaults to "Token", giving
+# "Authorization: Token <token>". BigPanDA rejects "Bearer" for this
+# credential -- under that scheme it expects an ATLAS IAM JWT and answers
+# 401 {"detail": "Invalid ATLAS IAM token: Not enough segments"}. Set this to
+# an empty string to send the raw token value with no prefix.
+# export PANDA_MONITOR_TOKEN_SCHEME="Token"
+
+# The token is sent ONLY to the filebrowser and media endpoints, which need
+# it. Job and task metadata are served unauthenticated and REJECT a request
+# carrying an Authorization header, so it must not be sent there.
 
 # Path to the DuckDB file written by the ingestion agent.
 # Used by the panda_jobs_query tool (atlas.jobs_query).

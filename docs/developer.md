@@ -188,7 +188,7 @@ Key variables:
 | `MISTRAL_API_KEY` / `OPENAI_API_KEY` / … | Provider API keys |
 | `ASKPANDA_ENABLE_REAL_PANDA` | `1` to use real BigPanDA API |
 | `PANDA_MONITOR_TOKEN` | BigPanDA access token — required for log analysis |
-| `PANDA_MONITOR_TOKEN_SCHEME` | Authorization scheme for it (default `Bearer`) |
+| `PANDA_MONITOR_TOKEN_SCHEME` | Authorization scheme for it (default `Token`) |
 | `BAMBOO_TRACE` | `1` to enable structured tracing |
 | `BAMBOO_TRACE_FILE` | Write trace NDJSON to file (required for TUI) |
 | `BAMBOO_OTEL_ENDPOINT` | OTLP/gRPC endpoint for OpenTelemetry export |

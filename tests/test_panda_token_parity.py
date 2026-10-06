@@ -27,6 +27,20 @@ from typing import Any
 
 import pytest
 
+#: A URL that accepts the credential, for the header-shape tests.
+_FILEBROWSER_URL: str = (
+    "https://bigpanda.cern.ch/filebrowser/?pandaid=1&json&filename=pilotlog.txt"
+)
+
+#: The job metadata URL, which serves 200 unauthenticated and 401 when an
+#: Authorization header is present.
+_METADATA_URL: str = "https://bigpanda.cern.ch/job?pandaid=1&json"
+
+#: Where a log download redirects; the header has to survive that hop.
+_MEDIA_URL: str = (
+    "https://bigpanda.cern.ch//media/filebrowser/806f3002/tarball/pilotlog.txt"
+)
+
 #: Modules that build BigPanDA request headers.
 _HTTP_MODULES: tuple[str, ...] = (
     "bamboo.tools._panda_http",
@@ -70,7 +84,7 @@ def test_every_http_copy_can_send_the_token(module_name: str) -> None:
         f"module must, or the plugin that uses it silently loses log access."
     )
     assert module.ENV_MONITOR_TOKEN == "PANDA_MONITOR_TOKEN"
-    assert module.DEFAULT_MONITOR_TOKEN_SCHEME == "Bearer"
+    assert module.DEFAULT_MONITOR_TOKEN_SCHEME == "Token"
 
 
 @pytest.mark.parametrize("module_name", _HTTP_MODULES)
@@ -85,14 +99,18 @@ def test_an_unset_token_adds_no_header(
     """
     module = _load(module_name)
     monkeypatch.delenv("PANDA_MONITOR_TOKEN", raising=False)
-    assert module.panda_monitor_headers() == {}
+    assert module.panda_monitor_headers(_FILEBROWSER_URL) == {}
 
 
 @pytest.mark.parametrize("module_name", _HTTP_MODULES)
-def test_a_set_token_becomes_a_bearer_header(
+def test_a_set_token_becomes_a_token_header(
     module_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default scheme is ``Bearer`` in every copy.
+    """The default scheme is ``Token`` in every copy.
+
+    Not ``Bearer``: under that scheme BigPanDA expects an ATLAS IAM JWT and
+    answers ``401 {"detail": "Invalid ATLAS IAM token: Not enough segments"}``
+    for the opaque credential it actually issues.
 
     Args:
         module_name: Dotted path of the module under test.
@@ -101,7 +119,9 @@ def test_a_set_token_becomes_a_bearer_header(
     module = _load(module_name)
     monkeypatch.setenv("PANDA_MONITOR_TOKEN", "abc123")
     monkeypatch.delenv("PANDA_MONITOR_TOKEN_SCHEME", raising=False)
-    assert module.panda_monitor_headers() == {"Authorization": "Bearer abc123"}
+    assert module.panda_monitor_headers(_FILEBROWSER_URL) == {
+        "Authorization": "Token abc123"
+    }
 
 
 @pytest.mark.parametrize("module_name", _HTTP_MODULES)
@@ -122,7 +142,9 @@ def test_an_empty_scheme_sends_the_raw_token(
     module = _load(module_name)
     monkeypatch.setenv("PANDA_MONITOR_TOKEN", "abc123")
     monkeypatch.setenv("PANDA_MONITOR_TOKEN_SCHEME", "")
-    assert module.panda_monitor_headers() == {"Authorization": "abc123"}
+    assert module.panda_monitor_headers(_FILEBROWSER_URL) == {
+        "Authorization": "abc123"
+    }
 
 
 @pytest.mark.parametrize("module_name", _CACHE_MODULES)
@@ -143,3 +165,43 @@ def test_every_cache_copy_reports_and_retries_failures(module_name: str) -> None
     assert module.LOG_MISSING_TTL > 0
     assert module.LOG_MISSING_TTL != float("inf")
     assert module.LOG_TTL == float("inf")
+
+
+@pytest.mark.parametrize("module_name", _HTTP_MODULES)
+def test_the_metadata_endpoint_never_receives_the_token(
+    module_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Job and task metadata must be requested without an Authorization header.
+
+    This is not caution, it is a requirement. The metadata endpoint serves
+    ``200`` unauthenticated and answers ``401`` when the header is present, so
+    a credential helper that attaches the token to everything breaks every
+    analysis before it reaches a log file — which is exactly what happened.
+
+    Args:
+        module_name: Dotted path of the module under test.
+        monkeypatch: Pytest fixture.
+    """
+    module = _load(module_name)
+    monkeypatch.setenv("PANDA_MONITOR_TOKEN", "abc123")
+
+    assert module.panda_monitor_headers(_METADATA_URL) == {}
+    assert module.url_needs_token(_METADATA_URL) is False
+
+
+@pytest.mark.parametrize("module_name", _HTTP_MODULES)
+def test_the_download_and_its_redirect_both_receive_the_token(
+    module_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The filebrowser redirects to /media/, and the header must survive it.
+
+    Args:
+        module_name: Dotted path of the module under test.
+        monkeypatch: Pytest fixture.
+    """
+    module = _load(module_name)
+    monkeypatch.setenv("PANDA_MONITOR_TOKEN", "abc123")
+
+    assert module.url_needs_token(_FILEBROWSER_URL) is True
+    assert module.url_needs_token(_MEDIA_URL) is True
+    assert module.panda_monitor_headers(_MEDIA_URL)["Authorization"]

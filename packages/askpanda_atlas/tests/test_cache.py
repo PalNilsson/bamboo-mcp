@@ -435,7 +435,7 @@ def test_no_token_configured_sends_no_authorization_header(
     assert "Authorization" not in call.call_args.kwargs["headers"]
 
 
-def test_a_configured_token_is_sent_as_a_bearer_header(
+def test_a_configured_token_is_sent_as_a_token_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The token reaches the filebrowser request.
@@ -454,7 +454,7 @@ def test_a_configured_token_is_sent_as_a_bearer_header(
     with patch("requests.get", return_value=ok) as call:
         cached_fetch_log(url)
 
-    assert call.call_args.kwargs["headers"]["Authorization"] == "Bearer s3cr3t"
+    assert call.call_args.kwargs["headers"]["Authorization"] == "Token s3cr3t"
 
 
 def test_cached_fetch_log_after_clear_refetches() -> None:

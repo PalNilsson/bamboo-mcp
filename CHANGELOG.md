@@ -131,6 +131,30 @@ All notable changes to Bamboo are documented here.
   equivalent for an installed deployment.
 
 ### Fixed
+- **The BigPanDA token is sent only to the endpoints that accept it, and the
+  scheme is `Token`.** Two corrections to the credential plumbing, both found
+  against the live service.
+
+  The scheme is `Token`, not `Bearer`. Under `Bearer` BigPanDA expects an ATLAS
+  IAM JWT and answers `401 {"detail": "Invalid ATLAS IAM token: Not enough
+  segments"}` — the credential it issues for this is an opaque 40-character
+  token. `PANDA_MONITOR_TOKEN_SCHEME` still overrides it, but the default now
+  matches the service instead of guaranteeing a 401 for every new deployment.
+
+  More seriously, attaching the credential to every BigPanDA request was wrong
+  and broke things that previously worked. The job metadata endpoint serves
+  `200` unauthenticated and answers `401` when an `Authorization` header is
+  present, so with a token configured *every analysis failed at
+  `fetch_metadata`* — before it reached the log file the token was added for.
+  `panda_monitor_headers` now takes the URL and returns a header only for the
+  filebrowser and media paths; `/media/` is included because the download
+  redirects there and the header has to survive the hop.
+
+  Scoping a credential to the endpoints that need it is the right default
+  regardless. "Harmless future-proofing" was the reasoning for sending it
+  everywhere, and it was neither. `tests/test_panda_token_parity.py` now pins
+  the metadata endpoint receiving no header, across all three copies.
+
 - **Classification falls back to the pilot error code instead of giving up.**
   `classify_failure` was substring matching over `piloterrordiag` and the log
   excerpt and nothing else, which fails two ways that look identical from the

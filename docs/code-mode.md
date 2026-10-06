@@ -635,8 +635,18 @@ had no log content.  An error outranks a missing log.
 Every log file and file listing comes from BigPanDA's filebrowser, which now
 answers an unauthenticated request with `401` and
 `{"error": "No token provided"}`. Set `PANDA_MONITOR_TOKEN` in the server's
-environment; `PANDA_MONITOR_TOKEN_SCHEME` overrides the `Bearer` prefix for a
-deployment that wants the raw value.
+environment.
+
+The header is `Authorization: Token <value>`, not `Bearer` — under `Bearer`
+BigPanDA expects an ATLAS IAM JWT and answers
+`401 {"detail": "Invalid ATLAS IAM token: Not enough segments"}`.
+`PANDA_MONITOR_TOKEN_SCHEME` overrides the prefix if a deployment needs
+something else.
+
+The token goes **only** to the filebrowser and media endpoints. Job and task
+metadata are served unauthenticated and *reject* a request carrying an
+`Authorization` header, so sending the credential everywhere breaks every
+analysis before it reaches a log file.
 
 Without it the loop still runs and still produces a verdict — `classify`
 reaches one from `piloterrordiag` alone — so the failure does not look like a

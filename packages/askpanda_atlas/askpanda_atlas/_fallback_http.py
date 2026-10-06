@@ -33,34 +33,72 @@ ENV_MONITOR_TOKEN: str = "PANDA_MONITOR_TOKEN"
 #: empty string to send the token value bare, with no scheme prefix.
 ENV_MONITOR_TOKEN_SCHEME: str = "PANDA_MONITOR_TOKEN_SCHEME"
 
-#: Scheme used when :data:`ENV_MONITOR_TOKEN_SCHEME` is unset.
-DEFAULT_MONITOR_TOKEN_SCHEME: str = "Bearer"
+#: Scheme used when :data:`ENV_MONITOR_TOKEN_SCHEME` is unset.  ``Token``
+#: rather than ``Bearer``: BigPanDA answers ``Bearer`` with ``401 {"detail":
+#: "Invalid ATLAS IAM token: Not enough segments"}``, because under that
+#: scheme it expects an ATLAS IAM JWT, while the credential it actually issues
+#: for this is an opaque 40-character token presented as ``Token <value>``.
+DEFAULT_MONITOR_TOKEN_SCHEME: str = "Token"
+
+#: URL path fragments of the endpoints that accept the credential.
+#:
+#: Scoped deliberately.  Sending it everywhere looked like harmless
+#: future-proofing and was not: the job metadata endpoint serves ``200``
+#: unauthenticated and answers ``401`` when an ``Authorization`` header is
+#: present, so attaching the token to every request broke every analysis
+#: before it reached a log file.  Narrow is also the right default for a
+#: credential — it should travel to the endpoints that need it and nowhere
+#: else.
+#:
+#: ``/filebrowser`` serves the file listing and the download; ``/media/`` is
+#: where the download redirects, and the header has to survive that hop.
+TOKEN_PATHS: tuple[str, ...] = ("/filebrowser", "/media/")
 
 
-def panda_monitor_headers() -> dict[str, str]:
-    """Return the Authorization header for BigPanDA, or an empty mapping.
+def url_needs_token(url: str) -> bool:
+    """Report whether a BigPanDA URL is one that accepts the token.
 
-    BigPanDA's filebrowser endpoint used to serve its ``&json`` form
-    unauthenticated.  It no longer does: an unauthenticated request now gets
-    ``401`` with ``{"error": "No token provided"}``, which means no log file
-    and no file listing can be read without a credential.
-
-    Read from the environment on every call rather than captured at import,
-    so a token can be supplied or rotated without reaching into module state,
-    and so a test can set one with ``monkeypatch.setenv``.
-
-    The scheme is configurable because the exact form BigPanDA expects is the
-    one part of this that is not verifiable from here: ``Bearer <token>``
-    covers the usual case, and setting
-    :data:`ENV_MONITOR_TOKEN_SCHEME` to an empty string sends the raw value
-    for a deployment that wants the token unprefixed.  Getting it wrong is
-    then a configuration change rather than a code change.
+    Args:
+        url: The URL about to be requested.
 
     Returns:
-        ``{"Authorization": ...}`` when a token is configured, otherwise an
-        empty dict — so an unconfigured deployment behaves exactly as before
-        and callers can always splat the result into their headers.
+        ``True`` for the filebrowser and media endpoints, ``False`` for
+        everything else — including job and task metadata, which reject a
+        request that carries an ``Authorization`` header.
     """
+    return any(fragment in url for fragment in TOKEN_PATHS)
+
+
+def panda_monitor_headers(url: str) -> dict[str, str]:
+    """Return the Authorization header for a BigPanDA URL, if it takes one.
+
+    BigPanDA's filebrowser used to serve its ``&json`` form unauthenticated.
+    It no longer does: an unauthenticated request gets ``401`` with
+    ``{"error": "No token provided"}``, so no log file and no file listing can
+    be read without a credential.
+
+    Read from the environment on every call rather than captured at import, so
+    a token can be supplied or rotated without reaching into module state, and
+    so a test can set one with ``monkeypatch.setenv``.
+
+    The scheme is configurable because BigPanDA accepts more than one and the
+    right one is a property of the deployment, not of this code: ``Token`` is
+    the default, and setting :data:`ENV_MONITOR_TOKEN_SCHEME` to an empty
+    string sends the raw value for a deployment that wants it unprefixed.
+
+    Args:
+        url: The URL about to be requested.  Required rather than optional:
+            a credential helper whose default is "send it" is the wrong shape,
+            and every caller has the URL to hand.
+
+    Returns:
+        ``{"Authorization": ...}`` when a token is configured *and* the URL is
+        one that accepts it, otherwise an empty dict — so an unconfigured
+        deployment and a metadata request both behave exactly as before, and
+        callers can always splat the result into their headers.
+    """
+    if not url_needs_token(url):
+        return {}
     token: str = os.getenv(ENV_MONITOR_TOKEN, "").strip()
     if not token:
         return {}
@@ -96,7 +134,7 @@ def fetch_jsonish(
         headers={
             "Accept": "application/json",
             "User-Agent": "AskPanDA/1.0",
-            **panda_monitor_headers(),
+            **panda_monitor_headers(url),
         },
         allow_redirects=True,
     )
