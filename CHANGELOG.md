@@ -7,6 +7,30 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **RAG tools were answering every question from 83 of 9,128 indexed chunks.**
+  `_chroma_routing.resolve_collection_for_topic()` checks the scalar
+  `BAMBOO_CHROMA_COLLECTION` *before* the per-topic built-in default, so setting
+  it collapses every topic onto one collection. On aipanda033 it was set to
+  `bamboo_docs` — 83 chunks of the `bamboo-mcp-services` repository's own
+  READMEs — while the same store held `panda_docs__b` (389), `atlas_docs__a`
+  (356), `rucio_docs__a` (236) and `root_docs__b` (8064).
+
+  "What is PanDA?" was therefore answered from a DuckDB column table, and the
+  model fell back on prior knowledge for two thin generic sentences. The planner
+  was tagging topics correctly — a live trace shows `topic='atlas'` — and step
+  1b discarded it. Nothing errored and nothing logged, so two different LLMs
+  were suspected before the corpus was.
+
+  Routing is **unchanged**: reordering the precedence would silently re-point
+  existing single-collection deployments, which is a decision rather than a fix
+  (D-73). What changed is that a topic with a built-in default being overridden
+  by the scalar now logs a warning naming both collections and the two ways to
+  correct it, once per topic.
+
+  The configuration fix needs no code: set `BAMBOO_CHROMA_COLLECTION_MAP` and
+  drop the scalar. See `docs/handover-rag-collection-routing.md`, which also
+  carries the open questions for `bamboo-mcp-services` (D-78 – D-83).
+
 - **Tool-retrieval trace spans now carry `hits`, and the TUI renders them
   properly.** The span reuses `EVENT_RETRIEVAL`, whose renderer reads a `hits`
   field this span never emitted, so `/tracing` showed

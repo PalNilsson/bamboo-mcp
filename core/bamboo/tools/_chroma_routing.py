@@ -117,6 +117,10 @@ COLLECTION_MAP_ENV = "BAMBOO_CHROMA_COLLECTION_MAP"
 #: set or does not contain an entry for the requested topic.
 COLLECTION_DEFAULT_ENV = "BAMBOO_CHROMA_COLLECTION"
 
+#: Topics already warned about, so the scalar-override notice is logged once
+#: per topic rather than on every question.
+_WARNED_TOPICS: set[str] = set()
+
 #: Built-in default logical collection names keyed by topic string.  These are
 #: used when neither ``BAMBOO_CHROMA_COLLECTION_MAP`` nor
 #: ``BAMBOO_CHROMA_COLLECTION`` is set.
@@ -240,6 +244,32 @@ def resolve_collection_for_topic(chroma_path: str, topic: str) -> str:
     # Step 1b — fall back to scalar BAMBOO_CHROMA_COLLECTION
     if not logical_name:
         logical_name = os.getenv(COLLECTION_DEFAULT_ENV, "").strip()
+
+        # The scalar is checked BEFORE the per-topic built-in below, so setting
+        # it collapses every topic onto one collection. That is deliberate for
+        # single-collection deployments, and silent everywhere else: on
+        # aipanda033 the store held panda_docs (389), atlas_docs (356),
+        # root_docs (8064) and rucio_docs (236), while every query — including
+        # ones the planner correctly tagged topic="atlas" — was answered from
+        # bamboo_docs (83 chunks of this project's own service READMEs). The
+        # answers were thin rather than wrong, so nothing looked broken.
+        #
+        # Routing is left as it is; changing the precedence would silently
+        # re-point existing single-collection deployments. But a topic that has
+        # a built-in default and is being overridden by the scalar is worth
+        # saying out loud, once per topic.
+        if logical_name and topic_key in _BUILTIN_DEFAULTS:
+            if topic_key not in _WARNED_TOPICS:
+                _WARNED_TOPICS.add(topic_key)
+                LOG.warning(
+                    "_chroma_routing: topic '%s' would resolve to '%s', but %s='%s' "
+                    "overrides it, so this and every other topic is answered from "
+                    "'%s'. Set %s to route topics to their own collections, or "
+                    "unset %s to use the built-in per-topic defaults.",
+                    topic_key, _BUILTIN_DEFAULTS[topic_key],
+                    COLLECTION_DEFAULT_ENV, logical_name, logical_name,
+                    COLLECTION_MAP_ENV, COLLECTION_DEFAULT_ENV,
+                )
 
     # Step 1c — built-in per-topic default
     if not logical_name:
