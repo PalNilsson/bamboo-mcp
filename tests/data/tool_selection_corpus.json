@@ -1,0 +1,1133 @@
+{
+  "version": 1,
+  "description": "Labelled questions for evaluating tool retrieval and tool selection in the Bamboo planner. Each case names the tool(s) a correct plan must propose. Cases flagged 'hard' pair a question with a tool it is deliberately easy to confuse for another catalogue tool; those are reported separately, because aggregate recall hides exactly the failures retrieval is most likely to cause.",
+  "provenance": {
+    "cheatsheet": "Taken verbatim from docs/question-cheatsheet.md.",
+    "authored": "Written for this corpus, from tool descriptions and routing guidance, to cover tools the cheat sheet has no section for and confusions it does not probe."
+  },
+  "coverage_exempt": {
+    "bamboo_llm_probe": "Startup credential check; invoked by the interface, never asked for in words.",
+    "bamboo_last_evidence": "Reads the previous call's evidence; an interface affordance, not a question.",
+    "bamboo_promptlog_status": "Drains buffered write events for the system panel.",
+    "bamboo_promptlog_rate": "Invoked by the rating control with an index and document id.",
+    "atlas.ui_manifest": "Returns UI branding metadata at startup."
+  },
+  "cases": [
+    {
+      "id": "c001",
+      "question": "What is the status of task 29871234?",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c002",
+      "question": "Summarise task 27431862.",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c003",
+      "question": "Has task 29004501 finished?",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c004",
+      "question": "Why is task 28765432 failing?",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c005",
+      "question": "Show me the progress of task 27000001.",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c006",
+      "question": "How many jobs are left in task 29871234?",
+      "expected_tools": [
+        "panda_task_status"
+      ],
+      "source": "authored"
+    },
+    {
+      "id": "c007",
+      "question": "What is the status of job 6837798305?",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c008",
+      "question": "Show me the metadata for pandaid 6901234567.",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c009",
+      "question": "Which site ran job 6837798305?",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c010",
+      "question": "What files does job 6901234567 have?",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c011",
+      "question": "When was job 6837798305 submitted?",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "authored"
+    },
+    {
+      "id": "c012",
+      "question": "What transformation did job 6901234567 run?",
+      "expected_tools": [
+        "panda_job_status"
+      ],
+      "source": "authored"
+    },
+    {
+      "id": "c013",
+      "question": "Why did job 6837798305 fail?",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c014",
+      "question": "Analyse the failure of job 6901234567.",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c015",
+      "question": "What error caused job 6837798305 to die?",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c016",
+      "question": "Diagnose job 6901234567.",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c017",
+      "question": "Job 6837798305 failed — what went wrong?",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "authored"
+    },
+    {
+      "id": "c018",
+      "question": "Pull the pilot log for job 6901234567 and tell me the error.",
+      "expected_tools": [
+        "panda_log_analysis"
+      ],
+      "source": "authored"
+    },
+    {
+      "id": "c019",
+      "question": "How many pilots are running at BNL right now?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c020",
+      "question": "How many pilots are running at MWT2?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c021",
+      "question": "What is the pilot count at AGLT2?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c022",
+      "question": "Show me pilot statistics for CERN.",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c023",
+      "question": "How many idle pilots are there at SWT2_CPB?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c024",
+      "question": "How many MCORE pilots are running at BNL?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c025",
+      "question": "How many managed pilots are submitted at IN2P3-CC?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c026",
+      "question": "What is the pilot status at SLAC-SCS?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c027",
+      "question": "How many harvester workers are at NET2?",
+      "expected_tools": [
+        "panda_harvester_workers"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c028",
+      "question": "How many jobs failed at BNL?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c029",
+      "question": "What is the job failure rate at AGLT2?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c030",
+      "question": "How many jobs are running at CERN right now?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c031",
+      "question": "Show me the top errors at SWT2_CPB.",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c032",
+      "question": "How many jobs finished at MWT2 today?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c033",
+      "question": "Which jobs are failing at BNL?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c034",
+      "question": "What is the job status breakdown at TRIUMF?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c035",
+      "question": "How many jobs failed at IN2P3-CC in the last hour?",
+      "expected_tools": [
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c036",
+      "question": "What are the pilot and job failure rates at BNL?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c037",
+      "question": "What are the pilot and job failure rates at MWT2?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c038",
+      "question": "How many pilots and how many failed jobs are there at BNL right now?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c039",
+      "question": "Give me a BNL site health summary — pilots and jobs.",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c040",
+      "question": "What is the pilot count and job error rate at AGLT2?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c041",
+      "question": "How are pilots and jobs doing at CERN?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c042",
+      "question": "How many running pilots and job failures at SWT2_CPB?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c043",
+      "question": "What is the site status at TRIUMF — pilots and jobs?",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c044",
+      "question": "Pilot health and job status at IN2P3-CC.",
+      "expected_tools": [
+        "panda_harvester_workers",
+        "panda_jobs_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Co-occurrence case: both tools must be retrieved together."
+    },
+    {
+      "id": "c045",
+      "question": "Is the PanDA server alive?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c046",
+      "question": "Is PanDA OK?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c047",
+      "question": "Is the PanDA server up?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c048",
+      "question": "Is PanDA running?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c049",
+      "question": "What is the PanDA server status?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c050",
+      "question": "PanDA server health check.",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c051",
+      "question": "Is PanDA available?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c052",
+      "question": "Is PanDA responding?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c053",
+      "question": "Is PanDA down?",
+      "expected_tools": [
+        "panda_server_health"
+      ],
+      "source": "cheatsheet"
+    },
+    {
+      "id": "c054",
+      "question": "What are the settings for queue BNL-ATLAS?",
+      "expected_tools": [
+        "panda_queue_info"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with cric_query: both answer queue-configuration questions."
+    },
+    {
+      "id": "c055",
+      "question": "Show me the configuration for site AGLT2.",
+      "expected_tools": [
+        "panda_queue_info"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with cric_query: both answer queue-configuration questions."
+    },
+    {
+      "id": "c056",
+      "question": "What resources does CERN_PROD support?",
+      "expected_tools": [
+        "panda_queue_info"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with cric_query: both answer queue-configuration questions."
+    },
+    {
+      "id": "c057",
+      "question": "Is BNL accepting MCORE jobs?",
+      "expected_tools": [
+        "panda_queue_info"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with cric_query: both answer queue-configuration questions."
+    },
+    {
+      "id": "c058",
+      "question": "What is the maxtime for queue SWT2_CPB?",
+      "expected_tools": [
+        "panda_queue_info"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with cric_query: both answer queue-configuration questions."
+    },
+    {
+      "id": "c059",
+      "question": "Which queues use the rucio copytool?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c060",
+      "question": "Which queues are not online?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c061",
+      "question": "What is the queue status at BNL?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c062",
+      "question": "Which queues are using the objectstore copytool?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c063",
+      "question": "Is BNL-PTEST active?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c064",
+      "question": "What sites are available?",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c065",
+      "question": "List every CRIC queue that is in test state.",
+      "expected_tools": [
+        "cric_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with panda_queue_info."
+    },
+    {
+      "id": "c066",
+      "question": "What is the average stage-in time at BNL?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c067",
+      "question": "What is the maximum queue time for failed jobs?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c068",
+      "question": "Total wall-clock time at CERN today.",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c069",
+      "question": "What is the average RSS memory at BNL?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c070",
+      "question": "What is the CPU efficiency at IN2P3?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c071",
+      "question": "Total HS06-seconds at TRIUMF.",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c072",
+      "question": "What is the average write throughput at CERN?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c073",
+      "question": "What is the CO2 footprint per job?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c074",
+      "question": "What is the average memory leak rate at CERN?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c075",
+      "question": "Show me all Python versions used by jobs this week.",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c076",
+      "question": "OS version breakdown at BNL.",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c077",
+      "question": "What is the average lsetup time at CERN?",
+      "expected_tools": [
+        "atlas.job_stats"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_jobs_query: historical metrics versus live counts."
+    },
+    {
+      "id": "c078",
+      "question": "Which sites had pilot failures above 20% today?",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers: windowed rates versus live counts."
+    },
+    {
+      "id": "c079",
+      "question": "What is the pilot failure rate at BNL this week?",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers: windowed rates versus live counts."
+    },
+    {
+      "id": "c080",
+      "question": "Which sites had the most failed pilots?",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers: windowed rates versus live counts."
+    },
+    {
+      "id": "c081",
+      "question": "How did failed pilots trend over the last 24 hours?",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "cheatsheet",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers: windowed rates versus live counts."
+    },
+    {
+      "id": "c082",
+      "question": "Plot submitted pilots per hour at MWT2 since yesterday.",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers."
+    },
+    {
+      "id": "c083",
+      "question": "Has the pilot failure percentage at AGLT2 got worse this month?",
+      "expected_tools": [
+        "atlas.harvester_timeseries"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with panda_harvester_workers."
+    },
+    {
+      "id": "c084",
+      "question": "Why did the pilot code fail?",
+      "expected_tools": [
+        "atlas.pilot_source_analysis"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Follow-up after panda_log_analysis; confusable with code_query."
+    },
+    {
+      "id": "c085",
+      "question": "Show me the source of the function that raised that exception.",
+      "expected_tools": [
+        "atlas.pilot_source_analysis"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Follow-up after panda_log_analysis; confusable with code_query."
+    },
+    {
+      "id": "c086",
+      "question": "What is wrong with the pilot in that traceback?",
+      "expected_tools": [
+        "atlas.pilot_source_analysis"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Follow-up after panda_log_analysis; confusable with code_query."
+    },
+    {
+      "id": "c087",
+      "question": "Can this pilot exception be fixed?",
+      "expected_tools": [
+        "atlas.pilot_source_analysis"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Follow-up after panda_log_analysis; confusable with code_query."
+    },
+    {
+      "id": "c088",
+      "question": "Analyse the core dump of job 6837798305.",
+      "expected_tools": [
+        "atlas.core_dump_analysis"
+      ],
+      "source": "authored",
+      "notes": "The drift case: guidance names atlas.core_dump_analysis, not core_dump_analysis."
+    },
+    {
+      "id": "c089",
+      "question": "What was job 6901234567 stuck on?",
+      "expected_tools": [
+        "atlas.core_dump_analysis"
+      ],
+      "source": "authored",
+      "notes": "The drift case: guidance names atlas.core_dump_analysis, not core_dump_analysis."
+    },
+    {
+      "id": "c090",
+      "question": "Why did job 6837798305 hang?",
+      "expected_tools": [
+        "atlas.core_dump_analysis"
+      ],
+      "source": "authored",
+      "notes": "The drift case: guidance names atlas.core_dump_analysis, not core_dump_analysis."
+    },
+    {
+      "id": "c091",
+      "question": "Give me a gdb backtrace for job 6901234567.",
+      "expected_tools": [
+        "atlas.core_dump_analysis"
+      ],
+      "source": "authored",
+      "notes": "The drift case: guidance names atlas.core_dump_analysis, not core_dump_analysis."
+    },
+    {
+      "id": "c092",
+      "question": "Job 6837798305 was killed as a looping job — what was it actually doing?",
+      "expected_tools": [
+        "atlas.core_dump_analysis"
+      ],
+      "source": "authored",
+      "notes": "The drift case: guidance names atlas.core_dump_analysis, not core_dump_analysis."
+    },
+    {
+      "id": "c093",
+      "question": "Explain pilot/util/processes.py.",
+      "expected_tools": [
+        "code_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Requires an explicit file path; confusable with panda_doc_search."
+    },
+    {
+      "id": "c094",
+      "question": "What does the function get_memory_usage in pilot/util/memory.py do?",
+      "expected_tools": [
+        "code_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Requires an explicit file path; confusable with panda_doc_search."
+    },
+    {
+      "id": "c095",
+      "question": "Walk me through src/pilot/control/payload.py.",
+      "expected_tools": [
+        "code_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Requires an explicit file path; confusable with panda_doc_search."
+    },
+    {
+      "id": "c096",
+      "question": "Show me the retry logic in pilot/util/https.py.",
+      "expected_tools": [
+        "code_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Requires an explicit file path; confusable with panda_doc_search."
+    },
+    {
+      "id": "c097",
+      "question": "What exceptions does pilot/common/exception.py define?",
+      "expected_tools": [
+        "code_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Requires an explicit file path; confusable with panda_doc_search."
+    },
+    {
+      "id": "c098",
+      "question": "What is PanDA?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c099",
+      "question": "How does the pilot system work in ATLAS?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c100",
+      "question": "What is a Harvester worker?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c101",
+      "question": "What does piloterrorcode 1301 mean?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c102",
+      "question": "How does JEDI schedule tasks?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c103",
+      "question": "What is the difference between a task and a job in PanDA?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c104",
+      "question": "What causes stage-in failures?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c105",
+      "question": "How does Harvester communicate with the grid?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c106",
+      "question": "What is a MCORE job?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c107",
+      "question": "What is the role of the taskbuffer in PanDA?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c108",
+      "question": "How are jobs retried in PanDA?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c109",
+      "question": "What is gshare and how does it affect job priority?",
+      "expected_tools": [
+        "panda_doc_bm25",
+        "panda_doc_search"
+      ],
+      "source": "cheatsheet",
+      "notes": "Co-occurrence case: the universal fallback route uses both tools."
+    },
+    {
+      "id": "c110",
+      "question": "Show me all responses rated 1 from today.",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c111",
+      "question": "What is the average rating per model this week?",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c112",
+      "question": "Which questions received the lowest ratings last month?",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c113",
+      "question": "How many Bamboo turns were there yesterday?",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c114",
+      "question": "Which tool was used most often in the past week?",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c115",
+      "question": "Compare token cost across providers this month.",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c116",
+      "question": "Replay session 4f1c2a90 for me.",
+      "expected_tools": [
+        "opensearch_promptlog_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_query; the cheatsheet calls this panda_prompt_log, which is not a wire name."
+    },
+    {
+      "id": "c117",
+      "question": "Run this OpenSearch DSL query against atlas_harvesterworkers-*.",
+      "expected_tools": [
+        "opensearch_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_promptlog_query; this is the generic DSL escape hatch."
+    },
+    {
+      "id": "c118",
+      "question": "Aggregate the raw bamboomcp-promptlog index by model keyword.",
+      "expected_tools": [
+        "opensearch_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_promptlog_query; this is the generic DSL escape hatch."
+    },
+    {
+      "id": "c119",
+      "question": "Search the allowed OpenSearch indices for documents matching this filter.",
+      "expected_tools": [
+        "opensearch_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_promptlog_query; this is the generic DSL escape hatch."
+    },
+    {
+      "id": "c120",
+      "question": "Give me a raw DSL aggregation over os-atlas.cern.ch.",
+      "expected_tools": [
+        "opensearch_query"
+      ],
+      "source": "authored",
+      "hard": true,
+      "notes": "Confusable with opensearch_promptlog_query; this is the generic DSL escape hatch."
+    }
+  ]
+}
