@@ -6,6 +6,24 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`scripts/probe_llm.py`** — check that the configured LLM provider is
+  reachable and its key valid, without starting a server.
+
+  The `bamboo_llm_probe` tool already sends the request, but it reads a
+  selector installed by `bamboo.core.create_server()`, so calling it from a
+  bare interpreter answers `not_configured` — a message that reads like a
+  configuration fault and is really a bootstrap one. The script builds the same
+  selector directly from `bamboo.config.Config`, and deliberately does not
+  import `mcp`: a connectivity check should not fail because the SDK version is
+  wrong, which is exactly what happens under `mcp` 2.x, where the decorator API
+  `create_server()` uses no longer exists.
+
+  It prints what each profile resolved to before probing, because the common
+  mistake is silent: a typo in `LLM_FAST_PROVIDER` leaves that profile on the
+  default provider rather than raising, so the run looks fine while half the
+  traffic goes somewhere unintended. Exits non-zero on failure, for smoke tests.
+
 ### Fixed
 - **`opensearch_promptlog_query`'s description now states its purpose in the
   first paragraph.** The tool was not retrieved for "Which questions received
