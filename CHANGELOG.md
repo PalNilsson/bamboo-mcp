@@ -6,6 +6,26 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Tool-retrieval trace spans now carry `hits`, and the TUI renders them
+  properly.** The span reuses `EVENT_RETRIEVAL`, whose renderer reads a `hits`
+  field this span never emitted, so `/tracing` showed
+  `retrieval tool_retrieval 0 backend=lexical hits=?` — the one line an operator
+  looks at during a selection problem, saying nothing. The span now emits
+  `hits`, and the renderer shows `kept=10/22` when retrieval applied and
+  `not applied (<reason>)` when it did not, because for this span a high hit
+  count is ambiguous: a passthrough keeps every tool.
+
+- **`scripts/probe_rag.py` now reports raw distances and pre-threshold result
+  counts.** It converts a distance to a score as `1 - distance`, which is only
+  meaningful for a cosine-space collection. ChromaDB's default space is squared
+  L2, where distances are unbounded and routinely exceed 1.0 — so every score
+  clamps to 0.0 and every query reports `hits=0 score=n/a`, which is
+  indistinguishable from an empty or unreachable corpus. The probe now prints
+  `returned=` (results before the threshold) and `best_distance=` (the raw
+  number), which is what tells a scoring-convention mismatch apart from a
+  genuine retrieval failure.
+
 ### Added
 - **`scripts/probe_llm.py`** — check that the configured LLM provider is
   reachable and its key valid, without starting a server.

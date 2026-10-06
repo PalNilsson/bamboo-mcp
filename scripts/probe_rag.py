@@ -87,6 +87,13 @@ class QueryResult:
         top_score: Highest similarity score among returned results, or 0.0.
         top_snippet: First 200 chars of the top result document, or empty string.
         error: Error message if the query failed, otherwise empty string.
+        returned: Results the backend returned before the score threshold was
+            applied.  Reported separately because the two zeros mean opposite
+            things: nothing retrieved is an empty or unreachable corpus, while
+            results retrieved and all filtered out is a scoring problem.
+        top_distance: Smallest raw distance the vector backend returned, or
+            ``None``.  The one number needed to interpret a vector failure,
+            and the one the probe used to discard.
     """
 
     query: str
@@ -95,6 +102,8 @@ class QueryResult:
     top_score: float = 0.0
     top_snippet: str = ""
     error: str = ""
+    returned: int = 0
+    top_distance: float | None = None
 
     @property
     def passed(self) -> bool:
@@ -292,14 +301,23 @@ def _run_vector_query(
     hits = 0
     top_score = 0.0
     top_snippet = ""
+    top_distance: float | None = None
 
     for doc, dist in zip(documents, distances):
+        # score = 1 - distance is only meaningful for a cosine-space
+        # collection. ChromaDB's default space is squared L2, where distances
+        # are unbounded and routinely exceed 1.0, so every score clamps to 0.0
+        # and every query reports zero hits with "score=n/a" — a total failure
+        # indistinguishable from an empty corpus. Keeping the raw distance is
+        # what tells those apart.
         score = max(0.0, 1.0 - dist)
         if score >= min_score:
             hits += 1
+        if top_distance is None or dist < top_distance:
+            top_distance = dist
+            top_snippet = doc[:200]
         if score > top_score:
             top_score = score
-            top_snippet = doc[:200]
 
     return QueryResult(
         query=query,
@@ -307,6 +325,8 @@ def _run_vector_query(
         hits=hits,
         top_score=top_score,
         top_snippet=top_snippet,
+        returned=len(documents),
+        top_distance=top_distance,
     )
 
 
@@ -418,7 +438,15 @@ def _print_suite_report(
             hits_str = f"hits={r.hits}"
             status = _status(r)
             err_str = f"  error: {r.error}" if r.error else ""
-            print(f"     [{r.backend:6}]  {status}  {hits_str}  {score_str}{err_str}")
+            extra = ""
+            if r.backend == "vector" and not r.error:
+                dist_str = (
+                    f"{r.top_distance:.4f}" if r.top_distance is not None else "n/a"
+                )
+                extra = f"  returned={r.returned}  best_distance={dist_str}"
+            print(
+                f"     [{r.backend:6}]  {status}  {hits_str}  {score_str}{extra}{err_str}"
+            )
             if verbose and r.top_snippet:
                 wrapped = textwrap.fill(
                     r.top_snippet, width=_SNIPPET_WIDTH,

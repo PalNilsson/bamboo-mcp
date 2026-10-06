@@ -484,6 +484,12 @@ def _log_decision(decision: RetrievalDecision) -> None:
         emit_sync(
             EVENT_RETRIEVAL,
             tool="tool_retrieval",
+            # The interfaces' retrieval-span renderer reads "hits" and prints
+            # "hits=?" without it. This span reuses EVENT_RETRIEVAL, so it has
+            # to satisfy that contract as well as carry its own fields —
+            # otherwise the one line an operator looks at during a selection
+            # problem says nothing at all.
+            hits=len(decision.kept),
             applied=decision.applied,
             reason=decision.reason,
             backend=decision.backend,

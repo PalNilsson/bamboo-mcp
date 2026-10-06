@@ -211,6 +211,15 @@ def _span_detail(span_rec: Dict[str, Any]) -> str:
         backend = span_rec.get("backend", "")
         hits = span_rec.get("hits")
         hits_str = str(hits) if hits is not None else "?"
+        # Tool retrieval reuses this event. For it, "hits" alone is misleading:
+        # a passthrough keeps every tool, so a high count can mean retrieval
+        # worked well or that it never ran. The reason says which.
+        if span_rec.get("tool") == "tool_retrieval":
+            total = hits + len(span_rec.get("withheld") or [])
+            reason = span_rec.get("reason", "")
+            applied = span_rec.get("applied")
+            verdict = f"kept={hits_str}/{total}" if applied else f"not applied ({reason})"
+            return f"backend={backend} {verdict}"
         return f"backend={backend} hits={hits_str}"
 
     if event == "llm_call":
