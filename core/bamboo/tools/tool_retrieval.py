@@ -40,7 +40,10 @@ from typing import Any, Mapping, Protocol, Sequence
 logger = logging.getLogger(__name__)
 
 #: Selects the retrieval backend.  ``off`` (the default) disables retrieval
-#: entirely; ``lexical`` enables :class:`LexicalRetriever`.
+#: entirely; ``lexical`` enables :class:`LexicalRetriever`; ``embedding`` and
+#: ``hybrid`` enable the backends in
+#: :mod:`bamboo.tools._tool_retrieval_embedding`, both of which need an
+#: embedding model and fall back loudly when none is installed.
 ENV_BACKEND = "BAMBOO_TOOL_RETRIEVAL"
 
 #: Tool budget, pinned tools included.
@@ -69,7 +72,7 @@ PINNED_TOOLS: frozenset[str] = frozenset({"panda_doc_search", "panda_doc_bm25"})
 #: tool's purpose; the remainder is a field reference.
 MAX_INDEXED_DESCRIPTION_CHARS = 800
 
-_BACKENDS = ("off", "lexical")
+_BACKENDS = ("off", "lexical", "embedding", "hybrid")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _WARNED: set[str] = set()
 
@@ -277,8 +280,8 @@ class RetrievalDecision:
     Attributes:
         applied: Whether the catalog was actually narrowed.
         reason: Short machine-readable cause (``ok``, ``disabled``,
-            ``catalog_small``, ``no_question``, ``backend_error``,
-            ``empty_result``).
+            ``catalog_small``, ``no_question``, ``backend_unavailable``,
+            ``backend_error``, ``empty_result``).
         backend: Backend name, or ``"off"``.
         k: Tool budget in force, pins included.
         kept: Surviving tool names, pinned first, then by descending score.
@@ -379,6 +382,30 @@ def active_min_catalog() -> int:
     return _positive_int(ENV_MIN_CATALOG, DEFAULT_MIN_CATALOG)
 
 
+def _encoder_unavailable() -> type[BaseException]:
+    """Return the exception type signalling a missing embedding model.
+
+    Resolved lazily so that importing this module never imports the embedding
+    module.  Falls back to a type that cannot be raised when the embedding
+    module is itself unimportable, which leaves the generic handler to deal
+    with it rather than letting the lookup become the failure.
+
+    Returns:
+        type[BaseException]: The exception class to treat as "no model".
+    """
+    try:
+        from bamboo.tools._tool_retrieval_embedding import (  # noqa: PLC0415
+            EncoderUnavailable,
+        )
+
+        return EncoderUnavailable
+    except Exception:  # pragma: no cover - only when the module itself is broken
+        class _Unreachable(BaseException):
+            """Never raised."""
+
+        return _Unreachable
+
+
 def _build_retriever(backend: str) -> ToolRetriever | None:
     """Instantiate a backend by name.
 
@@ -391,6 +418,17 @@ def _build_retriever(backend: str) -> ToolRetriever | None:
     """
     if backend == "lexical":
         return LexicalRetriever()
+    if backend in ("embedding", "hybrid"):
+        # Imported here, not at module level: the embedding module is only a
+        # few hundred lines of pure Python, but importing it is the first step
+        # on a path that ends in loading an ONNX runtime, and a process that
+        # never plans must not take that step.
+        from bamboo.tools._tool_retrieval_embedding import (  # noqa: PLC0415
+            EmbeddingRetriever,
+            HybridRetriever,
+        )
+
+        return EmbeddingRetriever() if backend == "embedding" else HybridRetriever()
     return None
 
 
@@ -513,6 +551,18 @@ def select_tools(
             if hasattr(retriever, "score")
             else ()
         )
+    except _encoder_unavailable() as exc:
+        # An absent optional dependency, not a bug. Reported at WARNING and
+        # with its own reason, because "install requirements-rag.txt" and
+        # "the retriever is broken" need different responses and would
+        # otherwise be the same line in the log.
+        logger.warning(
+            "tool retrieval backend %r has no embedding model (%s); "
+            "falling back to the full catalog.",
+            backend,
+            exc,
+        )
+        return _passthrough("backend_unavailable")
     except Exception:
         # Loud, not silent: the question still gets answered from the full
         # catalog, but a retrieval layer that has quietly stopped retrieving

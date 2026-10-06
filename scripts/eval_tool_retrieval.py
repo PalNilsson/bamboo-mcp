@@ -39,6 +39,11 @@ from bamboo.tools.planner import (  # noqa: E402
     _collect_tool_catalog,
     routing_rules_for_plugin,
 )
+from bamboo.tools._tool_retrieval_embedding import (  # noqa: E402
+    EmbeddingRetriever,
+    EncoderUnavailable,
+    HybridRetriever,
+)
 from bamboo.tools.tool_retrieval import LexicalRetriever  # noqa: E402
 
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "data" / "tool_selection_corpus.json"
@@ -48,7 +53,12 @@ DEFAULT_CORPUS = REPO_ROOT / "tests" / "data" / "tool_selection_corpus.json"
 #: sees them and they count against the *k* budget.
 PINNED_TOOLS = frozenset({"panda_doc_search", "panda_doc_bm25"})
 
-RETRIEVERS: dict[str, Any] = {"null": NullRetriever, "lexical": LexicalRetriever}
+RETRIEVERS: dict[str, Any] = {
+    "null": NullRetriever,
+    "lexical": LexicalRetriever,
+    "embedding": EmbeddingRetriever,
+    "hybrid": HybridRetriever,
+}
 
 
 def _build_retriever(name: str) -> ToolRetriever:
@@ -68,6 +78,10 @@ def _build_retriever(name: str) -> ToolRetriever:
     except KeyError:
         raise SystemExit(
             f"unknown retriever {name!r}; available: {', '.join(sorted(RETRIEVERS))}"
+        )
+    except EncoderUnavailable as exc:
+        raise SystemExit(
+            f"retriever {name!r} needs an embedding model: {exc}"
         )
 
 
@@ -191,17 +205,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     rules = routing_rules_for_plugin(args.plugin_id)
     pinned = frozenset() if args.no_pins else PINNED_TOOLS
 
-    reports = [
-        evaluate(
-            _build_retriever(args.retriever),
-            corpus,
-            catalog,
-            k=k,
-            pinned=pinned,
-            routing_rules=rules,
-        )
-        for k in (args.k or [10])
-    ]
+    try:
+        reports = [
+            evaluate(
+                _build_retriever(args.retriever),
+                corpus,
+                catalog,
+                k=k,
+                pinned=pinned,
+                routing_rules=rules,
+            )
+            for k in (args.k or [10])
+        ]
+    except EncoderUnavailable as exc:
+        # The encoder resolves on first use, not at construction, so a missing
+        # model surfaces here rather than in _build_retriever.
+        raise SystemExit(f"retriever {args.retriever!r} needs an embedding model: {exc}")
 
     if args.json:
         print(json.dumps({"reports": [_report_to_dict(r) for r in reports]}, indent=2))

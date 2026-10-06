@@ -7,6 +7,66 @@ All notable changes to Bamboo are documented here.
 ## [Unreleased]
 
 ### Added
+- **Embedding and hybrid retrieval backends** —
+  `core/bamboo/tools/_tool_retrieval_embedding.py`. `BAMBOO_TOOL_RETRIEVAL`
+  now accepts `embedding` and `hybrid` alongside `lexical`. Still off by
+  default.
+
+  The lexical backend's one residual failure at k ≥ 12 is a question whose
+  wording shares no term with the description of the tool that answers it
+  ("Which questions received the lowest ratings last month?" →
+  `opensearch_promptlog_query`, whose description talks about prompt logs,
+  sessions and token costs). That is the gap an embedding model closes, and
+  `HybridRetriever` fuses the two by reciprocal rank — rankings rather than
+  scores, so no calibration between a BM25 value and a cosine is needed, which
+  is the part that usually goes wrong when the two are mixed.
+
+  **Model:** `all-MiniLM-L6-v2`, via ChromaDB's default embedding function —
+  the same model the document corpus already uses, already cached on the
+  deployment hosts. A second model would mean a second download, a second
+  cache and a second thing to be wrong about, for a corpus of 22 strings.
+  `sentence-transformers` is tried as a fallback. Both are optional extras and
+  neither is imported at module level.
+
+  **The planned on-disk precomputed index was dropped, deliberately.** The
+  reasoning behind it does not survive the query path: every question must be
+  encoded at query time, so the model loads regardless. A precomputed index
+  would have saved encoding 22 short documents — tens of milliseconds — while
+  leaving the real cost, the one-to-three second model load, exactly where it
+  was. What replaces it is an in-process vector cache keyed by a hash of the
+  catalogue's *indexed* text, so a change retrieval cannot see (a reordered
+  schema, an edit past the description truncation point) does not force a
+  re-encode, while a plugin changing a tool does.
+
+  **Encoder resolution probes rather than constructs.** ChromaDB's
+  `DefaultEmbeddingFunction()` constructs without touching the model and
+  downloads it on first call, so on a host that cannot reach the model cache
+  the failure arrived as a bare `ValueError` from inside the download path,
+  long after the caller had accepted the encoder. `resolve_encoder()` now
+  encodes one short string before returning, which costs only the model load
+  that was about to happen anyway, and turns an untyped runtime explosion into
+  an `EncoderUnavailable` at resolution time. Found by running it on a host
+  with no access to the model.
+
+  A missing model reports as its own passthrough reason,
+  `backend_unavailable`, at WARNING — distinct from `backend_error`, because
+  "install requirements-rag.txt" and "the retriever is broken" need different
+  responses and would otherwise be the same line in the log. A dimension
+  mismatch between index and query is the one condition here that does *not*
+  fail open: it means the two came from different models, so every score is
+  meaningless rather than degraded, and it raises.
+
+  Both backends are registered in `scripts/eval_tool_retrieval.py`. **Their
+  numbers are not yet recorded** — the comparison needs a host with the model
+  cache warm. Run on `aipanda033`:
+
+  ```
+  for r in lexical embedding hybrid; do
+      python scripts/eval_tool_retrieval.py --retriever $r --k 10 --k 12
+  done
+  ```
+
+### Added
 - **Query-conditioned tool retrieval** — `core/bamboo/tools/tool_retrieval.py`,
   hooked into the planner via `_collect_tool_catalog_with_decision()`.
   **Off by default**; `BAMBOO_TOOL_RETRIEVAL` is unset and nothing changes
