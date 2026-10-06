@@ -6,6 +6,52 @@ All notable changes to Bamboo are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Planner routing guidance is now a structured rule table**
+  (`bamboo.tools.planner`). `_build_atlas_planner_prompt()` and
+  `_build_cgsim_planner_prompt()` built their routing guidance as one
+  concatenated f-string naming roughly fifteen tools, with no machine-readable
+  link between a clause and the tools it names. Those clauses are now
+  `_ATLAS_ROUTING_RULES` and `_CGSIM_ROUTING_RULES`: ordered tuples of
+  `RoutingRule(tools, text)`, rendered by `_render_routing_guidance()`.
+
+  **The assembled prompt is byte-identical** for every `plugin_id` — verified
+  against the pre-refactor module before the old one was replaced. The new
+  `available_tools` parameter on `build_planner_system_prompt()` defaults to
+  `None`, meaning "do not filter", and no caller passes anything else yet.
+
+  The reason for the table is that the same prompt states *"Only propose tools
+  that appear in the provided tool catalog"*. When the catalog and the guidance
+  disagree the prompt contradicts itself, and the planner has been observed
+  resolving that by discarding the guidance wholesale: the catalog once
+  advertised `core_dump_analysis` while the guidance said
+  `atlas.core_dump_analysis`, so an explicit request to analyse a core dump was
+  answered with a log analysis. Nothing detected it. Pairing each clause with
+  its tools makes the coupling checkable now and filterable later, when
+  query-conditioned tool retrieval starts removing tools from the catalog —
+  a clause naming several tools is then also a co-occurrence unit, so the
+  site-health clause keeps `panda_harvester_workers` and `panda_jobs_query`
+  together rather than relying on both surviving top-k independently.
+
+- **`tests/test_planner_routing_rules.py`** (new, 22 tests) pins the guidance
+  against the live catalog in three layers: every guidance-named tool exists in
+  `_collect_tool_catalog()`; each rule's declared `tools` matches the names
+  appearing literally in its `text`, in both directions; and the filtering
+  predicate itself, with mutation guards for the four ways it would most
+  plausibly be broken (`&` for `<=`, `==` for `<=`, `not available_tools`
+  collapsing `None` into `frozenset()`, and reordering).
+
+  The catalog assertions excuse a tool only on evidence its backing dependency
+  is absent — `bamboo.core._JOBS_QUERY_AVAILABLE` and siblings for the
+  DuckDB-backed tools, and "no `atlas.*` name reached the catalog at all" for
+  the plugin — so the suite passes with and without the optional extras without
+  degrading into a no-op. A plugin that is installed but has lost a single
+  entry point still fails, which is what a stale `.egg-info` looks like: it
+  shadows `pyproject.toml`, and on a tree where `askpanda_atlas.egg-info`
+  predated the `atlas.core_dump_analysis` entry point these tests go red with
+  exactly the `core_dump_analysis` drift described above. `pip install -e
+  packages/askpanda_atlas` after removing the stale directory clears it.
+
 ### Added
 - **BigPanDA access token** (`PANDA_MONITOR_TOKEN`). BigPanDA's filebrowser
   stopped serving its `&json` form unauthenticated: it now answers `401` with

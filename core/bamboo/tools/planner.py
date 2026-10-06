@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from enum import Enum
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -186,37 +186,64 @@ def extract_first_json_object(text: str) -> str:
     raise ValueError("Unable to extract valid JSON object")
 
 
-def _build_atlas_planner_prompt(schema_compact: str) -> str:
-    """Return the planner system prompt for the ATLAS / ePIC plugin.
+class RoutingRule(NamedTuple):
+    """One routing-guidance clause of a planner system prompt.
 
-    Args:
-        schema_compact: Compact JSON schema string for the Plan output format.
+    The planner prompt states a hard rule — *"Only propose tools that appear
+    in the provided tool catalog"* — alongside guidance that names specific
+    tools.  When the catalog and the guidance disagree the prompt contradicts
+    itself, and the planner has been observed discarding the guidance
+    wholesale rather than reconciling it: the catalog once advertised
+    ``core_dump_analysis`` while the guidance said
+    ``atlas.core_dump_analysis``, and an explicit request to analyse a core
+    dump was answered with a log analysis.
 
-    Returns:
-        System prompt string.
+    Pairing each clause with the tools it names makes that coupling
+    machine-checkable, and lets :func:`_render_routing_guidance` withhold a
+    clause whose tools are absent instead of emitting a contradiction.  A
+    clause naming several tools is thereby also a co-occurrence unit: the
+    site-health clause names ``panda_harvester_workers`` and
+    ``panda_jobs_query``, and is emitted only when both survive.
+
+    Attributes:
+        tools: Wire names of every catalog tool this clause names.  Must list
+            exactly the catalog names appearing literally in *text*; the
+            correspondence is pinned by test.
+        text: The clause, without its trailing newline.
     """
-    return (
-        "You are a tool planner for an MCP server. "
-        "Your job is to output a single JSON object that conforms exactly to the provided JSON Schema.\n\n"
-        "Hard rules:\n"
-        "- Output MUST be valid JSON (no trailing commas).\n"
-        "- Output MUST be a single JSON object, and MUST NOT be wrapped in markdown fences.\n"
-        "- Do not include any explanation outside the JSON object.\n"
-        "- Only propose tools that appear in the provided tool catalog.\n"
-        "- Be conservative: if uncertain, set route='PLAN' and confidence lower.\n\n"
-        "Routing guidance:\n"
+
+    tools: frozenset[str]
+    text: str
+
+
+#: Routing guidance for the ATLAS / ePIC planner prompt, in precedence order.
+#:
+#: Order is load-bearing and mirrors the order the clauses were concatenated
+#: in before this table existed; the broad fallback clause must stay last.
+_ATLAS_ROUTING_RULES: tuple[RoutingRule, ...] = (
+    RoutingRule(
+        frozenset({"panda_task_status"}),
         "- If the question contains a task ID (hints.task_id present): "
-        "use panda_task_status. route=FAST_PATH.\n"
+        "use panda_task_status. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_log_analysis"}),
         "- If the question asks to diagnose/analyse/why a job failed "
         "(hints.job_id present + failure keywords): "
-        "use panda_log_analysis. route=FAST_PATH.\n"
+        "use panda_log_analysis. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_log_analysis", "atlas.pilot_source_analysis"}),
         "- If panda_log_analysis has already been called and returned "
         "traceback_available=true with a non-null deepest_pilot_frame, AND the "
         "user wants to understand the pilot code or why the exception was raised "
         "(e.g. 'why did the pilot code fail', 'show me the source', 'what is "
         "wrong with the pilot', 'can this be fixed'): use atlas.pilot_source_analysis, "
         "passing job_id, the log_excerpt and the pilot_version from the prior "
-        "evidence. route=PLAN.\n"
+        "evidence. route=PLAN.",
+    ),
+    RoutingRule(
+        frozenset({"atlas.core_dump_analysis"}),
         "- If the question asks what a job was actually doing when it was "
         "killed or stalled, or explicitly asks for a core dump, gdb, or a "
         "backtrace (e.g. 'analyse the core dump of job 123', 'what was job 123 "
@@ -225,14 +252,23 @@ def _build_atlas_planner_prompt(schema_compact: str) -> str:
         "when the job was killed as a looping job (pilot error code 1150), "
         "mode='crash' for a segfault or abort, and mode='auto' when unsure. "
         "This tool is ATLAS-only and takes about a minute; never propose it "
-        "for ePIC or any other plugin. route=FAST_PATH.\n"
+        "for ePIC or any other plugin. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_job_status"}),
         "- If the question asks about a job (hints.job_id present, no failure keywords): "
-        "use panda_job_status. route=FAST_PATH.\n"
+        "use panda_job_status. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_harvester_workers", "panda_jobs_query"}),
         "- If the question asks about BOTH pilot counts/status AND job counts/failures "
         "at a site (e.g. 'pilots and jobs at BNL', 'site health'): "
         "use panda_harvester_workers AND panda_jobs_query together. "
         "Pass site= to panda_harvester_workers and queue= to panda_jobs_query. "
-        "route=FAST_PATH.\n"
+        "route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"atlas.harvester_timeseries"}),
         "- If the question asks about pilot failure rates, failure percentages, or "
         "which sites had high failure rates over a time window "
         "(e.g. 'which sites had pilot failures above 20% today', "
@@ -241,17 +277,26 @@ def _build_atlas_planner_prompt(schema_compact: str) -> str:
         "Pass site= if a single site is mentioned; omit site= for cross-site queries. "
         "Always express from_dt/to_dt as absolute ISO-8601 strings "
         "(e.g. '2026-06-12T00:00:00'), never as relative expressions like 'now-6h'. "
-        "route=FAST_PATH.\n"
+        "route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_harvester_workers"}),
         "- If the question asks about live pilot counts or Harvester worker status "
         "right now (e.g. 'how many pilots are running', 'how many pilots submitted', "
         "'pilot counts at X', 'pilots running at X'): "
         "use panda_harvester_workers. "
         "Always express from_dt/to_dt as absolute ISO-8601 strings "
         "(e.g. '2026-06-12T00:00:00'), never as relative expressions like 'now-6h'. "
-        "route=FAST_PATH.\n"
+        "route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_jobs_query"}),
         "- If the question asks about live job counts, job failures, job status, "
         "or error rates at a site (e.g. 'how many jobs failed', 'job failure rate', "
-        "'top errors at X'): use panda_jobs_query. route=FAST_PATH.\n"
+        "'top errors at X'): use panda_jobs_query. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"atlas.job_stats"}),
         "- If the question asks about job performance metrics from the "
         "historical OpenSearch index — stage-in time, stage-out time, wall-clock "
         "time, queue wait time, payload execution time, pilot setup time, "
@@ -268,35 +313,161 @@ def _build_atlas_planner_prompt(schema_compact: str) -> str:
         "'average memory leak rate at CERN', 'which Python versions are used', "
         "'show me all Python versions used by jobs this week', "
         "'OS version breakdown at BNL', 'average lsetup time at CERN'): "
-        "use atlas.job_stats. Pass site= if a site is mentioned. route=FAST_PATH.\n"
+        "use atlas.job_stats. Pass site= if a site is mentioned. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_queue_info"}),
         "- If the question asks about a site's queue configuration: "
-        "use panda_queue_info. route=FAST_PATH.\n"
+        "use panda_queue_info. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"panda_server_health"}),
         "- If the question asks whether the PanDA server is alive, OK, running, or "
         "healthy (e.g. 'is PanDA alive?', 'is the PanDA server OK?', 'is PanDA up?', "
-        "'PanDA server status'): use panda_server_health. route=FAST_PATH.\n"
+        "'PanDA server status'): use panda_server_health. route=FAST_PATH.",
+    ),
+    RoutingRule(
+        frozenset({"code_query", "panda_doc_search"}),
         "- code_query requires an EXPLICIT source file path in the question "
         "(e.g. 'pilot/util/processes.py', 'src/foo.py'). "
         "NEVER use code_query for conceptual questions like 'how does X work', "
         "'what is X', 'explain X', or 'tell me about X'. "
-        "Those must use panda_doc_search instead.\n"
+        "Those must use panda_doc_search instead.",
+    ),
+    RoutingRule(
+        frozenset({"panda_doc_search", "panda_doc_bm25"}),
         "- For ALL other questions (general knowledge, concepts, how-to, 'what is'): "
         "use panda_doc_search AND panda_doc_bm25 together. route=RETRIEVE. "
-        "Never answer general questions from the LLM alone — always retrieve first.\n\n"
+        "Never answer general questions from the LLM alone — always retrieve first.",
+    ),
+)
+
+
+#: Routing guidance for the CGSim planner prompt, in precedence order.
+#:
+#: The closing preference clause names only ``cgsim.sim_query`` literally and
+#: refers to the documentation tools by description, so it survives their
+#: removal without dangling.
+_CGSIM_ROUTING_RULES: tuple[RoutingRule, ...] = (
+    RoutingRule(
+        frozenset({"cgsim.sim_query"}),
+        "- If the question asks about simulation results — job timings, execution durations, "
+        "queue wait times, file transfer speeds, network congestion, site allocation, "
+        "disk I/O, retry rates, CPU/storage utilisation, or any data recorded in the "
+        "simulation database — use cgsim.sim_query. route=FAST_PATH. "
+        "This includes generic questions like 'show me all jobs', 'list all job IDs', "
+        "'what happened during the simulation', 'which site was busiest'.\n"
+        "  IMPORTANT: pass the user's question to cgsim.sim_query VERBATIM — do not "
+        "expand, rephrase, or add detail. The tool handles its own SQL generation.",
+    ),
+    RoutingRule(
+        frozenset({"cgsim.doc_search", "cgsim.doc_bm25"}),
+        "- If the question asks about how CGSim or SimGrid works, plugin APIs, "
+        "configuration options, or concepts (e.g. 'what is a netzone?', "
+        "'how do I write a plugin?', 'what does assignJob do?'): "
+        "use cgsim.doc_search AND cgsim.doc_bm25 together. route=RETRIEVE.",
+    ),
+    RoutingRule(
+        frozenset({"cgsim.sim_query"}),
+        "- When in doubt, prefer cgsim.sim_query over the doc tools — most questions "
+        "in this context are about simulation results, not documentation.",
+    ),
+)
+
+
+def routing_rules_for_plugin(plugin_id: str = "") -> tuple[RoutingRule, ...]:
+    """Return the routing-guidance rules used for a plugin's planner prompt.
+
+    Mirrors the dispatch in :func:`build_planner_system_prompt` so callers —
+    notably the tests that pin guidance against the live tool catalog — do not
+    reimplement it and drift from it.
+
+    Args:
+        plugin_id: Active plugin identifier (e.g. ``"cgsim"``, ``"atlas"``).
+            Unknown values fall back to the ATLAS rules, as the prompt builder
+            falls back to the ATLAS prompt.
+
+    Returns:
+        Tuple[RoutingRule, ...]: Rules in precedence order.
+    """
+    if plugin_id == "cgsim":
+        return _CGSIM_ROUTING_RULES
+    return _ATLAS_ROUTING_RULES
+
+
+def _render_routing_guidance(
+    rules: tuple[RoutingRule, ...],
+    available_tools: frozenset[str] | None = None,
+) -> str:
+    """Render routing-guidance clauses, withholding those naming absent tools.
+
+    Args:
+        rules: Rules in precedence order.
+        available_tools: Wire names present in the tool catalog the planner
+            will be shown.  ``None`` means "do not filter" and emits every
+            clause — the behaviour before guidance filtering existed, and the
+            behaviour whenever the full catalog is passed through.
+
+    Returns:
+        str: The clauses, one per line, each terminated by a newline.  Empty
+        when every clause was withheld.
+    """
+    if available_tools is None:
+        kept = list(rules)
+    else:
+        kept = [rule for rule in rules if rule.tools <= available_tools]
+    if not kept:
+        return ""
+    return "\n".join(rule.text for rule in kept) + "\n"
+
+
+def _build_atlas_planner_prompt(
+    schema_compact: str,
+    available_tools: frozenset[str] | None = None,
+) -> str:
+    """Return the planner system prompt for the ATLAS / ePIC plugin.
+
+    Args:
+        schema_compact: Compact JSON schema string for the Plan output format.
+        available_tools: Wire names in the catalog the planner will be shown.
+            ``None`` emits all routing guidance unfiltered.
+
+    Returns:
+        System prompt string.
+    """
+    guidance = _render_routing_guidance(_ATLAS_ROUTING_RULES, available_tools)
+    return (
+        "You are a tool planner for an MCP server. "
+        "Your job is to output a single JSON object that conforms exactly to the provided JSON Schema.\n\n"
+        "Hard rules:\n"
+        "- Output MUST be valid JSON (no trailing commas).\n"
+        "- Output MUST be a single JSON object, and MUST NOT be wrapped in markdown fences.\n"
+        "- Do not include any explanation outside the JSON object.\n"
+        "- Only propose tools that appear in the provided tool catalog.\n"
+        "- Be conservative: if uncertain, set route='PLAN' and confidence lower.\n\n"
+        "Routing guidance:\n"
+        f"{guidance}\n"
         f"JSON Schema (must match exactly):\n{schema_compact}\n"
     )
 
 
-def _build_cgsim_planner_prompt(schema_compact: str) -> str:
+def _build_cgsim_planner_prompt(
+    schema_compact: str,
+    available_tools: frozenset[str] | None = None,
+) -> str:
     """Return the planner system prompt for the CGSim plugin.
 
     Contains no knowledge of PanDA tools — only CGSim tools.
 
     Args:
         schema_compact: Compact JSON schema string for the Plan output format.
+        available_tools: Wire names in the catalog the planner will be shown.
+            ``None`` emits all routing guidance unfiltered.
 
     Returns:
         System prompt string.
     """
+    guidance = _render_routing_guidance(_CGSIM_ROUTING_RULES, available_tools)
     return (
         "You are a tool planner for the CGSim simulation assistant (Bamboo MCP). "
         "Your job is to output a single JSON object that conforms exactly to the provided JSON Schema.\n\n"
@@ -307,25 +478,16 @@ def _build_cgsim_planner_prompt(schema_compact: str) -> str:
         "- Only propose tools that appear in the provided tool catalog.\n"
         "- Be conservative: if uncertain, set route='PLAN' and confidence lower.\n\n"
         "Routing guidance:\n"
-        "- If the question asks about simulation results — job timings, execution durations, "
-        "queue wait times, file transfer speeds, network congestion, site allocation, "
-        "disk I/O, retry rates, CPU/storage utilisation, or any data recorded in the "
-        "simulation database — use cgsim.sim_query. route=FAST_PATH. "
-        "This includes generic questions like 'show me all jobs', 'list all job IDs', "
-        "'what happened during the simulation', 'which site was busiest'.\n"
-        "  IMPORTANT: pass the user's question to cgsim.sim_query VERBATIM — do not "
-        "expand, rephrase, or add detail. The tool handles its own SQL generation.\n"
-        "- If the question asks about how CGSim or SimGrid works, plugin APIs, "
-        "configuration options, or concepts (e.g. 'what is a netzone?', "
-        "'how do I write a plugin?', 'what does assignJob do?'): "
-        "use cgsim.doc_search AND cgsim.doc_bm25 together. route=RETRIEVE.\n"
-        "- When in doubt, prefer cgsim.sim_query over the doc tools — most questions "
-        "in this context are about simulation results, not documentation.\n\n"
+        f"{guidance}\n"
         f"JSON Schema (must match exactly):\n{schema_compact}\n"
     )
 
 
-def build_planner_system_prompt(schema: dict[str, Any], plugin_id: str = "") -> str:
+def build_planner_system_prompt(
+    schema: dict[str, Any],
+    plugin_id: str = "",
+    available_tools: frozenset[str] | None = None,
+) -> str:
     """Build the system prompt for the planner.
 
     Selects a plugin-specific prompt when *plugin_id* is recognised, falling
@@ -334,14 +496,19 @@ def build_planner_system_prompt(schema: dict[str, Any], plugin_id: str = "") -> 
     Args:
         schema: JSON schema that the model output must conform to.
         plugin_id: Active plugin identifier (e.g. ``"cgsim"``, ``"atlas"``).
+        available_tools: Wire names present in the tool catalog that will
+            accompany this prompt.  Routing guidance naming a tool outside
+            this set is withheld, so the prompt cannot instruct the planner to
+            propose a tool its own hard rules forbid.  ``None`` — the current
+            caller — emits all guidance unfiltered.
 
     Returns:
         str: System prompt text.
     """
     schema_compact = json.dumps(schema, ensure_ascii=False)
     if plugin_id == "cgsim":
-        return _build_cgsim_planner_prompt(schema_compact)
-    return _build_atlas_planner_prompt(schema_compact)
+        return _build_cgsim_planner_prompt(schema_compact, available_tools)
+    return _build_atlas_planner_prompt(schema_compact, available_tools)
 
 
 def build_planner_user_prompt(
