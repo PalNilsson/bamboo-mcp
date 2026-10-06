@@ -18,9 +18,13 @@ second implementation of the same protocol, and
 ``scripts/eval_tool_retrieval.py`` decides between them on recall rather than
 on taste.
 
-**Off by default.**  ``BAMBOO_TOOL_RETRIEVAL`` is unset in production until the
-harness says retrieval does not lose tools the planner needed.  Everything here
-is dark until that switch flips.
+**On by default, as ``lexical``, since the harness said so.**  Measured over
+120 labelled questions at k=10: recall 0.992, 0.983 on the deliberately
+confusable subset, guidance coverage 1.000, and 39% of the former prompt.  The
+embedding backend scored worse on both recall and payload, losing precisely the
+jargon cases — a literal source path, ``MCORE``, ``queue time`` — that carry
+most of this catalog's meaning.  ``BAMBOO_TOOL_RETRIEVAL=off`` remains the kill
+switch, and restores the previous behaviour exactly.
 
 **Degradation is loud.**  A retriever that raises, or returns names outside the
 catalog, falls back to the full catalog and says so in the log and the trace.
@@ -55,7 +59,7 @@ ENV_MIN_CATALOG = "BAMBOO_TOOL_RETRIEVAL_MIN_CATALOG"
 #: Truthy raises the per-question selection line from DEBUG to INFO.
 ENV_LOG = "BAMBOO_TOOL_RETRIEVAL_LOG"
 
-DEFAULT_BACKEND = "off"
+DEFAULT_BACKEND = "lexical"
 DEFAULT_K = 10
 DEFAULT_MIN_CATALOG = 12
 

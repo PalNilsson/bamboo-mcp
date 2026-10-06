@@ -43,6 +43,7 @@ from bamboo.tools._tool_retrieval_embedding import (  # noqa: E402
     EmbeddingRetriever,
     EncoderUnavailable,
     HybridRetriever,
+    catalog_fingerprint,
 )
 from bamboo.tools.tool_retrieval import LexicalRetriever  # noqa: E402
 
@@ -118,6 +119,9 @@ def _format_report(report: Report, show_failures: int) -> str:
     return "\n".join(lines)
 
 
+_fingerprint = ""
+
+
 def _report_to_dict(report: Report) -> dict[str, Any]:
     """Convert a report to a JSON-serialisable summary.
 
@@ -137,6 +141,7 @@ def _report_to_dict(report: Report) -> dict[str, Any]:
         "payload_fraction": round(report.mean_payload_fraction(), 4),
         "over_budget_cases": report.over_budget_cases(),
         "full_payload_chars": report.full_payload_bytes,
+        "catalog_fingerprint": _fingerprint,
         "failures": [
             {
                 "id": r.case.case_id,
@@ -200,8 +205,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         int: Process exit status.
     """
     args = _parse_args(argv)
+    global _fingerprint
     corpus = load_corpus(args.corpus)
     catalog = _collect_tool_catalog(namespaces=[args.namespace] if args.namespace else None)
+    _fingerprint = catalog_fingerprint(catalog)[:12]
     rules = routing_rules_for_plugin(args.plugin_id)
     pinned = frozenset() if args.no_pins else PINNED_TOOLS
 
@@ -225,7 +232,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         print(json.dumps({"reports": [_report_to_dict(r) for r in reports]}, indent=2))
     else:
-        print(f"catalog: {len(catalog)} tools, namespace={args.namespace!r}")
+        # The fingerprint makes a report comparable with another. Two hosts
+        # running the same command produced 29,527 and 29,750 characters and
+        # recalls of 0.983 and 0.992, because their plugin descriptions
+        # differed; without this line that discrepancy reads as noise in the
+        # retriever rather than a difference in what was measured.
+        print(
+            f"catalog: {len(catalog)} tools, namespace={args.namespace!r}, "
+            f"fingerprint={catalog_fingerprint(catalog)[:12]}"
+        )
         print(f"corpus:  {len(corpus.cases)} cases from {args.corpus}")
         print(f"pinned:  {sorted(pinned) or 'none'}")
         print()

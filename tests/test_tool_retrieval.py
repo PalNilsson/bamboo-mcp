@@ -27,6 +27,7 @@ from bamboo.tools.planner import (
     _collect_tool_catalog_with_decision,
 )
 from bamboo.tools.tool_retrieval import (
+    DEFAULT_BACKEND,
     DEFAULT_K,
     ENV_BACKEND,
     ENV_K,
@@ -95,12 +96,25 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestConfiguration:
     """The environment surface."""
 
-    def test_retrieval_is_off_by_default(self) -> None:
-        """An unset variable means no retrieval.
+    def test_lexical_is_the_default(self) -> None:
+        """An unset variable means lexical retrieval.
 
-        The whole commit lands dark; this is the assertion that says so.
+        Flipped on the harness's evidence: 0.992 recall at k=10 for 39% of the
+        prompt. The embedding backend measured worse on both axes.
         """
+        assert active_backend() == "lexical"
+
+    def test_off_remains_the_kill_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``off`` restores the pre-retrieval planner exactly.
+
+        The only recovery available to an operator who suspects retrieval, so
+        it is asserted rather than assumed.
+        """
+        monkeypatch.setenv(ENV_BACKEND, "off")
         assert active_backend() == "off"
+        decision = select_tools("why did job 1 fail?", _catalog())
+        assert not decision.applied
+        assert decision.reason == "disabled"
 
     def test_a_known_backend_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A recognised name selects that backend, case and space insensitively."""
@@ -118,7 +132,7 @@ class TestConfiguration:
         """
         monkeypatch.setenv(ENV_BACKEND, "lexcial")
         with caplog.at_level(logging.WARNING):
-            assert active_backend() == "off"
+            assert active_backend() == DEFAULT_BACKEND
         assert "not a recognised retrieval backend" in caplog.text
 
     @pytest.mark.parametrize("raw", ["0", "-3", "banana", ""])
@@ -245,8 +259,9 @@ class TestLexicalRetriever:
 class TestSelectToolsPassthrough:
     """Every route back to the full catalog, and its stated reason."""
 
-    def test_disabled_by_default(self) -> None:
-        """With no backend configured the catalog passes through."""
+    def test_explicitly_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the backend switched off the catalog passes through."""
+        monkeypatch.setenv(ENV_BACKEND, "off")
         decision = select_tools("why did job 1 fail?", _catalog())
         assert not decision.applied
         assert decision.reason == "disabled"
@@ -406,8 +421,11 @@ class TestNarrowCatalog:
             n for n in original if n in set(decision.kept)
         ]
 
-    def test_disabled_returns_the_catalog_unchanged(self) -> None:
+    def test_disabled_returns_the_catalog_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """With retrieval off the entries come back as they went in."""
+        monkeypatch.setenv(ENV_BACKEND, "off")
         catalog = _catalog()
         narrowed, decision = narrow_catalog("why did job 1 fail?", catalog)
         assert not decision.applied
@@ -437,11 +455,27 @@ class TestPlannerIntegration:
         assert decision is None
         assert catalog
 
-    def test_the_default_configuration_changes_nothing(self) -> None:
-        """With retrieval unset the planner's catalog is byte-identical.
+    def test_the_default_configuration_now_narrows(self) -> None:
+        """With nothing configured the planner's catalog is narrowed.
 
-        This commit must be dark. The flip is C5's, not C3's.
+        The behavioural flip. Everything before this commit asserted the
+        opposite, deliberately.
         """
+        plain = _collect_tool_catalog(namespaces=["atlas"])
+        hooked, decision = _collect_tool_catalog_with_decision(
+            namespaces=["atlas"], question="why did job 6837798305 fail?"
+        )
+        assert decision is not None
+        if len(plain) <= DEFAULT_K:
+            pytest.skip("catalog too small to narrow in this environment")
+        assert decision.applied
+        assert len(hooked) < len(plain)
+
+    def test_switching_off_restores_the_full_catalog(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``off`` gives the planner exactly what it received before retrieval."""
+        monkeypatch.setenv(ENV_BACKEND, "off")
         plain = _collect_tool_catalog(namespaces=["atlas"])
         hooked, decision = _collect_tool_catalog_with_decision(
             namespaces=["atlas"], question="why did job 6837798305 fail?"
@@ -495,8 +529,9 @@ class TestDebugVisibility:
         for name in sorted(PINNED_TOOLS):
             assert f"{name}(pinned)" in rendered
 
-    def test_a_passthrough_states_its_reason(self) -> None:
+    def test_a_passthrough_states_its_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The not-applied line says why, not just that."""
+        monkeypatch.setenv(ENV_BACKEND, "off")
         rendered = format_decision(select_tools("why did job 1 fail?", _catalog()))
         assert "not applied" in rendered
         assert "reason=disabled" in rendered

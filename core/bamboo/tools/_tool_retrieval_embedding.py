@@ -33,14 +33,42 @@ import logging
 import math
 from typing import Any, Mapping, Protocol, Sequence
 
-from bamboo.tools.tool_retrieval import LexicalRetriever, index_terms
+from bamboo.tools.tool_retrieval import LexicalRetriever, _positive_int, index_terms
 
 logger = logging.getLogger(__name__)
 
-#: Reciprocal-rank-fusion constant.  The value from the original Cormack et al.
-#: formulation; it damps the influence of top ranks enough that one backend
-#: being confidently wrong cannot dominate the other being quietly right.
-RRF_K = 60
+#: Overrides :data:`RRF_K`.  Exposed so the tuning below can be settled by
+#: measurement rather than argument.
+ENV_RRF_K = "BAMBOO_TOOL_RETRIEVAL_RRF_K"
+
+#: Reciprocal-rank-fusion constant.
+#:
+#: The literature's default is 60, and on this catalog 60 is wrong.  With *N*
+#: scorable tools, a tool ranked first by one backend scores ``1/(K+1)`` while a
+#: tool ranked last by *both* scores ``2/(K+N)``.  At K=60 and N=20 those are
+#: 0.0164 and 0.0250: **every** tool both backends rank beats **every** tool only
+#: one ranks, whatever the ranks.  Fusion degenerates into "the intersection,
+#: then the leftovers", and the single-source find that hybrid retrieval exists
+#: to rescue is exactly what it cannot rescue — which is what the harness
+#: observed, with hybrid missing the one case the embedding backend alone
+#: solved.
+#:
+#: 60 assumes rankings over thousands of documents.  For a corpus of 22, the
+#: crossover is near K = N, so 10 leaves a confident single-source rank able to
+#: compete.  This is reasoning, not a measurement: hybrid is not the shipped
+#: backend, and the number to trust is whatever
+#: ``scripts/eval_tool_retrieval.py --retriever hybrid`` reports after a sweep
+#: of :data:`ENV_RRF_K`.
+RRF_K = 10
+
+
+def active_rrf_k() -> int:
+    """Return the configured rank-fusion constant.
+
+    Returns:
+        int: :data:`RRF_K` unless ``BAMBOO_TOOL_RETRIEVAL_RRF_K`` overrides it.
+    """
+    return _positive_int(ENV_RRF_K, RRF_K)
 
 
 class EncoderUnavailable(RuntimeError):
@@ -347,8 +375,9 @@ class HybridRetriever:
     cosine — which is the part that usually goes wrong when the two are mixed
     by weighted sum.
 
-    Whether it beats either alone is a question for the harness, not for this
-    docstring.
+    The harness's verdict so far is that it does not beat lexical alone on this
+    catalog; see :data:`RRF_K` for why the original tuning made that outcome
+    structurally certain, and what to re-measure.
     """
 
     name = "hybrid"
@@ -383,6 +412,7 @@ class HybridRetriever:
         order = {name: position for position, name in enumerate(names)}
 
         fused: dict[str, float] = {name: 0.0 for name in names}
+        rrf_k = active_rrf_k()
 
         # Only positively-scoring lexical entries contribute a rank. A tool
         # sharing no term with the question has not been ranked by BM25 at all,
@@ -391,10 +421,10 @@ class HybridRetriever:
             name for name, value in self._lexical.score(question, catalog) if value > 0.0
         ]
         for rank, name in enumerate(lexical):
-            fused[name] += 1.0 / (RRF_K + rank + 1)
+            fused[name] += 1.0 / (rrf_k + rank + 1)
 
         for rank, (name, _) in enumerate(self._embedding.score(question, catalog)):
-            fused[name] += 1.0 / (RRF_K + rank + 1)
+            fused[name] += 1.0 / (rrf_k + rank + 1)
 
         scored = [(name, fused[name]) for name in names]
         scored.sort(key=lambda pair: (-pair[1], order[pair[0]]))
