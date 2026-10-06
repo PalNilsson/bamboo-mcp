@@ -16,15 +16,30 @@ All notable changes to Bamboo are documented here.
   `not applied (<reason>)` when it did not, because for this span a high hit
   count is ambiguous: a passthrough keeps every tool.
 
-- **`scripts/probe_rag.py` now reports raw distances and pre-threshold result
-  counts.** It converts a distance to a score as `1 - distance`, which is only
-  meaningful for a cosine-space collection. ChromaDB's default space is squared
-  L2, where distances are unbounded and routinely exceed 1.0 — so every score
-  clamps to 0.0 and every query reports `hits=0 score=n/a`, which is
-  indistinguishable from an empty or unreachable corpus. The probe now prints
-  `returned=` (results before the threshold) and `best_distance=` (the raw
-  number), which is what tells a scoring-convention mismatch apart from a
-  genuine retrieval failure.
+- **`scripts/probe_rag.py` reported a healthy vector index as a total
+  failure, and an irrelevant keyword match as a pass.** Both verdicts were
+  wrong, in opposite directions.
+
+  The vector side scored results as `1 - distance`, which is only meaningful
+  for a cosine-space collection. ChromaDB's default is L2, where distances
+  routinely exceed 1.0 — so every score clamped to 0.0 and every query reported
+  `hits=0 score=n/a`, indistinguishable from an empty corpus. On a live
+  83-document store the raw distances were 1.03–1.41, which under L2 on
+  normalised vectors is cosine 0.29–0.49: an entirely healthy index that the
+  probe called dead. Scoring is now space-aware via `_distance_to_score()`,
+  the space is read from the collection metadata and printed in the header, and
+  `returned=` and `best_distance=` are shown so the conversion can be checked
+  by its reader rather than trusted.
+
+  The keyword side is a single-token `$contains` substring filter, not BM25,
+  and it hardcoded `top_score=1.0`. `PASS hits=3 score=1.00` therefore read as
+  a relevance judgement while returning, for a query about PanDA, a document
+  about table-swap unit tests. It now reports the matched token instead of a
+  fabricated score.
+
+  Both backends now print the top result's source file, which is the field that
+  matters most: a query returning the best of the *wrong corpus* looks exactly
+  like a ranking failure until you can see which documents are in there.
 
 ### Added
 - **`scripts/probe_llm.py`** — check that the configured LLM provider is

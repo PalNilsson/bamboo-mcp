@@ -104,6 +104,8 @@ class QueryResult:
     error: str = ""
     returned: int = 0
     top_distance: float | None = None
+    top_source: str = ""
+    match: str = ""
 
     @property
     def passed(self) -> bool:
@@ -269,6 +271,46 @@ def _report_collection_not_found(
     sys.exit(2)
 
 
+def _distance_to_score(distance: float, space: str) -> float:
+    """Convert a ChromaDB distance to a similarity in [0, 1].
+
+    The conversion depends entirely on the collection's distance space, and
+    getting it wrong is silent.  This probe previously assumed cosine for every
+    collection, so on an L2 collection — ChromaDB's default — every score
+    clamped to 0.0 and every query reported zero hits, which is
+    indistinguishable from an empty corpus.
+
+    Args:
+        distance: Raw distance from ``collection.query``.
+        space: The collection's ``hnsw:space`` (``cosine``, ``l2`` or ``ip``).
+
+    Returns:
+        float: Similarity in [0, 1].  For ``l2`` the vectors are assumed
+        normalised, where squared L2 is ``2 - 2 * cosine``; ChromaDB's default
+        embedding function normalises, so that holds for any collection built
+        with it.
+    """
+    if space == "cosine":
+        return max(0.0, 1.0 - distance)
+    if space == "ip":
+        return max(0.0, min(1.0, distance))
+    return max(0.0, 1.0 - distance / 2.0)
+
+
+def _collection_space(collection: Any) -> str:
+    """Return a collection's configured distance space.
+
+    Args:
+        collection: Open ChromaDB Collection object.
+
+    Returns:
+        str: ``cosine``, ``ip``, or ``l2`` — the last being ChromaDB's default
+        and the fallback when the metadata does not say.
+    """
+    metadata = getattr(collection, "metadata", None) or {}
+    return str(metadata.get("hnsw:space", "l2")).strip().lower() or "l2"
+
+
 def _run_vector_query(
     collection: Any,
     query: str,
@@ -290,32 +332,38 @@ def _run_vector_query(
         raw = collection.query(
             query_texts=[query],
             n_results=top_k,
-            include=["documents", "distances"],
+            include=["documents", "metadatas", "distances"],
         )
     except Exception as exc:  # noqa: BLE001
         return QueryResult(query=query, backend="vector", error=str(exc))
 
+    space = _collection_space(collection)
     documents: list[str] = (raw.get("documents") or [[]])[0]
+    metadatas: list[dict] = (raw.get("metadatas") or [[]])[0] or [{}] * len(documents)
     distances: list[float] = (raw.get("distances") or [[]])[0]
 
     hits = 0
     top_score = 0.0
     top_snippet = ""
     top_distance: float | None = None
+    top_source = ""
 
-    for doc, dist in zip(documents, distances):
+    for doc, meta, dist in zip(documents, metadatas, distances):
         # score = 1 - distance is only meaningful for a cosine-space
         # collection. ChromaDB's default space is squared L2, where distances
         # are unbounded and routinely exceed 1.0, so every score clamps to 0.0
         # and every query reports zero hits with "score=n/a" — a total failure
         # indistinguishable from an empty corpus. Keeping the raw distance is
         # what tells those apart.
-        score = max(0.0, 1.0 - dist)
+        score = _distance_to_score(dist, space)
         if score >= min_score:
             hits += 1
         if top_distance is None or dist < top_distance:
             top_distance = dist
             top_snippet = doc[:200]
+            top_source = str((meta or {}).get("source_path")
+                             or (meta or {}).get("source")
+                             or (meta or {}).get("file") or "")
         if score > top_score:
             top_score = score
 
@@ -327,6 +375,7 @@ def _run_vector_query(
         top_snippet=top_snippet,
         returned=len(documents),
         top_distance=top_distance,
+        top_source=top_source,
     )
 
 
@@ -367,19 +416,29 @@ def _run_bm25_query(
             raw = collection.get(
                 where_document={"$contains": token},
                 limit=top_k,
-                include=["documents"],
+                include=["documents", "metadatas"],
             )
         except Exception as exc:  # noqa: BLE001
             return QueryResult(query=query, backend="bm25", error=str(exc))
 
         docs: list[str] = raw.get("documents") or []
         if docs:
+            metas: list[dict] = raw.get("metadatas") or [{}] * len(docs)
+            first = metas[0] if metas else {}
+            # No score. This backend is a single-token substring filter, not
+            # BM25, and reporting a hardcoded 1.00 made "PASS score=1.00" read
+            # as a relevance judgement — so a query about PanDA returned a
+            # document about table-swap unit tests and still showed green. The
+            # matched token is the honest thing to report.
             return QueryResult(
                 query=query,
                 backend="bm25",
                 hits=len(docs),
-                top_score=1.0,
                 top_snippet=docs[0][:200],
+                top_source=str((first or {}).get("source_path")
+                               or (first or {}).get("source")
+                               or (first or {}).get("file") or ""),
+                match=token,
             )
 
     return QueryResult(query=query, backend="bm25", hits=0)
@@ -405,6 +464,7 @@ def _print_suite_report(
     suite: SuiteResult,
     queries_with_desc: list[tuple[str, str]],
     verbose: bool,
+    collection: Any = None,
 ) -> None:
     """Print a human-readable report for the full suite.
 
@@ -412,11 +472,18 @@ def _print_suite_report(
         suite: Aggregated SuiteResult.
         queries_with_desc: List of (query, description) pairs in suite order.
         verbose: When True, print the top snippet for each result.
+        collection: Open collection, used to report the distance space. The
+            space decides how a distance becomes a score, so a report that
+            omits it cannot be checked by its reader.
     """
     col_name = suite.collection_name
     doc_count = suite.collection_count
 
     print(f"\nCorpus : {col_name}  ({doc_count} documents)")
+    if collection is not None:
+        space = _collection_space(collection)
+        note = "" if space == "cosine" else "  (scores converted for this space)"
+        print(f"Space  : {space}{note}")
     print(f"Checks : {suite.n_passed} passed, {suite.n_failed} failed\n")
 
     desc_map = {q: d for q, d in queries_with_desc}
@@ -444,9 +511,13 @@ def _print_suite_report(
                     f"{r.top_distance:.4f}" if r.top_distance is not None else "n/a"
                 )
                 extra = f"  returned={r.returned}  best_distance={dist_str}"
+            elif r.backend == "bm25" and r.match:
+                score_str = f"matched={r.match!r}"
             print(
                 f"     [{r.backend:6}]  {status}  {hits_str}  {score_str}{extra}{err_str}"
             )
+            if r.top_source:
+                print(f"             top source: {r.top_source}")
             if verbose and r.top_snippet:
                 wrapped = textwrap.fill(
                     r.top_snippet, width=_SNIPPET_WIDTH,
@@ -584,7 +655,7 @@ def main() -> None:
             _run_bm25_query(collection, query, top_k)
         )
 
-    _print_suite_report(suite, queries_with_desc, verbose)
+    _print_suite_report(suite, queries_with_desc, verbose, collection)
 
     sys.exit(0 if suite.passed else 1)
 
