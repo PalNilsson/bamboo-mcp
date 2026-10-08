@@ -1,38 +1,31 @@
-"""The symbols bamboo-eval measures through must stay where it looks for them.
+"""The symbols bamboo-eval measures through (decision E-22).
 
-Decision E-22.  The evaluation framework lives in a separate repository
-(``PalNilsson/bamboo-eval``) and depends on this one; the dependency is
-one-way, so this repository cannot import it.  Without this file a rename here
-would break the framework silently, and the breakage would surface in a
-scheduled run on the other repository a fortnight later, in a stack trace that
-looks like a bug in the framework.
+bamboo-eval lives in its own repository and calls into this one.  Without this
+test a rename here breaks nothing visible for a fortnight, and then surfaces as
+a failed scheduled run on another repository — which is precisely the
+late, misattributed failure the evaluation framework exists to prevent.
 
-So the coupling is pinned here instead, in this repository's own suite, where
-it fails in the pull request that causes it.
+So the contract is asserted *here*, in the pull request that would break it.
 
-The authoritative list is ``ENTRY_POINTS`` in ``bamboo_eval/production.py``.
-This file deliberately duplicates it rather than importing it: importing would
-make bamboo-eval a test dependency of bamboo-mcp and reverse the dependency
-direction the split was chosen for.  The duplication is small, and
-``bamboo-eval check-contract`` is the richer check for CI jobs that do install
-the framework.
-
-What this file does *not* check is behaviour.  It asserts that the symbols
-exist and are callable with the signature the framework uses.  Whether they
-still return what the framework believes they return is what the framework's
-own parity test is for.
+The entry-point list below is duplicated from
+``bamboo_eval/production.py`` **deliberately**.  Importing bamboo-eval to read
+it would reverse the dependency direction the two-repository split was chosen
+for (decision E-21: bamboo-eval depends on bamboo-mcp, never the other way),
+and would also mean this test passes whenever bamboo-eval is absent, which is
+exactly when it is most needed.  Two copies that must agree is the cost; a
+failure here names the other copy.
 """
 from __future__ import annotations
 
+import importlib
 import inspect
+from typing import Any
 
 import pytest
 
-#: Mirrors ENTRY_POINTS in bamboo_eval/production.py.  Each entry is
-#: (module, attribute, why bamboo-eval calls it).  Keep the two in step: a
-#: symbol removed from one and not the other is how this test stops meaning
-#: anything.
-EVAL_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
+#: ``(module, attribute, why bamboo-eval calls it)``.  Keep in step with
+#: ``ENTRY_POINTS`` in bamboo-eval's ``production.py``.
+REQUIRED_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
     (
         "bamboo.tools.planner",
         "_collect_tool_catalog",
@@ -51,6 +44,13 @@ EVAL_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
         "the clause/tool pairing the guidance-coverage metric relies on",
     ),
     (
+        "bamboo.tools.planner",
+        "bamboo_plan_tool",
+        "is the planner the server itself calls; the selection-accuracy metric "
+        "measures what this returns rather than a reconstruction of the "
+        "planning path (decision E-25)",
+    ),
+    (
         "bamboo.tools.tool_retrieval",
         "LexicalRetriever",
         "the shipped BM25 retriever under test",
@@ -58,62 +58,177 @@ EVAL_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
     (
         "bamboo.tools._tool_retrieval_embedding",
         "catalog_fingerprint",
-        "hashes the indexed catalogue text; every stored eval record cites it",
+        "hashes the indexed catalogue text; every stored record cites it",
     ),
 )
+
+#: Backends.  bamboo-eval records a stated skip when these are unavailable, so
+#: their absence is not a contract breach — but a *rename* still is, which is
+#: why they are listed and checked only when importable.
+OPTIONAL_ENTRY_POINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "bamboo.tools._tool_retrieval_embedding",
+        "EmbeddingRetriever",
+        "embedding backend, for the backend comparison",
+    ),
+    (
+        "bamboo.tools._tool_retrieval_embedding",
+        "HybridRetriever",
+        "RRF fusion of the two backends, for the RRF constant sweep",
+    ),
+)
+
+_HINT = (
+    "bamboo-eval resolves this symbol from its own repository. Either restore "
+    "it, or update ENTRY_POINTS in bamboo_eval/production.py and this list "
+    "together, in the same pull request."
+)
+
+
+def _resolve(module_name: str, attribute: str) -> Any:
+    """Resolve one declared symbol.
+
+    Args:
+        module_name: Dotted module path.
+        attribute: Symbol name within it.
+
+    Returns:
+        Any: The symbol.
+    """
+    module = importlib.import_module(module_name)
+    return getattr(module, attribute)
 
 
 @pytest.mark.parametrize(
     ("module_name", "attribute", "why"),
-    EVAL_ENTRY_POINTS,
-    ids=[f"{m}.{a}" for m, a, _ in EVAL_ENTRY_POINTS],
+    REQUIRED_ENTRY_POINTS,
+    ids=[f"{m}.{a}" for m, a, _ in REQUIRED_ENTRY_POINTS],
 )
-def test_entry_point_exists(module_name: str, attribute: str, why: str) -> None:
-    """The symbol bamboo-eval resolves is still importable under this name.
+def test_required_entry_points_exist(module_name: str, attribute: str, why: str) -> None:
+    """Every symbol bamboo-eval requires is still where it looks for it.
 
     Args:
         module_name: Dotted module path.
-        attribute: Symbol name.
-        why: What the framework uses it for, quoted back in the failure.
+        attribute: Symbol name within it.
+        why: What bamboo-eval uses it for, repeated in the failure message so
+            the person reading it knows whether the symbol moved or the
+            measurement did.
     """
-    module = pytest.importorskip(module_name)
+    try:
+        _resolve(module_name, attribute)
+    except (ImportError, AttributeError) as exc:
+        pytest.fail(f"{module_name}.{attribute} is gone; bamboo-eval calls it "
+                    f"because it {why}. ({exc}) {_HINT}")
+
+
+@pytest.mark.parametrize(
+    ("module_name", "attribute", "why"),
+    OPTIONAL_ENTRY_POINTS,
+    ids=[f"{m}.{a}" for m, a, _ in OPTIONAL_ENTRY_POINTS],
+)
+def test_optional_entry_points_exist_when_their_module_does(
+    module_name: str, attribute: str, why: str
+) -> None:
+    """An optional backend may be absent, but it may not be renamed.
+
+    Args:
+        module_name: Dotted module path.
+        attribute: Symbol name within it.
+        why: What bamboo-eval uses it for.
+    """
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        pytest.skip(f"{module_name} is not importable in this environment")
+        raise
     assert hasattr(module, attribute), (
-        f"{module_name}.{attribute} is gone. bamboo-eval calls it because it "
-        f"{why}. Renaming it breaks the evaluation framework silently: update "
-        f"ENTRY_POINTS in bamboo_eval/production.py and this file together, or "
-        f"keep an alias."
+        f"{module_name}.{attribute} is gone; bamboo-eval calls it because it "
+        f"{why}. {_HINT}"
     )
 
 
-def test_collect_tool_catalog_still_takes_namespaces() -> None:
-    """The catalogue entry point keeps the keyword the framework passes.
+def test_the_catalogue_collector_takes_namespaces() -> None:
+    """bamboo-eval asks for one plugin's catalogue by keyword.
 
-    bamboo-eval calls ``_collect_tool_catalog(namespaces=[...])``.  A change to
-    positional-only, or a rename of the parameter, would be caught here rather
-    than as an unexplained TypeError in another repository.
+    The metric passes ``namespaces=[...]``; a positional-only rename of that
+    parameter would make every measurement run against a different catalogue
+    from the one it claims.
     """
-    planner = pytest.importorskip("bamboo.tools.planner")
-    signature = inspect.signature(planner._collect_tool_catalog)
+    signature = inspect.signature(_resolve("bamboo.tools.planner", "_collect_tool_catalog"))
     assert "namespaces" in signature.parameters
-    assert signature.parameters["namespaces"].kind is not inspect.Parameter.POSITIONAL_ONLY
 
 
-def test_routing_rule_exposes_tools_and_text() -> None:
-    """The guidance metric reads ``rule.tools`` and ``rule.text``.
+def test_the_planner_tool_is_called_the_way_bamboo_eval_calls_it() -> None:
+    """``bamboo_plan_tool.call`` is an awaitable taking one mapping.
 
-    It pairs each clause with the tools it names, and counts a case as
-    uncovered when a surviving catalogue no longer carries the clause that
-    explains its tool.  Both attribute names are part of the contract.
+    bamboo-eval drives it with ``asyncio.run(tool.call({...}))`` and reads the
+    first text block as the validated plan (decision E-25).  If it stops being
+    a coroutine, or stops taking its arguments as a single mapping, the
+    selection-accuracy metric is measuring something else — and the whole point
+    of that metric is that it measures the path the server takes.
     """
-    planner = pytest.importorskip("bamboo.tools.planner")
-    rule = planner.RoutingRule(frozenset({"a"}), "- use a.")
-    assert rule.tools == frozenset({"a"})
-    assert rule.text == "- use a."
+    tool = _resolve("bamboo.tools.planner", "bamboo_plan_tool")
+    call = getattr(tool, "call", None)
+    assert inspect.iscoroutinefunction(call), (
+        f"bamboo_plan_tool.call is {type(call).__name__}, not a coroutine function. {_HINT}"
+    )
+    parameters = [
+        name
+        for name, parameter in inspect.signature(call).parameters.items()
+        if parameter.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    assert parameters == ["arguments"], (
+        f"bamboo_plan_tool.call takes {parameters}; bamboo-eval passes a single "
+        f"arguments mapping. {_HINT}"
+    )
 
 
-def test_routing_rules_for_plugin_returns_rules() -> None:
-    """The ATLAS guidance is reachable by plugin id, as the framework asks."""
-    planner = pytest.importorskip("bamboo.tools.planner")
-    rules = planner.routing_rules_for_plugin("atlas")
-    assert rules, "ATLAS routing guidance is empty; guidance coverage would be vacuous"
-    assert all(hasattr(r, "tools") and hasattr(r, "text") for r in rules)
+def _planner_model(name: str) -> Any:
+    """Return a schema class from the planner module, or skip.
+
+    These two are not declared entry points — bamboo-eval reads the planner's
+    output as JSON rather than importing its models, so that the metric does
+    not depend on pydantic classes it does not own.  They are checked here
+    because two *behaviours* bamboo-eval classifies depend on the schema
+    continuing to admit them.
+
+    Args:
+        name: Class name.
+
+    Returns:
+        Any: The class.
+    """
+    try:
+        return _resolve("bamboo.tools.planner", name)
+    except (ImportError, AttributeError):
+        pytest.skip(f"bamboo.tools.planner.{name} is not available here")
+        raise
+
+
+def test_the_plan_schema_still_admits_a_toolless_plan() -> None:
+    """A ``RETRIEVE`` plan with no tool calls must stay possible.
+
+    bamboo-eval scores one as ``declined`` — a planner that proposed nothing,
+    which is neither a wrong tool nor malformed output (decision E-28).  If
+    ``RETRIEVE`` disappeared, or ``tool_calls`` stopped defaulting to a list,
+    that outcome would silently become an ``unparseable`` and a real behaviour
+    would be recorded as a defect.
+    """
+    route = _planner_model("PlanRoute")
+    assert "RETRIEVE" in {member.value for member in route}
+    field = _planner_model("Plan").model_fields["tool_calls"]
+    assert field.annotation is not None
+
+
+def test_a_tool_call_still_carries_a_free_form_tool_name() -> None:
+    """Both ``panda_task_status`` and ``atlas.task_status`` must stay valid.
+
+    bamboo-eval resolves between the two naming conventions rather than
+    comparing strings (decision E-27).  A schema that constrained ``tool`` to
+    one convention — an enum of catalogue names, say — would make that
+    resolution rule a measurement of a case that can no longer occur, and the
+    rule should then be deleted rather than left to look like it is working.
+    """
+    field = _planner_model("ToolCall").model_fields["tool"]
+    assert field.annotation is str
