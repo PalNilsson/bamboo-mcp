@@ -324,58 +324,6 @@ All notable changes to Bamboo are documented here.
   `BAMBOO_TOOL_RETRIEVAL_LOG`. All read at call time and all fail open to the
   default with a warning logged once per distinct bad value.
 
-### Added
-- **Tool-retrieval evaluation harness** — `core/bamboo/evaluation/`,
-  `scripts/eval_tool_retrieval.py`, and a 120-case labelled corpus at
-  `tests/data/tool_selection_corpus.json`. Pure stdlib, nothing on a request
-  path, no optional dependency.
-
-  Query-conditioned tool retrieval trades a smaller planner prompt for the risk
-  of withholding the tool the planner needed. That trade cannot be argued, only
-  measured, and it has to be measured *before* the retriever exists — otherwise
-  the first numbers have nothing to be compared against. `NullRetriever`
-  returns the whole catalog and so reproduces today's planner exactly; its
-  score is the reference.
-
-  **Baseline, recorded on a 22-tool ATLAS catalog (29,527 chars):** recall@k
-  1.000, recall@k on the hard subset 1.000, guidance coverage 1.000, payload
-  fraction 1.000, at k = 8, 10 and 12. Reproduce with
-  `python scripts/eval_tool_retrieval.py --k 8 --k 10 --k 12`.
-
-  Three metrics, because recall alone is not enough. Recall@k is strict: a
-  question routed to two tools scores zero when only one survives, since half a
-  co-occurrence pair is a broken plan rather than a partial one. Guidance
-  coverage asks whether the routing clauses that survive filtering still *name*
-  the expected tools — retrieval can keep the right tool while dropping the
-  clause explaining when to use it, which no recall figure reveals. Payload
-  fraction is the only reason to accept any recall loss at all. Each is also
-  reported over the 59 cases flagged `hard`, which pair a question with a tool
-  it is deliberately easy to confuse for a neighbour (`panda_queue_info` against
-  `cric_query`, live counts against historical aggregates); aggregate recall is
-  dominated by easy cases and would look healthy while the confusable ones rot.
-
-  The harness **measures** the *k* budget rather than enforcing it. Truncating
-  a retriever's output inside `evaluate()` would hide a retriever that ignores
-  its budget, and reduced `NullRetriever` to "the first *k* entries in catalog
-  order" — which scored 0.383 and would have become the reference every later
-  measurement was judged against. `Report.over_budget_cases()` reports the
-  overrun instead; the baseline is expected to be over budget on every case and
-  a real retriever is not. `tests/test_tool_selection_corpus.py` pins this.
-
-  The corpus covers all 17 catalogue tools a user asks for in words, minimum
-  four cases each; the five invoked by the interface rather than by a question
-  (`bamboo_llm_probe`, `bamboo_last_evidence`, `bamboo_promptlog_status`,
-  `bamboo_promptlog_rate`, `atlas.ui_manifest`) carry a written exemption in the
-  corpus file itself, so adding a tool forces a decision rather than leaving a
-  blind spot. 87 questions are verbatim from `docs/question-cheatsheet.md`; the
-  rest were authored for tools the cheat sheet has no section for.
-
-  Note for whoever next edits the cheat sheet: it documents the prompt-log tool
-  as `panda_prompt_log`, which has never been a wire name — the tool is
-  `opensearch_promptlog_query`. The corpus uses the real name, and
-  `test_every_expected_tool_is_in_the_catalog` would have caught the error had
-  the cheat sheet been transcribed mechanically. The doc is still wrong.
-
 ### Changed
 - **Planner routing guidance is now a structured rule table**
   (`bamboo.tools.planner`). `_build_atlas_planner_prompt()` and
